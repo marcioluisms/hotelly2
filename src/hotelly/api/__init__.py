@@ -1,0 +1,1 @@
+"""Hotelly API module."""
