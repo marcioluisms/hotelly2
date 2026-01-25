@@ -38,6 +38,15 @@ echo "## Git Log (últimos 10 commits)"
 git log --oneline -n 10
 echo
 
+echo "## Repo Tree (tracked files)"
+TRACKED_COUNT=$(git ls-files | wc -l)
+echo "Tracked files: $TRACKED_COUNT"
+git ls-files | head -n 200
+if [[ "$TRACKED_COUNT" -gt 200 ]]; then
+    echo "... (truncated, showing first 200)"
+fi
+echo
+
 echo "## Arquivos em docs/"
 find docs -maxdepth 3 -type f | sort
 echo
