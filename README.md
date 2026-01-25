@@ -22,3 +22,13 @@ uv run pytest -q
 ```
 
 Sobe o servidor em http://127.0.0.1:8000 com hot-reload. Health check: `/health`.
+
+## Context Pack
+
+Gera um pacote de contexto para colar no início de uma nova conversa com o ChatGPT:
+
+```bash
+bash scripts/context_pack.sh
+```
+
+Cole o output na nova conversa para rehidratar o contexto do projeto.
