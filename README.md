@@ -14,3 +14,11 @@ uv run uvicorn hotelly.api.app:app --reload
 # Rodar testes
 uv run pytest -q
 ```
+
+## Desenvolvimento local
+
+```bash
+./scripts/dev.sh
+```
+
+Sobe o servidor em http://127.0.0.1:8000 com hot-reload. Health check: `/health`.
