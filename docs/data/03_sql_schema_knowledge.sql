@@ -1,0 +1,15 @@
+-- docs/data/03_sql_schema_knowledge.sql
+-- Hotelly V2 — Schema Knowledge (DEFERIDO PÓS-MVP)
+--
+-- Objetivo futuro (não-MVP):
+-- - Base de conhecimento (FAQ, políticas, comodidades por pousada)
+-- - Eventual busca semântica (embeddings) para respostas assistidas pela IA
+--
+-- Decisão (por enquanto):
+-- - O MVP NÃO terá persistência/ingestão de KB estruturada neste schema.
+-- - Conteúdo de pousada (políticas/comodidades) entra via cadastro/admin (post-MVP) ou configuração inicial.
+--
+-- Quando ativar:
+-- - Criar ADR específico:
+--   - Postgres + pgvector vs Vertex AI Search vs outra solução.
+-- - Definir chunking, atualização e retenção.

@@ -1,0 +1,521 @@
+## 1) Princípios de execução (para fatiar certo e não virar novela)
+
+1. **Vertical slice primeiro**: cada fatia deve atravessar o fluxo real (WhatsApp → Quote → Hold → Stripe → Reserva). 
+2. **Transações críticas são “código sagrado”**: implementar exatamente conforme os invariantes/locks/idempotência descritos; qualquer atalho aqui vira incidente. 
+3. **Assíncrono por padrão** (Cloud Tasks): receber eventos rápido, processar depois com dedupe. 
+4. **Burocracia mínima, evidência máxima**: menos texto, mais comandos/outputs e testes que provem. (Isso reduz retrabalho e mantém segurança.)
+
+## 2) Backlog inicial (em marcos que entregam valor rápido)
+
+### Marco M0 — Fundação (infra + esqueleto executável)
+
+* Cloud Run + Cloud SQL + Cloud Tasks + Secret Manager “de pé” (dev/staging/prod).  
+* Migrações/DDL do **core transacional** (holds, ari_days, payments, reservations, processed_events, etc.). (Sem isso não existe V2 de verdade.)  
+* Observabilidade mínima: logs estruturados + métricas de fluxo/erro + correlação. 
+* Dev local com Compose + seed mínimo + replay de webhooks. 
+
+**Critério de aceite do M0:** subir um serviço “hello-domain” que conecta no Cloud SQL, roda migração e expõe healthcheck.
+
+---
+
+### Marco M1 — Motor transacional (zero overbooking + idempotência)
+
+Implementar e testar as 4 transações críticas (Postgres):
+
+1. **Create Hold** (reserva inventário via `inv_held++` com guardas no `WHERE`). 
+2. **Expire Hold** (task idempotente + `FOR UPDATE` no hold + `inv_held--`). 
+3. **Cancel Hold** (mesma lógica do expire, com status cancelado). 
+4. **Stripe Confirm → Convert Hold → Reservation** (dedupe de evento + lock + `inv_held--/inv_booked++` + reserva 1:1). 
+
+**Critério de aceite do M1 (não-negociável):**
+
+* Idempotência: `processed_events` para webhooks/tasks e (recomendado) `idempotency_keys` para endpoints internos. 
+* Concorrência: ordem fixa de updates ARI e locks conforme guia (evita deadlock/race). 
+* Teste de concorrência (mínimo): 20 tentativas simultâneas criando hold na última unidade de inventário → **1 sucesso, 19 falhas limpas**.
+
+---
+
+### Marco M2 — Ingestão WhatsApp + Orquestração (evento entra, dedupe, task roda)
+
+* Endpoint WhatsApp (Meta/Evolution) seguindo contrato. 
+* Dedupe de mensagens/eventos e enfileiramento em Cloud Tasks. 
+* Worker “handle_message” que chama o motor de domínio (quote/hold) sem travar webhook.
+
+**Critério de aceite do M2:** receber 100 mensagens repetidas (retries) e processar **1 vez** (resto no-op), sem criar holds duplicados.
+
+---
+
+### Marco M3 — Fluxo MVP ponta-a-ponta (conversa simples + pagamento + confirmação)
+
+* State machine mínima de Conversation/Hold/Payment aplicada. 
+* IA (Gemini 2.5 Flash) só para **roteamento/extração** no MVP, com guardrails (sem “inventar” ações fora do permitido). 
+* Geração de link de pagamento e envio ao usuário; confirmação por webhook Stripe. 
+* Mensagem final de confirmação com dados essenciais (sem PII em log).
+
+**Critério de aceite do M3:** do WhatsApp ao “reserva confirmada” em staging, com um roteiro controlado.
+
+---
+
+### Marco M4 — Operação do piloto (rodar sem sofrimento)
+
+* Runbook real para: reprocessar webhooks, pagamentos sem reserva, stuck holds, etc. 
+* Alarmes/alertas do que derruba piloto: falha de conversão, crescimento de holds presos, erros Stripe, falha de task. 
+* Ferramenta/admin mínimo de onboarding (mesmo que seja CLI/endpoint interno) para cadastrar pousada, room types, ARI seed.
+
+**Critério de aceite do M4:** alguém (não-dev) consegue operar incidentes comuns com playbook.
+
+---
+
+## 3) Fatiamento correto: como escrever stories sem “trabalho invisível”
+
+Regra prática: **story só é válida se entrega uma capacidade observável** (endpoint, job, migração, métrica) e fecha com evidência.
+
+**Template de story (enxuto):**
+
+* Objetivo (1 frase)
+* Escopo (o que entra / o que NÃO entra)
+* Alterações (arquivos/módulos)
+* Riscos (concorrência, idempotência, PII, dinheiro)
+* Aceite (testes + comandos + outputs esperados)
+* Observabilidade (log/métrica/alarme tocados)
+
+## 4) Critérios de aceite e “Definition of Done” (reduz burocracia mantendo segurança)
+
+### DoD padrão (para quase tudo)
+
+* ✅ Testes unit/integration relevantes + smoke básico. 
+* ✅ Logs estruturados, sem payload bruto e sem PII. 
+* ✅ Idempotência explícita quando há retry/evento externo. 
+* ✅ Migração versionada quando altera schema (sem “rodar na mão”). 
+* ✅ Evidência: comandos executados + outputs (não “eu acho”).
+
+### DoD reforçado (dinheiro e inventário)
+
+* ✅ Teste de concorrência e retry (webhook duplicado / task duplicada)
+* ✅ `SELECT … FOR UPDATE` no hold onde compete (expire/cancel/convert)  
+* ✅ Guardas no `WHERE` do ARI para evitar overbooking 
+* ✅ Unique constraints que blindam duplicidade (reservation 1:1 por hold; payment dedupe por checkout.session.id) 
+
+## 5) Redução de burocracia (sem perder controle)
+
+* **Sem PRD novo / sem docs longas por story.** Só atualiza doc quando: muda decisão, contrato, ou invariantes. (Caso contrário, é ruído.)
+* **ADRs só quando travar decisão** (stack/região/provedor/consistência). Base já definida. 
+* **Checklist curto obrigatório** para mudanças críticas (inventário/pagamento/PII).
+* **Automação > reunião**: comandos padrão de validação rodando em CI.
+
+## 6) Próximo passo prático (ordem que reduz risco)
+
+1. Fechar DDL/migrações do core transacional (M0→M1).
+2. Implementar M1 completo (as 4 transações) com testes de concorrência.
+3. Só então plugar WhatsApp/Stripe/IA em cima (M2/M3), porque aí vocês integram sobre base sólida.
+
+---
+
+P0 — Guardrails (CI/Segurança) + Base Executável
+V2-S0.0 — CI com Quality Gates (G0–G2) como hard fail
+
+Depende: nada
+Entrega: pipeline de CI que barra erro antes de ir para staging/prod.
+Aceite (G0–G2):
+
+G0: compileall, build Docker, app sobe e responde /health
+
+G1: migrações rodam em DB vazio e rodam de novo (idempotente) + valida constraints críticas
+
+G2: falha se houver print( em código de produção; falha se logar “payload/body/request.json/webhook” sem redaction; falha se /internal/* estiver montado em router público
+Evidência: logs do CI mostrando gates rodando e passando.
+
+V2-S0.1 — Skeleton do serviço + healthcheck + config por ambiente
+
+Depende: V2-S0.0
+Aceite: /health 200; ENV=dev|staging|prod carrega config sem segredos hardcoded.
+Evidência: curl /health + python -m compileall -q .
+
+V2-S0.2 — Dockerfile + imagem executável
+
+Depende: V2-S0.1
+Aceite: build e run local; /health ok no container.
+Evidência: docker build + docker run + curl.
+
+V2-S0.3 — Deploy Cloud Run (dev) + conectividade Cloud SQL
+
+Depende: V2-S0.2
+Aceite: Cloud Run em us-central1; app conecta no Postgres via connector/proxy conforme decisão.
+Evidência: log de conexão + SELECT 1.
+
+V2-S0.4 — Cloud Tasks habilitado + fila padrão + endpoint worker “noop”
+
+Depende: V2-S0.3
+Aceite: criar task → worker executa 1 vez e confirma receipt durável.
+Evidência: execução no log + dedupe básico (task repetida vira no-op quando aplicável).
+
+P0 — Banco “SoT” + Idempotência + Outbox (não-negociável)
+V2-S1.1 — DDL core + migrações versionadas
+
+Depende: V2-S0.3
+Inclui (mínimo): properties, room_types, ari_days, holds, hold_nights, payments, reservations.
+Aceite: migração sobe do zero; constraints básicas existem.
+Evidência: migrate up em banco vazio + dump/inspeção de schema.
+
+V2-S1.2 — Idempotência formal: processed_events + idempotency_keys
+
+Depende: V2-S1.1
+Aceite: UNIQUE processed_events(source, external_id); UNIQUE idempotency_keys(property_id, scope, idempotency_key).
+Evidência: testes inserindo duplicado (1 efeito, resto no-op/erro controlado).
+
+V2-S1.3 — Outbox append-only (Postgres) + contrato mínimo de eventos
+
+Depende: V2-S1.1
+Aceite: tabela outbox_events append-only; evento é gravado na mesma transação das mudanças críticas.
+Eventos mínimos: hold.created|expired|cancelled, payment.received|succeeded|failed, reservation.confirmed.
+Evidência: teste: cria hold → existe linha no outbox com correlation_id e payload redigido.
+
+V2-S1.4 — Seed mínimo (dev) + compose “um comando”
+
+Depende: V2-S1.1
+Aceite: sobe Postgres+app; roda migrate+seed; cria 1 property, 1 room_type, ARI para range de datas.
+Evidência: docker compose up + queries provando registros.
+
+P0 — Transações Críticas (blindagem contra overbooking e duplicidade)
+V2-S2.1 — CREATE HOLD (transação crítica) + Gate G4 habilitado
+
+Depende: V2-S1.2, V2-S1.3
+Aceite:
+
+exige Idempotency-Key e persiste em idempotency_keys
+
+cria hold + hold_nights determinísticas
+
+atualiza ARI com guarda no WHERE (sem inventário negativo)
+
+grava outbox hold.created
+Evidência:
+
+teste concorrente (20 chamadas na última unidade): 1 sucesso, 19 falhas limpas (Gate G4)
+
+idempotência: mesma chave retorna mesma resposta, sem duplicar.
+
+V2-S2.2 — EXPIRE HOLD (Cloud Tasks) idempotente + Gate G3 (tasks)
+
+Depende: V2-S2.1, V2-S0.4
+Aceite:
+
+dedupe por (source='tasks', external_id=task_id) em processed_events
+
+SELECT … FOR UPDATE no hold
+
+se não elegível → no-op
+
+se expirar → inv_held-- por noite + status expired + outbox hold.expired
+Evidência: replay da mesma task 2x → 1 efeito (Gate G3).
+
+V2-S2.3 — CANCEL HOLD idempotente
+
+Depende: V2-S2.1
+Aceite: lock no hold; liberar ARI; status cancelled; outbox hold.cancelled.
+Evidência: cancelar 2x → no-op na segunda.
+
+V2-S2.4 — CONVERT HOLD (Stripe confirm → reserva) + Gate G5 habilitado
+
+Depende: V2-S2.1, V2-S1.2, V2-S1.3
+Aceite:
+
+dedupe do evento Stripe em processed_events
+
+upsert payment com UNIQUE (property_id, provider, provider_object_id)
+
+lock no hold; race-safe com expire/cancel
+
+se expirado → não cria reserva; marca payment para manual; outbox payment.received/failed
+
+se ok → inv_held-- e inv_booked++ por noite (ordem determinística), cria reservation UNIQUE por hold
+
+outbox reservation.confirmed + payment.succeeded
+Evidência: simular expire vs convert em paralelo → sem inventário negativo e no máx 1 reserva (Gate G5).
+
+P1 — Stripe (semântica correta de webhook e expiração coerente)
+V2-S3.1 — Criar Checkout Session com metadata canônica
+
+Depende: V2-S2.1
+Aceite: metadata inclui property_id, hold_id, conversation_id; expiração do checkout alinhada ao expires_at do hold.
+Evidência: teste sandbox criando sessão + valida metadata.
+
+V2-S3.2 — Webhook Stripe: ACK correto + enqueue (sem 2xx em falha interna) + Gate G3 (stripe)
+
+Depende: V2-S1.2, V2-S0.4
+Aceite:
+
+verifica assinatura
+
+2xx só após receipt durável (registrar processed_events e/ou enfileirar de forma durável)
+
+erro interno real → 5xx (para retry) ou receipt+task garantido
+Evidência: replay do mesmo evento 2x → 1 efeito (Gate G3).
+
+V2-S3.3 — Política “pagamento após expiração” + runbook curto
+
+Depende: V2-S2.4
+Aceite: status/flag operacional + procedimento de correção (manual/reprocess).
+Evidência: cenário simulado e query de identificação.
+
+P1 — WhatsApp (um único caminho, sem “3 fontes de verdade”)
+V2-S4.0 — Contrato interno único de mensagem (InboundMessage) + pipeline único
+
+Depende: V2-S0.1
+Aceite: existe um formato interno; providers só adaptam para ele; não existe lógica duplicada de orquestração.
+Evidência: testes de adaptação por provider.
+
+V2-S4.1 — Adaptadores inbound (Meta + Evolution) → InboundMessage
+
+Depende: V2-S4.0
+Aceite: normaliza message_id, from, text (redigido), timestamps; sem log de payload bruto.
+Evidência: fixtures de ambos providers passando.
+
+V2-S4.2 — Dedupe inbound + enqueue Cloud Tasks
+
+Depende: V2-S1.2, V2-S0.4
+Aceite: mesmo message_id 10x → 1 processamento; resto no-op.
+Evidência: replay e contadores/métricas.
+
+V2-S4.3 — Outbound sender (Tasks, retry/backoff)
+
+Depende: V2-S0.4
+Aceite: retry com backoff; logs com correlation_id; sem PII.
+Evidência: simular falha do provider e ver retries.
+
+P1 — Conversation/Quote/IA (MVP ponta-a-ponta)
+V2-S5.1 — State machine de Conversation (mínimo)
+
+Depende: V2-S4.2
+Aceite: estados open → quoting → holding → waiting_payment → confirmed; transições só por eventos.
+Evidência: testes de transições válidas/ inválidas.
+
+V2-S5.2 — Quote read-only (consistência simples) + Pricing determinístico inicial
+
+Depende: V2-S1.1
+Aceite: disponibilidade = inv_total - inv_booked - inv_held; pricing determinístico.
+Evidência: testes comparando quote vs ARI.
+
+V2-S5.3 — Golden tests de Pricing (Gate G6 habilitado quando pricing existe)
+
+Depende: V2-S5.2
+Aceite: golden tests para BPS, FIXED, PACKAGE ARRIVAL, PACKAGE OVERLAP (quando aplicável).
+Evidência: suite passando no CI (Gate G6).
+
+V2-S5.4 — IA como roteador (guardrails) + fallback determinístico
+
+Depende: V2-S5.1
+Aceite: IA só decide intenção/slots; ações críticas sempre chamam motor SQL; respostas com schema fixo.
+Evidência: golden tests de intenção + cenários de fallback.
+
+V2-S5.5 — E2E staging: WhatsApp → Quote → Hold → Stripe → Confirmado
+
+Depende: V2-S3.2, V2-S4.2, V2-S2.4
+Aceite: fluxo completo; replay de webhooks/mensagens não duplica; overbooking = 0 em stress pequeno.
+Evidência: script e2e + logs correlacionados.
+
+P2 — Operação e Observabilidade (rodar piloto sem sangrar)
+V2-S6.1 — Correlation_id end-to-end + logs estruturados com redaction
+
+Depende: V2-S0.1
+Aceite: todo request/task/webhook propaga correlation_id; nada de payload raw.
+Evidência: 1 trace completo nos logs.
+
+V2-S6.2 — Métricas mínimas + alertas do piloto
+
+Depende: V2-S6.1
+Aceite: contadores (inbound, holds, expirations, conversions, errors) + alertas (stuck holds, falha webhook, falha task, erro DB).
+Evidência: teste de disparo em staging.
+
+V2-S6.3 — SQLs operacionais (reconcile/stuck/payments_without_reservation/reprocess_candidates)
+
+Depende: V2-S2.4
+Aceite: queries rodam e retornam casos em fixtures controladas.
+Evidência: outputs no CI/staging.
+
+V2-S6.4 — Runbook de incidentes (curto, acionável)
+
+Depende: V2-S6.2
+Aceite: procedimentos para reprocess webhook, pagamento sem reserva, stuck holds, rollback/redeploy.
+Evidência: simulação guiada em staging.
+
+------
+
+Sprint 0 / 1 / 2 (plano executável, com corte de escopo e gates)
+
+Meta geral: no fim da Sprint 2 existe fluxo ponta-a-ponta em staging (mensagem → hold → pagamento → confirmação) com idempotência e sem overbooking. O resto fica fora.
+
+Sprint 0 — “Base + Gates + DB pronto para transação”
+
+Objetivo: ter pipeline e ambiente dev “incontestáveis”: build/deploy, DB com migrações, idempotência e outbox prontos para suportar as transações críticas.
+
+Escopo (entra)
+
+V2-S0.0 — CI com Quality Gates (G0–G2)
+
+V2-S0.1 — Skeleton + healthcheck + config por env
+
+V2-S0.2 — Dockerfile
+
+V2-S0.3 — Cloud Run dev + Cloud SQL conectando
+
+V2-S0.4 — Cloud Tasks + fila + worker noop
+
+V2-S1.1 — DDL core + migrações versionadas
+
+V2-S1.2 — processed_events + idempotency_keys
+
+V2-S1.3 — Outbox append-only + contrato mínimo de eventos
+
+V2-S1.4 — Seed mínimo + compose “um comando”
+
+Fora (não entra)
+
+WhatsApp real, Stripe real, IA, UI/admin (só seed/fixtures)
+
+Definition of Done (Sprint 0)
+
+CI falha quando viola gates
+
+Deploy dev rodando e conectado ao Postgres
+
+Migrações sobem do zero + seed cria cenário mínimo
+
+Outbox grava evento dentro de transação (teste prova)
+
+Evidências obrigatórias (Sprint 0)
+
+Log do CI com G0–G2 passando
+
+curl /health no Cloud Run (dev)
+
+migrate up + query listando tabelas e constraints críticas
+
+Teste de duplicidade em processed_events e idempotency_keys
+
+Entrega ao final: “plataforma” onde dá para implementar E2 sem medo.
+
+Sprint 1 — “Motor transacional blindado”
+
+Objetivo: implementar as 4 transações críticas com idempotência real, concorrência correta e outbox emitindo eventos. Aqui nasce a V2.
+
+Escopo (entra)
+
+V2-S2.1 — CREATE HOLD (com Gate G4)
+
+V2-S2.2 — EXPIRE HOLD (Tasks) (com Gate G3 de tasks)
+
+V2-S2.3 — CANCEL HOLD
+
+V2-S2.4 — CONVERT HOLD (sem Stripe ainda; entrada por comando interno/fixture) (com Gate G5)
+
+Fora (não entra)
+
+Integração Stripe/WhatsApp/IA (só simulação por fixtures/endpoint interno protegido)
+
+Observabilidade “bonita” (só o suficiente para debug)
+
+Definition of Done (Sprint 1)
+
+Overbooking impossível no teste de concorrência
+
+Idempotência provada com replay (mesma chave/evento não duplica)
+
+Race expire vs convert coberta por teste
+
+Outbox sempre emitida nas mudanças críticas
+
+Evidências obrigatórias (Sprint 1)
+
+Teste concorrente “última unidade”: 1 sucesso, N-1 falhas limpas (G4)
+
+Replay de task/convert 2x: 1 efeito (G3/G5)
+
+Teste race expire vs convert em paralelo
+
+Queries provando ARI consistente (inv_held/inv_booked nunca negativo)
+
+Entrega ao final: núcleo confiável que segura dinheiro e inventário.
+
+Sprint 2 — “Integrações mínimas + E2E staging”
+
+Objetivo: fechar o loop real com o mínimo de WhatsApp + Stripe e confirmar reserva em staging, mantendo os gates.
+
+Escopo (entra)
+Stripe
+
+V2-S3.1 — Criar Checkout Session (metadata canônica + expiração alinhada ao hold)
+
+V2-S3.2 — Webhook Stripe com ACK correto + enqueue (Gate G3 stripe)
+
+V2-S3.3 — Política “pagamento após expiração” (flag + runbook curto)
+
+WhatsApp (mínimo)
+
+V2-S4.0 — Contrato interno único de mensagem
+
+V2-S4.1 — Adaptador inbound (escolher 1 provider primeiro: Meta ou Evolution; o segundo fica para Sprint 3)
+
+V2-S4.2 — Dedupe inbound + enqueue Tasks
+
+V2-S4.3 — Outbound sender (Tasks + retry)
+
+Orquestração mínima
+
+V2-S5.1 — Conversation state machine mínima
+
+V2-S5.2 — Quote read-only simples (sem pricing avançado)
+
+V2-S5.5 — E2E staging (mensagem → quote → hold → stripe → confirmado)
+
+Fora (não entra)
+
+IA (Sprint 3)
+
+Golden tests de pricing avançado (Sprint 3, quando pricing existir)
+
+Observabilidade completa (Sprint 3; por enquanto logs + correlation id básico)
+
+Definition of Done (Sprint 2)
+
+Em staging, uma conversa controlada cria hold, gera link, recebe webhook e converte em reserva
+
+Replays (mensagem/webhook) não duplicam
+
+Caso “pagou depois de expirar” cai no fluxo operacional correto (flag/runbook)
+
+Evidências obrigatórias (Sprint 2)
+
+Script E2E (ou coleção Postman) rodando e gerando:
+
+1 hold
+
+1 checkout session
+
+1 payment recebido/sucedido
+
+1 reservation confirmada
+
+Replay de inbound message_id e stripe event_id: no-op
+
+Logs com correlation_id amarrando o fluxo inteiro
+
+Entrega ao final: MVP transacional funcional em staging, pronto para piloto controlado (sem IA).
+
+Sprint 3 (preview, só para alinhar expectativa)
+
+IA roteadora com guardrails (V2-S5.4)
+
+Golden tests pricing (V2-S5.3)
+
+Segundo provider WhatsApp
+
+Observabilidade/alertas completos (E6)
+
+Regra de corte (para não estourar sprint)
+
+Se surgir algo “legal de ter”, mas não é:
+
+gate / idempotência / inventário / webhook ACK correto / E2E
+então não entra nas Sprints 0–2.
+

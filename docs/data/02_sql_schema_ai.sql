@@ -1,0 +1,15 @@
+-- docs/data/02_sql_schema_ai.sql
+-- Hotelly V2 — Schema AI (DEFERIDO PÓS-MVP)
+--
+-- Objetivo futuro (não-MVP):
+-- - Versionar prompts e schemas de saída (intent/slots)
+-- - Registrar "AI traces" redigidos (sem PII) para melhoria contínua
+-- - A/B testing de prompts (quando aplicável)
+--
+-- Decisão (por enquanto):
+-- - O MVP NÃO depende de persistência específica de IA no Postgres.
+-- - Observabilidade de IA fica em logs/métricas (sem payload bruto), conforme docs/operations/04_observability.md.
+--
+-- Quando ativar:
+-- - Criar ADR específico para armazenamento (Postgres vs BigQuery vs Vertex AI Search/Feature Store).
+-- - Definir retenção, anonimização e governança.
