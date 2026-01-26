@@ -32,3 +32,5 @@ bash scripts/context_pack.sh
 ```
 
 Cole o output na nova conversa para rehidratar o contexto do projeto.
+
+[ci bootstrap]
