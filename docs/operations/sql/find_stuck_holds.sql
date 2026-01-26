@@ -11,7 +11,6 @@ SELECT
   now() AS now_utc,
   (now() - h.expires_at) AS overdue_by,
   h.conversation_id,
-  h.quote_id,
   h.quote_option_id,
   h.created_at,
   h.updated_at

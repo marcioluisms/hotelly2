@@ -13,7 +13,6 @@ Criar um **hold** que reserva inventário com expiração, garantindo **zero ove
 ## Entrada
 - `property_id`
 - `conversation_id`
-- `quote_id`
 - `quote_option_id` (contém `room_type_id`, `rate_plan_id`, `total_cents`)
 - `checkin`, `checkout`
 - `expires_at`
@@ -41,8 +40,8 @@ BEGIN;
 -- Se já existia, retornar a resposta gravada.
 
 -- 1) Criar hold
-INSERT INTO holds(id, property_id, conversation_id, quote_id, quote_option_id, status, expires_at)
-VALUES (gen_random_uuid(), :property_id, :conversation_id, :quote_id, :quote_option_id, 'active', :expires_at)
+INSERT INTO holds(id, property_id, conversation_id, quote_option_id, status, expires_at)
+VALUES (gen_random_uuid(), :property_id, :conversation_id, :quote_option_id, 'active', :expires_at)
 RETURNING id;
 
 -- 2) Inserir noites do hold (no app, ou via generate_series)
