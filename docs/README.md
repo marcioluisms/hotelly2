@@ -120,7 +120,7 @@ Conteúdo:
 ### T1. Arquitetura de Referência
 
 📄 `01_reference_architecture.md`
-**Status:** 🔴 **A COMPLETAR (faltam diagramas, fronteiras e fluxos)**
+**Status:** 🟢 **PRONTO (MVP: componentes, fronteiras e fluxos mínimos; diagramas detalhados podem evoluir)**
 **Maturidade:** ⚠️ **CONCEITUAL**
 
 ---
@@ -130,7 +130,7 @@ Conteúdo:
 ### T2. Modelo de Domínio e State Machines
 
 📄 `01_state_machines.md`
-**Status:** 🔴 **A COMPLETAR (transições completas + eventos/outbox + diagramas)**
+**Status:** 🟢 **PRONTO (MVP: estados, transições e invariantes; diagramas podem evoluir)**
 **Maturidade:** ⚠️ **CONCEITUAL**
 
 ---
