@@ -34,7 +34,7 @@ BEGIN;
 -- 0) Dedupe do job/task
 INSERT INTO processed_events(property_id, source, external_id)
 VALUES (:property_id, 'tasks', :task_id)
-ON CONFLICT (source, external_id) DO NOTHING;
+ON CONFLICT (property_id, source, external_id) DO NOTHING;
 
 -- Se já existia, sair (idempotente)
 

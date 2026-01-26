@@ -42,7 +42,7 @@ BEGIN;
 -- 0) Dedupe do webhook
 INSERT INTO processed_events(property_id, source, external_id)
 VALUES (:property_id, 'stripe', :stripe_event_id)
-ON CONFLICT (source, external_id) DO NOTHING;
+ON CONFLICT (property_id, source, external_id) DO NOTHING;
 
 -- Se já existia, sair (idempotente)
 

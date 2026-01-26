@@ -1,16 +1,10 @@
--- Hotelly V2 — Cloud SQL (Postgres) — Core Schema
--- File: docs/data/01_sql_schema_core.sql
+-- Hotelly V2 — Cloud SQL (Postgres) — Core Schema (FONTE DE VERDADE)
+-- File: migrations/sql/001_initial.sql
 -- Goal: Minimal, opinionated DDL to support critical transactions (ARI, holds, payments, reservations, idempotency, dedupe, outbox).
 --
--- IMPORTANT (DERIVADO):
--- - A FONTE DE VERDADE do schema são as migrations em /migrations.
--- - Não edite este arquivo para "aplicar" schema. Alterações devem ser feitas via migrations.
--- - Este arquivo existe para leitura humana e referência rápida.
--- - Para schema inicial e mudanças P1, veja:
---     - migrations/sql/001_initial.sql
---     - migrations/sql/002_schema_p1.sql
-
-BEGIN;
+-- IMPORTANT:
+-- - Nao usar BEGIN/COMMIT aqui (Alembic ja gerencia transacoes).
+-- - Alteracoes de schema devem ser feitas via migrations; docs/data/* e derivado.
 
 -- UUID helpers
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -285,5 +279,3 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 
 CREATE INDEX IF NOT EXISTS idx_outbox_events_property_time
   ON outbox_events(property_id, occurred_at DESC);
-
-COMMIT;

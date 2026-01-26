@@ -73,7 +73,7 @@ Adicione se ainda não estiverem:
 
 * `holds(property_id, status, expires_at)` (já tem)
 * `payments(property_id, hold_id, status)` (já tem)
-* `processed_events(source, external_id)` unique (já tem)
+* `processed_events(property_id, source, external_id)` unique (já tem)
 
 ---
 
@@ -163,7 +163,7 @@ BEGIN;
 -- 0) Dedupe de task
 INSERT INTO processed_events(property_id, source, external_id)
 VALUES (:property_id, 'tasks', :task_id)
-ON CONFLICT (source, external_id) DO NOTHING;
+ON CONFLICT (property_id, source, external_id) DO NOTHING;
 
 -- se já existia: COMMIT e exit (idempotente)
 
@@ -228,7 +228,7 @@ BEGIN;
 -- 0) Dedupe webhook
 INSERT INTO processed_events(property_id, source, external_id)
 VALUES (:property_id, 'stripe', :stripe_event_id)
-ON CONFLICT (source, external_id) DO NOTHING;
+ON CONFLICT (property_id, source, external_id) DO NOTHING;
 
 -- se já existia: COMMIT e exit
 
