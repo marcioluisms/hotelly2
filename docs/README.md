@@ -155,7 +155,7 @@ Conteúdo:
 
 📁 `docs/integrations/`
 
-### T4. Contrato WhatsApp (Meta + Evolution)
+### T4. Contrato WhatsApp (provider inicial: Evolution)
 
 📄 `whatsapp_contract.md`
 **Status:** 🟢 **PRONTO**
