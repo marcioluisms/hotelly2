@@ -11,17 +11,32 @@ Este documento é **normativo**: se um comando “oficial” não existir no rep
 
 ---
 
-## Pré‑requisitos
+## Pré-requisitos
 Obrigatórios:
-- Docker + Docker Compose v2
 - Git
+- `uv` (gerenciador de dependências e runner)
+- Acesso a um Postgres (local ou remoto) configurado via `DATABASE_URL`
 
 Recomendados (para debug e integração com GCP):
-- Python (mesma versão definida no projeto)
 - `psql` (cliente Postgres)
 - Google Cloud SDK (`gcloud`)
 - Stripe CLI (para replay realista de webhooks)
 - (Opcional) `jq`
+- Docker (útil para subir Postgres local rapidamente)
+
+---
+
+## Estado atual no repo (hoje)
+O repositório **já suporta** desenvolvimento local via `uv` e script:
+- `uv sync --all-extras`
+- `./scripts/dev.sh` (sobe API com hot-reload)
+
+E o repositório **ainda NÃO possui** (TARGET / backlog):
+- `docker-compose.yml`
+- `Makefile`
+- `.env.example`
+
+Este documento separa o que é **executável hoje** do que é **TARGET**.
 
 ---
 
@@ -36,42 +51,38 @@ Recomendados (para debug e integração com GCP):
 ---
 
 ## TL;DR (quickstart)
-1) Subir infra local:
+1) Instalar deps:
 ```bash
-docker compose up -d --build
+uv sync --all-extras
 ```
 
-2) Aplicar schema (um dos dois caminhos):
-- **A) Migrações (preferido)**:
+2) Configurar ambiente (`.env.local`) com `DATABASE_URL` apontando para um Postgres acessível.
+
+3) Aplicar schema core (se estiver usando um DB vazio):
 ```bash
-docker compose exec app make migrate
-# ou: docker compose exec app alembic upgrade head
-```
-- **B) SQL core (fallback)**:
-```bash
-docker compose exec -T db psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hotelly} < docs/data/01_sql_schema_core.sql
+psql "${DATABASE_URL}" -f docs/data/01_sql_schema_core.sql
 ```
 
-3) Seed mínimo:
+4) Subir a API:
 ```bash
-docker compose exec app make seed-minimal
-# ou: docker compose exec app python -m hotelly.scripts.seed_minimal
+./scripts/dev.sh
 ```
 
-4) Rodar testes (gates locais):
+5) Rodar testes:
 ```bash
-docker compose exec app make test
-# ou: docker compose exec app pytest -q
+uv run pytest -q
 ```
 
-5) Smoke:
+6) Smoke:
 ```bash
 curl -sS http://localhost:${APP_PORT:-8000}/health
 ```
 
 ---
 
-## Docker Compose (layout esperado)
+## Docker Compose (TARGET)
+**TARGET / backlog:** padronizar `docker-compose.yml` (Postgres + app) e comandos únicos (Makefile/scripts).
+
 A execução local deve ter, no mínimo, estes serviços:
 - `db`: Postgres
 - `app`: API (FastAPI)
@@ -86,7 +97,7 @@ Se o repo ainda não tiver `docker-compose.yml`, crie como parte do backlog (Spr
 ---
 
 ## Arquivo `.env.local` (mínimo)
-Crie `.env.local` a partir de `.env.example` (se existir) ou manualmente.
+Crie `.env.local` manualmente (não há `.env.example` versionado hoje).
 
 Exemplo (ajuste nomes conforme o código):
 ```env
@@ -97,7 +108,7 @@ APP_PORT=8000
 POSTGRES_DB=hotelly
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
-DATABASE_URL=postgresql://postgres:postgres@db:5432/hotelly
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/hotelly
 
 # Logs
 LOG_LEVEL=INFO
@@ -120,7 +131,7 @@ Notas:
 
 ---
 
-## Comandos “oficiais” (make targets)
+## Comandos "oficiais" (make targets) — TARGET
 Recomendação: padronizar `make` para reduzir variação local.
 
 Targets mínimos:
@@ -173,11 +184,11 @@ Use isso só se estiver iterando rápido em código Python.
 Exemplo:
 ```bash
 export $(cat .env.local | xargs)  # cuidado com espaços/quotes
-python -m uvicorn hotelly.api.app:app --reload --host 0.0.0.0 --port ${APP_PORT:-8000}
+uv run uvicorn hotelly.api.app:app --reload --host 0.0.0.0 --port ${APP_PORT:-8000}
 ```
 
 Regras:
-- Ainda assim, o Postgres deve estar no Docker.
+- Ainda assim, o Postgres deve estar acessível via `DATABASE_URL` (local, Docker ou remoto).
 - Logs devem continuar sem payload raw/PII.
 
 ---
@@ -251,7 +262,10 @@ O que validar:
 
 ---
 
-## Suite mínima local (espelha os Quality Gates)
+## Suite mínima local (TARGET: espelhar Quality Gates)
+**Nota:** os gates G0–G6 são TARGET (ver `02_cicd_environments.md`). Enquanto não houver script oficial/CI cobrindo,
+use esta seção como checklist local.
+
 Rodar antes de fechar qualquer story relevante:
 
 - G0 — build & startup:
