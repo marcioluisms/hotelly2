@@ -107,10 +107,20 @@ Este documento é **normativo**: se uma etapa “oficial” não existir no repo
 
 ## CI — Pipeline (sempre)
 
+### Estado atual (repo hoje)
+No momento, o CI no repositório cobre apenas o mínimo (ex.: `compileall` e `pytest`).
+Os **Quality Gates (G0–G6)** abaixo representam o **alvo normativo** do projeto.
+Até estarem implementados no CI (ou em um script local padronizado), eles **não podem ser tratados como "aplicados"**.
+
+Regra: qualquer item descrito como gate e ainda não implementado deve virar tarefa explícita (story) antes de ser usado como critério de aceite.
+
 ### Gatilhos
 - Pull Request (feature → main): roda CI completo.
 - Push/merge em `main`: roda CI completo + (opcional) deploy automático `dev`.
 - Tag `v*`: roda CI + promove (staging/prod conforme regra abaixo).
+
+> Nota: "CI completo" aqui significa **o que existe no repo**. Quando os gates forem implementados,
+> esta seção permanece válida e passa a refletir a prática.
 
 ### Jobs mínimos (ordem)
 1) **Lint/format** (rápido)
@@ -121,6 +131,9 @@ Este documento é **normativo**: se uma etapa “oficial” não existir no repo
 
 ### Quality Gates (hard fail)
 Os gates são a régua objetiva. Se falhar, não fecha story.
+
+**Importante:** a lista abaixo é o **TARGET** (normativo).
+Marque um gate como "aplicável" somente quando houver implementação real no CI (ou script oficial versionado).
 
 - **G0 — Build & Startup**
   - `python -m compileall -q src` (ou raiz)
