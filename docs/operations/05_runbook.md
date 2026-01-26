@@ -4,6 +4,14 @@
 
 ## 1. Escopo
 
+## Estado atual do repo (importante)
+No momento, o serviço FastAPI expõe apenas `/health` e ainda não possui rotas implementadas para:
+- `/webhooks/*`
+- `/tasks/*`
+
+Portanto, qualquer passo que mencione "reenfileirar task", "chamar handler /tasks/..." ou "endpoint interno"
+deve ser tratado como **TARGET** até que as rotas/infra de Cloud Tasks estejam implementadas.
+
 Este runbook cobre:
 
 - Incidentes em **inventário/ARI**, **holds**, **pagamentos/Stripe**, **WhatsApp**, **Cloud Tasks**, **Cloud Run**, **Cloud SQL**.
@@ -121,11 +129,11 @@ Fora de escopo: suporte ao cliente final (mensagens de atendimento), melhorias d
 3) Rodar SQL de diagnóstico (repo):
    - `docs/operations/sql/payments_without_reservation.sql`
 4) Determinar a ação:
-   - Se hold ainda **active** e dentro do prazo: **reprocessar convert** via fila (preferível) ou endpoint interno.
+   - Se hold ainda **active** e dentro do prazo: **TARGET** — reprocessar convert via fila/endpoint interno quando `/tasks/*` existir.
    - Se hold **expired**: não criar reserva automaticamente. Aplicar política “pagamento após expiração” (manual/reacomodação/reembolso).
 
 **Mitigação rápida:**
-- Reenfileirar convert para um payment/hold específico (sempre idempotente).
+- **TARGET** — reenfileirar convert para um payment/hold específico (sempre idempotente) quando tasks existirem.
 - Se falha recorrente: pausar webhook Stripe e corrigir receipt.
 
 ---
@@ -142,7 +150,7 @@ Fora de escopo: suporte ao cliente final (mensagens de atendimento), melhorias d
    - `docs/operations/sql/find_stuck_holds.sql`
 3) Para cada hold:
    - Confirmar que está `active` e `expires_at < now()`.
-   - Enfileirar task de expire para o hold (preferível).
+   - **TARGET** — enfileirar task de expire para o hold (quando tasks existirem).
 4) Se tasks estiverem quebradas:
    - Executar um job manual de expire em lote (controlado, com limite) usando o mesmo código do worker.
 5) Validar ARI pós-expiração.
