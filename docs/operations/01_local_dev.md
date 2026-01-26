@@ -155,7 +155,7 @@ docker compose exec db psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hote
 ### Queries de sanidade (inventário e invariantes)
 **1) Checar overbooking (deve ser 0 linhas):**
 ```sql
-SELECT property_id, room_type_id, day
+SELECT property_id, room_type_id, date
 FROM ari_days
 WHERE (inv_booked + inv_held) > inv_total;
 ```
@@ -172,8 +172,12 @@ ORDER BY expires_at ASC;
 ```sql
 SELECT p.*
 FROM payments p
-LEFT JOIN reservations r ON r.payment_id = p.id
-WHERE p.status = 'succeeded' AND r.id IS NULL;
+LEFT JOIN reservations r
+  ON r.property_id = p.property_id
+  AND r.hold_id = p.hold_id
+WHERE p.status = 'succeeded'
+  AND r.id IS NULL
+  AND p.created_at < now() - interval '15 minutes';
 ```
 
 ---
@@ -244,7 +248,7 @@ Regra: **um único contrato interno** de mensagem; provider só adapta.
 
 Exemplo genérico de POST (payload *redigido*):
 ```bash
-curl -sS -X POST "http://localhost:${APP_PORT:-8000}/webhooks/whatsapp" \
+curl -sS -X POST "http://localhost:${APP_PORT:-8000}/webhooks/whatsapp/evolution" \
   -H "Content-Type: application/json" \
   -H "X-Correlation-Id: dev-123" \
   -d '{

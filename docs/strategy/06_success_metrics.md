@@ -162,7 +162,7 @@ Mesmo com pricing em aberto, medir já (para não pilotar no escuro).
 
 **U1 — GMV (Gross Merchandise Value) processado**
 - **Definição:** soma dos valores de reservas confirmadas (antes de taxa).
-- **Fonte:** `reservations.total_amount_cents` / Stripe.
+- **Fonte:** `reservations.total_cents` / Stripe.
 
 **U2 — Custo variável por reserva**
 - **Definição:** (custos de infra + provedores por período) / reservas confirmadas.

@@ -10,6 +10,25 @@ Este arquivo é a **porta de entrada** da documentação do repositório.
 
 ---
 
+## Nomenclatura Canônica
+
+Convenções obrigatórias para nomes de campos no schema e documentação:
+
+| Padrão | Tipo | Descrição | Exemplo |
+|--------|------|-----------|---------|
+| `*_cents` | INT | Valores monetários em centavos | `amount_cents`, `total_cents` |
+| `total_cents` | INT | Valor total em holds/reservations | `holds.total_cents` |
+| `amount_cents` | INT | Valor em payments | `payments.amount_cents` |
+| `base_rate_cents` | INT | Diária base em ARI | `ari_days.base_rate_cents` |
+| `currency` | TEXT | Código ISO 4217 | `BRL`, `USD` |
+| `*_at` | TIMESTAMPTZ | Timestamps (sempre UTC) | `created_at`, `expires_at` |
+| `*_id` | TEXT ou UUID | Identificadores | `property_id`, `hold_id` |
+| `date` | DATE | Datas de calendário (sem hora) | `ari_days.date`, `holds.checkin` |
+
+**Regra:** nunca usar `total_amount_cents`, `day`, ou variações não listadas acima.
+
+---
+
 # ÍNDICE DEFINITIVO — DOCUMENTAÇÃO HOTELLY V2
 
 ### Legenda de maturidade

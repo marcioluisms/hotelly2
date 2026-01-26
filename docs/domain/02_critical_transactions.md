@@ -105,8 +105,8 @@ ON CONFLICT (property_id, scope, idempotency_key) DO NOTHING;
 -- SELECT response_json ...; COMMIT;
 
 -- 1) Inserir hold como ACTIVE (ainda sem inventário aplicado? você escolhe)
-INSERT INTO holds(id, property_id, conversation_id, quote_id, quote_option_id, status, expires_at)
-VALUES (gen_random_uuid(), :property_id, :conversation_id, :quote_id, :quote_option_id, 'active', :expires_at)
+INSERT INTO holds(id, property_id, conversation_id, quote_option_id, status, checkin, checkout, total_cents, currency, expires_at)
+VALUES (gen_random_uuid(), :property_id, :conversation_id, :quote_option_id, 'active', :checkin, :checkout, :total_cents, :currency, :expires_at)
 RETURNING id INTO :hold_id;
 
 -- 2) Gerar linhas de noites (hold_nights) em ordem determinística
