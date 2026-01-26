@@ -42,6 +42,13 @@ Este documento é **normativo**: se uma etapa “oficial” não existir no repo
 
 ## Topologia recomendada por ambiente (GCP)
 
+### Estado atual do repo (importante)
+No momento, o serviço FastAPI no repositório expõe apenas `/health`.
+Os paths `/webhooks/*` e `/tasks/*` descritos abaixo são o **TARGET** de arquitetura/infra
+e só passam a ser "verdade operacional" quando estiverem implementados no código e no deploy.
+
+Enquanto isso, trate estas seções como especificação do sistema-alvo.
+
 ### Opção preferida (mais segura): **2 serviços Cloud Run**
 1) **`hotelly-public`** (público)
    - Só expõe: `/webhooks/stripe/*`, `/webhooks/whatsapp/*`, `/health`
