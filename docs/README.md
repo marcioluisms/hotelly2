@@ -12,6 +12,11 @@ Este arquivo é a **porta de entrada** da documentação do repositório.
 
 # ÍNDICE DEFINITIVO — DOCUMENTAÇÃO HOTELLY V2
 
+### Legenda de maturidade
+
+- **Status** (qualidade do texto): 🟢 PRONTO | 🟡 PARCIAL | 🔴 A COMPLETAR
+- **Maturidade** (o que dá para executar hoje): ✅ EXECUTÁVEL NO REPO | ⚠️ CONCEITUAL/DEPENDE DE ARTEFATOS | 🎯 TARGET (pós-MVP)
+
 ## 🔵 NÍVEL ESTRATÉGICO
 
 **Objetivo:** definir direção, limites e critérios de sucesso
@@ -22,7 +27,8 @@ Este arquivo é a **porta de entrada** da documentação do repositório.
 ### S1. Visão, North Star e Tese do Produto
 
 📄 `01_north_star.md`
-**Status:** 🟢 **PRONTO (base V1 + decisões V2)**
+**Status:** 🟡 **PARCIAL (esboço; expandir antes do piloto)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 Conteúdo:
 
 * O que é o Hotelly
@@ -36,7 +42,8 @@ Conteúdo:
 ### S2. ICP e Segmentação
 
 📄 `02_icp_segmentation.md`
-**Status:** 🟢 **PRONTO (V1)**
+**Status:** 🟡 **PARCIAL (esboço; expandir)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 Conteúdo:
 
 * Tipo de pousada
@@ -48,7 +55,8 @@ Conteúdo:
 ### S3. Estratégia de Piloto
 
 📄 `03_pilot_strategy.md`
-**Status:** 🟢 **PRONTO (decidido aqui)**
+**Status:** 🟡 **PARCIAL (esboço; expandir critérios de saída e operação)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 Conteúdo:
 
 * Até 10 pousadas
@@ -62,7 +70,8 @@ Conteúdo:
 ### S4. Modelo de Receita e Pricing
 
 📄 `04_pricing_unit_economics.md`
-**Status:** 🟡 **PARCIAL (base V1)**
+**Status:** 🟢 **PRONTO (orientativo; validar com dados do piloto)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 Aberto:
 
 * Fee por reserva (sim/não)
@@ -73,7 +82,8 @@ Aberto:
 ### S5. Roadmap por Capabilities
 
 📄 `05_capability_roadmap.md`
-**Status:** 🟢 **PRONTO (V1)**
+**Status:** 🟡 **PARCIAL (alto nível; detalhar por capability)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 Conteúdo:
 
 * Conversa
@@ -89,7 +99,8 @@ Conteúdo:
 ### S6. Critérios de Sucesso e Métricas
 
 📄 `06_success_metrics.md`
-**Status:** 🔴 **A ESCREVER**
+**Status:** 🟢 **PRONTO**
+**Maturidade:** ⚠️ **CONCEITUAL** (vira executável quando dashboards/alerts existirem)
 Conteúdo:
 
 * Conversão WhatsApp → pagamento
@@ -109,7 +120,8 @@ Conteúdo:
 ### T1. Arquitetura de Referência
 
 📄 `01_reference_architecture.md`
-**Status:** 🟢 **PRONTO**
+**Status:** 🔴 **A COMPLETAR (faltam diagramas, fronteiras e fluxos)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 
 ---
 
@@ -118,7 +130,8 @@ Conteúdo:
 ### T2. Modelo de Domínio e State Machines
 
 📄 `01_state_machines.md`
-**Status:** 🟢 **PRONTO**
+**Status:** 🔴 **A COMPLETAR (transições completas + eventos/outbox + diagramas)**
+**Maturidade:** ⚠️ **CONCEITUAL**
 
 ---
 
@@ -127,9 +140,16 @@ Conteúdo:
 ### T3. Modelo de Dados — Cloud SQL (SoT)
 
 📄 `01_sql_schema_core.sql`
+**Status:** 🟡 **PARCIAL (core existe; alinhar inconsistências schema↔docs↔SQL)**
+**Maturidade:** ✅ **EXECUTÁVEL NO REPO** (após alinhar inconsistências)
+
 📄 `02_sql_schema_ai.sql`
+**Status:** 🟢 **PRONTO (decisão: deferido pós-MVP)**
+**Maturidade:** 🎯 **TARGET**
+
 📄 `03_sql_schema_knowledge.sql`
-**Status:** 🟡 **EM ANDAMENTO (DDL a gerar)**
+**Status:** 🟢 **PRONTO (decisão: deferido pós-MVP)**
+**Maturidade:** 🎯 **TARGET**
 
 ---
 
@@ -139,14 +159,16 @@ Conteúdo:
 
 📄 `whatsapp_contract.md`
 **Status:** 🟢 **PRONTO**
+**Maturidade:** ✅ **USÁVEL COMO CONTRATO**
 
 ### T5. Contrato Stripe
 
 📄 `stripe_contract.md`
 **Status:** 🟢 **PRONTO**
+**Maturidade:** ✅ **USÁVEL COMO CONTRATO**
 Decisão:
 
-* Evento canônico: `checkout.session.completed`
+* Evento canônico: `checkout.session.completed` (converter apenas se `payment_status == "paid"`)
 
 ---
 
@@ -154,11 +176,11 @@ Decisão:
 
 ### ADRs (decisões travadas)
 
-* `ADR-000-base-decisions.md` ✅
-* `ADR-001-database-cloud-sql.md` 🔴
-* `ADR-002-ai-model-gemini-2.5-flash.md` 🔴
-* `ADR-003-region-us-central1.md` 🔴
-* `ADR-004-whatsapp-providers.md` 🔴
+* `ADR-000-base-decisions.md` 🟡
+* `ADR-001-database-cloud-sql.md` ✅
+* `ADR-002-ai-model-gemini-2.5-flash.md` ✅
+* `ADR-003-region-us-central1.md` ✅
+* `ADR-004-whatsapp-providers.md` ✅
 
 ---
 
@@ -172,7 +194,8 @@ Decisão:
 ### O1. Desenvolvimento Local
 
 📄 `01_local_dev.md`
-**Status:** 🔴 **A ESCREVER**
+**Status:** 🟡 **PARCIAL (conteúdo detalhado; falta tornar executável com compose/make/.env)**
+**Maturidade:** ⚠️ **DEPENDE DE ARTEFATOS**
 Conteúdo:
 
 * Docker / compose
@@ -185,21 +208,24 @@ Conteúdo:
 ### O2. CI/CD e Ambientes
 
 📄 `02_cicd_environments.md`
-**Status:** 🔴 **A ESCREVER**
+**Status:** 🟡 **PARCIAL (política definida; CI ainda não cobre gates)**
+**Maturidade:** ⚠️ **DEPENDE DE IMPLEMENTAÇÃO**
 
 ---
 
 ### O3. Testes e Regressão
 
 📄 `03_test_plan.md`
-**Status:** 🟡 **PARCIAL (V1 excelente, adaptar para SQL)**
+**Status:** 🟡 **PARCIAL (bom; falta refletir testes realmente implementados)**
+**Maturidade:** ⚠️ **DEPENDE DE IMPLEMENTAÇÃO**
 
 ---
 
 ### O4. Observabilidade
 
 📄 `04_observability.md`
-**Status:** 🔴 **A ESCREVER**
+**Status:** 🟡 **PARCIAL (bom; falta instrumentação/dashboards/alerts no ambiente)**
+**Maturidade:** ⚠️ **DEPENDE DE IMPLEMENTAÇÃO**
 Conteúdo:
 
 * Logs estruturados
@@ -211,7 +237,8 @@ Conteúdo:
 ### O5. Runbook Operacional
 
 📄 `05_runbook.md`
-**Status:** 🔴 **A ESCREVER**
+**Status:** 🟡 **PARCIAL (bom; falta amarrar mitigação a comandos acionáveis e tasks)**
+**Maturidade:** ⚠️ **DEPENDE DE ARTEFATOS**
 Conteúdo:
 
 * Reprocessar webhook
@@ -223,6 +250,6 @@ Conteúdo:
 
 ## 📌 RESUMO EXECUTIVO
 
-* **Estratégico:** ~85% pronto
-* **Tático:** ~70% pronto (principal lacuna: SQL DDL + ADRs)
-* **Operacional:** ~20% pronto (onde mais dói hoje)
+* **Estratégico:** esboços (S1/S2/S3/S5) + pricing orientativo (S4) + métricas bem definidas (S6).
+* **Tático:** contratos e schema core existem; lacunas principais são **arquitetura de referência** e **state machines**.
+* **Operacional:** documentação extensa, mas ainda **não 100% executável** (faltam compose/Makefile/.env e alguns comandos acionáveis).
