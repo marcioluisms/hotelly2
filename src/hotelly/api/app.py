@@ -1,11 +1,10 @@
-"""FastAPI application."""
+"""FastAPI application entry point.
 
-from fastapi import FastAPI
+Usage:
+    uvicorn hotelly.api.app:app  # Uses APP_ROLE env var (default: public)
+"""
 
-app = FastAPI(title="Hotelly V2", docs_url=None, redoc_url=None)
+from .factory import create_app
 
-
-@app.get("/health")
-def health() -> dict:
-    """Health check endpoint."""
-    return {"status": "ok"}
+# Default app instance for uvicorn compatibility
+app = create_app()
