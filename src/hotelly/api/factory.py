@@ -13,7 +13,14 @@ from hotelly.observability.correlation import (
 )
 
 from .routers import public, worker
-from .routes import tasks_holds, tasks_whatsapp, tasks_whatsapp_send, webhooks_whatsapp
+from .routes import (
+    tasks_holds,
+    tasks_stripe,
+    tasks_whatsapp,
+    tasks_whatsapp_send,
+    webhooks_stripe,
+    webhooks_whatsapp,
+)
 
 AppRole = Literal["public", "worker"]
 
@@ -53,6 +60,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
     # Mount public routes (always)
     app.include_router(public.router)
     app.include_router(webhooks_whatsapp.router)
+    app.include_router(webhooks_stripe.router)
 
     # Mount worker routes only for worker role
     if role == "worker":
@@ -60,5 +68,6 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(tasks_whatsapp.router)
         app.include_router(tasks_whatsapp_send.router)
         app.include_router(tasks_holds.router)
+        app.include_router(tasks_stripe.router)
 
     return app
