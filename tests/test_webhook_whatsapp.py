@@ -1,0 +1,256 @@
+"""Tests for WhatsApp webhook endpoint (requires Postgres)."""
+
+import os
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from hotelly.api.factory import create_app
+from hotelly.infra.db import get_conn, txn
+
+# Skip all tests if DATABASE_URL is not set
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("DATABASE_URL"),
+    reason="DATABASE_URL not set - skipping webhook tests",
+)
+
+# Valid Evolution payload fixture
+VALID_PAYLOAD = {
+    "event": "messages.upsert",
+    "data": {
+        "key": {
+            "id": "MSG123456789",
+            "remoteJid": "redacted",
+            "fromMe": False,
+        },
+        "messageType": "text",
+    },
+}
+
+TEST_PROPERTY_ID = "test-property-webhook"
+
+
+@pytest.fixture
+def ensure_property():
+    """Ensure test property exists in DB."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO properties (id, name)
+                VALUES (%s, %s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (TEST_PROPERTY_ID, "Test Property"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    yield
+    # Cleanup after test
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM processed_events WHERE property_id = %s",
+                (TEST_PROPERTY_ID,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def client():
+    """Create test client."""
+    app = create_app(role="public")
+    return TestClient(app)
+
+
+@pytest.fixture
+def mock_tasks_client():
+    """Create and inject mock tasks client."""
+    import hotelly.api.routes.webhooks_whatsapp as webhook_module
+
+    mock_client = MagicMock()
+    mock_client.enqueue.return_value = True
+
+    original_getter = webhook_module._get_tasks_client
+    webhook_module._get_tasks_client = lambda: mock_client
+
+    yield mock_client
+
+    webhook_module._get_tasks_client = original_getter
+
+
+class TestWebhookEvolution:
+    """Tests for POST /webhooks/whatsapp/evolution."""
+
+    def test_valid_post_creates_receipt_and_enqueues(
+        self, client, ensure_property, mock_tasks_client
+    ):
+        """Test 1: Valid POST creates receipt and enqueues task."""
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+
+        assert response.status_code == 200
+        assert response.text == "ok"
+
+        # Verify receipt was created
+        with txn() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM processed_events
+                WHERE property_id = %s AND source = 'whatsapp' AND external_id = %s
+                """,
+                (TEST_PROPERTY_ID, "MSG123456789"),
+            )
+            count = cur.fetchone()[0]
+            assert count == 1
+
+        # Verify enqueue was called
+        mock_tasks_client.enqueue.assert_called_once()
+        call_args = mock_tasks_client.enqueue.call_args
+        assert call_args[1]["task_id"] == "whatsapp:MSG123456789"
+
+    def test_duplicate_post_returns_200_no_double_enqueue(
+        self, client, ensure_property, mock_tasks_client
+    ):
+        """Test 2: Duplicate POST returns 200, no duplicate receipt, no second enqueue."""
+        # First request
+        response1 = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+        assert response1.status_code == 200
+        assert response1.text == "ok"
+
+        # Reset mock to track second call
+        mock_tasks_client.reset_mock()
+
+        # Second request with same message_id
+        response2 = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+        assert response2.status_code == 200
+        assert response2.text == "duplicate"
+
+        # Verify still only 1 receipt
+        with txn() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM processed_events
+                WHERE property_id = %s AND source = 'whatsapp' AND external_id = %s
+                """,
+                (TEST_PROPERTY_ID, "MSG123456789"),
+            )
+            count = cur.fetchone()[0]
+            assert count == 1
+
+        # Verify enqueue was NOT called on second request
+        mock_tasks_client.enqueue.assert_not_called()
+
+    def test_enqueue_failure_returns_500_no_receipt(
+        self, client, ensure_property
+    ):
+        """Test 3: Enqueue failure returns 500 and receipt is NOT saved (rollback)."""
+        import hotelly.api.routes.webhooks_whatsapp as webhook_module
+
+        # Create a failing tasks client
+        failing_client = MagicMock()
+        failing_client.enqueue.side_effect = RuntimeError("Enqueue failed!")
+
+        original_getter = webhook_module._get_tasks_client
+        webhook_module._get_tasks_client = lambda: failing_client
+
+        try:
+            # Use different message_id to avoid conflict with other tests
+            payload = {
+                "event": "messages.upsert",
+                "data": {
+                    "key": {"id": "MSG_FAIL_TEST_123", "remoteJid": "x", "fromMe": False},
+                    "messageType": "text",
+                },
+            }
+
+            response = client.post(
+                "/webhooks/whatsapp/evolution",
+                json=payload,
+                headers={"X-Property-Id": TEST_PROPERTY_ID},
+            )
+
+            # Must NOT be 2xx
+            assert response.status_code == 500
+
+            # Verify receipt was NOT saved (rollback worked)
+            with txn() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM processed_events
+                    WHERE property_id = %s AND source = 'whatsapp' AND external_id = %s
+                    """,
+                    (TEST_PROPERTY_ID, "MSG_FAIL_TEST_123"),
+                )
+                count = cur.fetchone()[0]
+                assert count == 0, "Receipt should NOT exist after enqueue failure"
+
+        finally:
+            webhook_module._get_tasks_client = original_getter
+
+    def test_invalid_payload_returns_400(self, client, ensure_property):
+        """Invalid payload shape returns 400."""
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json={"invalid": "payload"},
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+        assert response.status_code == 400
+
+    def test_missing_property_id_header_returns_422(self, client):
+        """Missing X-Property-Id header returns 422."""
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+        )
+        assert response.status_code == 422
+
+
+class TestEvolutionAdapter:
+    """Tests for evolution_adapter module."""
+
+    def test_validate_and_extract_valid_payload(self):
+        """Valid payload extracts correctly."""
+        from hotelly.whatsapp.evolution_adapter import validate_and_extract
+
+        msg = validate_and_extract(VALID_PAYLOAD)
+        assert msg.message_id == "MSG123456789"
+        assert msg.provider == "evolution"
+        assert msg.kind == "text"
+
+    def test_validate_and_extract_missing_message_id(self):
+        """Missing message_id raises InvalidPayloadError."""
+        from hotelly.whatsapp.evolution_adapter import (
+            InvalidPayloadError,
+            validate_and_extract,
+        )
+
+        with pytest.raises(InvalidPayloadError):
+            validate_and_extract({"data": {"key": {}}})
+
+    def test_validate_and_extract_empty_payload(self):
+        """Empty payload raises InvalidPayloadError."""
+        from hotelly.whatsapp.evolution_adapter import (
+            InvalidPayloadError,
+            validate_and_extract,
+        )
+
+        with pytest.raises(InvalidPayloadError):
+            validate_and_extract({})
