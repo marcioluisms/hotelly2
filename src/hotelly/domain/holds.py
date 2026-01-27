@@ -14,6 +14,30 @@ from hotelly.infra.repositories.holds_repository import (
     insert_hold_night,
 )
 from hotelly.infra.repositories.outbox_repository import emit_hold_created
+from hotelly.tasks.client import TasksClient
+
+# Module-level tasks client (singleton for dev)
+_tasks_client = TasksClient()
+
+
+def _get_tasks_client() -> TasksClient:
+    """Get tasks client (allows override in tests)."""
+    return _tasks_client
+
+
+def _handle_expire_hold(payload: dict) -> None:
+    """Handler for expire-hold task.
+
+    Called by Cloud Tasks in production, or directly in tests.
+    """
+    from hotelly.domain.expire_hold import expire_hold
+
+    expire_hold(
+        property_id=payload["property_id"],
+        hold_id=payload["hold_id"],
+        task_id=payload["task_id"],
+        correlation_id=payload.get("correlation_id"),
+    )
 
 
 class UnavailableError(Exception):
@@ -111,71 +135,94 @@ def create_hold(
             raise UnavailableError("Failed to create hold")
 
         if not created:
-            # Idempotent replay - return existing hold
+            # Idempotent replay - get existing hold data
             existing = get_hold(cur, hold_id)
-            if existing:
-                return {
-                    "id": existing["id"],
-                    "property_id": existing["property_id"],
-                    "room_type_id": room_type_id,
-                    "checkin": existing["checkin"],
-                    "checkout": existing["checkout"],
-                    "nights": (existing["checkout"] - existing["checkin"]).days,
-                    "total_cents": existing["total_cents"],
-                    "currency": existing["currency"],
-                    "created": False,
-                }
-            raise UnavailableError("Hold exists but could not be retrieved")
+            if not existing:
+                raise UnavailableError("Hold exists but could not be retrieved")
 
-        # Step 2: Reserve inventory for each night (date asc order)
-        current = checkin
-        while current < checkout:
-            # Increment inv_held with guard
-            success = increment_inv_held(
+            result = {
+                "id": existing["id"],
+                "property_id": existing["property_id"],
+                "room_type_id": room_type_id,
+                "checkin": existing["checkin"],
+                "checkout": existing["checkout"],
+                "nights": (existing["checkout"] - existing["checkin"]).days,
+                "total_cents": existing["total_cents"],
+                "currency": existing["currency"],
+                "created": False,
+            }
+            # Use existing expires_at for task scheduling
+            expires_at_for_task = existing.get("expires_at") or expires_at
+
+        else:
+            # Step 2: Reserve inventory for each night (date asc order)
+            current = checkin
+            while current < checkout:
+                # Increment inv_held with guard
+                success = increment_inv_held(
+                    cur,
+                    property_id=property_id,
+                    room_type_id=room_type_id,
+                    night_date=current,
+                )
+
+                if not success:
+                    # Guard failed - unavailable
+                    raise UnavailableError("Inventory unavailable")
+
+                # Insert hold_night
+                insert_hold_night(
+                    cur,
+                    hold_id=hold_id,
+                    property_id=property_id,
+                    room_type_id=room_type_id,
+                    night_date=current,
+                    qty=1,
+                )
+
+                current += timedelta(days=1)
+
+            # Step 3: Emit outbox event (only for newly created holds)
+            emit_hold_created(
                 cur,
                 property_id=property_id,
-                room_type_id=room_type_id,
-                night_date=current,
-            )
-
-            if not success:
-                # Guard failed - unavailable
-                raise UnavailableError("Inventory unavailable")
-
-            # Insert hold_night
-            insert_hold_night(
-                cur,
                 hold_id=hold_id,
-                property_id=property_id,
                 room_type_id=room_type_id,
-                night_date=current,
-                qty=1,
+                checkin=checkin.isoformat(),
+                checkout=checkout.isoformat(),
+                nights=nights,
+                total_cents=total_cents,
+                currency=currency,
+                correlation_id=correlation_id,
             )
 
-            current += timedelta(days=1)
+            result = {
+                "id": hold_id,
+                "property_id": property_id,
+                "room_type_id": room_type_id,
+                "checkin": checkin,
+                "checkout": checkout,
+                "nights": nights,
+                "total_cents": total_cents,
+                "currency": currency,
+                "created": True,
+            }
+            expires_at_for_task = expires_at
 
-        # Step 3: Emit outbox event (only for newly created holds)
-        emit_hold_created(
-            cur,
-            property_id=property_id,
-            hold_id=hold_id,
-            room_type_id=room_type_id,
-            checkin=checkin.isoformat(),
-            checkout=checkout.isoformat(),
-            nights=nights,
-            total_cents=total_cents,
-            currency=currency,
-            correlation_id=correlation_id,
-        )
+    # Step 4: Enqueue expiration task (outside transaction, always)
+    # Task will be executed at expires_at by Cloud Tasks (prod) or registered for tests (dev)
+    # Enqueue is idempotent by task_id, so replay is safe
+    task_id = f"expire-hold:{property_id}:{hold_id}"
+    _get_tasks_client().enqueue(
+        task_id=task_id,
+        handler=_handle_expire_hold,
+        payload={
+            "property_id": property_id,
+            "hold_id": hold_id,
+            "task_id": task_id,
+            "correlation_id": correlation_id,
+        },
+        schedule_time=expires_at_for_task,
+    )
 
-    return {
-        "id": hold_id,
-        "property_id": property_id,
-        "room_type_id": room_type_id,
-        "checkin": checkin,
-        "checkout": checkout,
-        "nights": nights,
-        "total_cents": total_cents,
-        "currency": currency,
-        "created": True,
-    }
+    return result
