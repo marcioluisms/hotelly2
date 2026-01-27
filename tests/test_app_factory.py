@@ -27,6 +27,13 @@ class TestPublicRole:
         response = client.get("/internal/health")
         assert response.status_code == 404
 
+    def test_tasks_whatsapp_not_mounted(self):
+        """Tasks whatsapp handle-message should NOT be available in public."""
+        app = create_app(role="public")
+        client = TestClient(app)
+        response = client.post("/tasks/whatsapp/handle-message", json={})
+        assert response.status_code == 404
+
 
 class TestWorkerRole:
     """Tests for APP_ROLE=worker."""
@@ -50,6 +57,15 @@ class TestWorkerRole:
         response = client.get("/internal/health")
         assert response.status_code == 200
         assert response.json()["subsystem"] == "internal"
+
+    def test_tasks_whatsapp_mounted(self):
+        """Tasks whatsapp handle-message should be available in worker."""
+        app = create_app(role="worker")
+        client = TestClient(app)
+        # Empty payload returns 400 (missing fields), not 404
+        response = client.post("/tasks/whatsapp/handle-message", json={})
+        assert response.status_code != 404
+        assert response.status_code == 400  # missing required fields
 
 
 class TestCorrelationId:
