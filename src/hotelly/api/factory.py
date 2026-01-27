@@ -13,7 +13,7 @@ from hotelly.observability.correlation import (
 )
 
 from .routers import public, worker
-from .routes import tasks_whatsapp, tasks_whatsapp_send, webhooks_whatsapp
+from .routes import tasks_holds, tasks_whatsapp, tasks_whatsapp_send, webhooks_whatsapp
 
 AppRole = Literal["public", "worker"]
 
@@ -59,5 +59,6 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(worker.router)
         app.include_router(tasks_whatsapp.router)
         app.include_router(tasks_whatsapp_send.router)
+        app.include_router(tasks_holds.router)
 
     return app
