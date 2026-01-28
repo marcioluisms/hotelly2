@@ -7,7 +7,7 @@ POSTGRES_PORT ?= 5432
 
 DATABASE_URL ?= postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/$(POSTGRES_DB)
 
-.PHONY: help dev db-up db-down db-logs clean migrate revision verify
+.PHONY: help dev db-up db-down db-logs clean migrate revision verify test test-unit test-e2e test-redaction
 
 help:
 	@echo "Targets:"
@@ -40,3 +40,15 @@ revision:
 
 verify:
 	./scripts/verify.sh
+
+test:
+	DATABASE_URL="$(DATABASE_URL)" uv run pytest -q
+
+test-unit:
+	uv run pytest tests/test_hashing.py tests/test_contact_refs.py -q
+
+test-e2e:
+	DATABASE_URL="$(DATABASE_URL)" uv run pytest tests/test_e2e_flow.py -v
+
+test-redaction:
+	uv run pytest tests/test_redaction.py -v
