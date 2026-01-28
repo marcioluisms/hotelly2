@@ -6,6 +6,8 @@ All operations happen in a single transaction with guards.
 
 from datetime import date, datetime, timedelta, timezone
 
+from psycopg2.extensions import cursor as PgCursor
+
 from hotelly.infra.db import txn
 from hotelly.infra.repositories.holds_repository import (
     get_hold,
@@ -60,6 +62,7 @@ def create_hold(
     quote_option_id: str | None = None,
     guest_count: int | None = None,
     correlation_id: str | None = None,
+    cur: PgCursor | None = None,
 ) -> dict:
     """Create a hold with transactional inventory reservation.
 
@@ -114,10 +117,11 @@ def create_hold(
 
     nights = (checkout - checkin).days
 
-    with txn() as cur:
+    def _do(c: PgCursor):
+        nonlocal expires_at
         # Step 1: Insert hold (idempotent)
         hold_id, created = insert_hold(
-            cur,
+            c,
             property_id=property_id,
             room_type_id=room_type_id,
             checkin=checkin,
@@ -136,7 +140,7 @@ def create_hold(
 
         if not created:
             # Idempotent replay - get existing hold data
-            existing = get_hold(cur, hold_id)
+            existing = get_hold(c, hold_id)
             if not existing:
                 raise UnavailableError("Hold exists but could not be retrieved")
 
@@ -160,7 +164,7 @@ def create_hold(
             while current < checkout:
                 # Increment inv_held with guard
                 success = increment_inv_held(
-                    cur,
+                    c,
                     property_id=property_id,
                     room_type_id=room_type_id,
                     night_date=current,
@@ -172,7 +176,7 @@ def create_hold(
 
                 # Insert hold_night
                 insert_hold_night(
-                    cur,
+                    c,
                     hold_id=hold_id,
                     property_id=property_id,
                     room_type_id=room_type_id,
@@ -184,7 +188,7 @@ def create_hold(
 
             # Step 3: Emit outbox event (only for newly created holds)
             emit_hold_created(
-                cur,
+                c,
                 property_id=property_id,
                 hold_id=hold_id,
                 room_type_id=room_type_id,
@@ -209,9 +213,18 @@ def create_hold(
             }
             expires_at_for_task = expires_at
 
+        return result, expires_at_for_task
+
+    if cur is not None:
+        result, expires_at_for_task = _do(cur)
+    else:
+        with txn() as c:
+            result, expires_at_for_task = _do(c)
+
     # Step 4: Enqueue expiration task (outside transaction, always)
     # Task will be executed at expires_at by Cloud Tasks (prod) or registered for tests (dev)
     # Enqueue is idempotent by task_id, so replay is safe
+    hold_id = result["id"]
     task_id = f"expire-hold:{property_id}:{hold_id}"
     _get_tasks_client().enqueue(
         task_id=task_id,

@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from psycopg2.extensions import cursor as PgCursor
+
 from hotelly.infra.db import txn
 from hotelly.infra.repositories.holds_repository import get_hold
 
@@ -132,6 +134,7 @@ def create_checkout_session(
     *,
     stripe_client: StripeClient,
     correlation_id: str | None = None,
+    cur: PgCursor | None = None,
 ) -> dict[str, Any]:
     """Create idempotent Checkout Session for a hold.
 
@@ -153,9 +156,9 @@ def create_checkout_session(
     # Deterministic idempotency key based on hold_id
     idempotency_key = _get_idempotency_key(hold_id)
 
-    with txn() as cur:
+    def _do(c: PgCursor):
         # 1. Get hold data (amount, currency, property_id)
-        hold = get_hold(cur, hold_id)
+        hold = get_hold(c, hold_id)
         if hold is None:
             raise HoldNotFoundError(f"Hold not found: {hold_id}")
 
@@ -169,7 +172,7 @@ def create_checkout_session(
         currency = hold["currency"]
 
         # 2. Check for existing payment
-        existing_payment = _find_existing_payment(cur, hold_id)
+        existing_payment = _find_existing_payment(c, hold_id)
 
         if existing_payment is not None:
             provider_object_id = existing_payment["provider_object_id"]
@@ -209,7 +212,7 @@ def create_checkout_session(
 
         # 4. Persist payment
         payment_id = _insert_payment(
-            cur,
+            c,
             property_id=property_id,
             hold_id=hold_id,
             amount_cents=amount_cents,
@@ -232,3 +235,9 @@ def create_checkout_session(
             "provider_object_id": provider_object_id,
             "checkout_url": session["url"],
         }
+
+    if cur is not None:
+        return _do(cur)
+    else:
+        with txn() as c:
+            return _do(c)

@@ -389,6 +389,7 @@ def _try_quote_hold_checkout(
             conversation_id=conversation_id,
             guest_count=guest_count,
             correlation_id=correlation_id,
+            cur=cur,
         )
     except HoldUnavailableError:
         logger.info(
@@ -416,13 +417,14 @@ def _try_quote_hold_checkout(
         },
     )
 
-    # 3. Create checkout session (outside this txn - opens its own)
+    # 3. Create checkout session (same txn so hold is visible)
     checkout_url: str | None = None
     try:
         checkout_result = create_checkout_session(
             hold["id"],
             stripe_client=_get_stripe_client(),
             correlation_id=correlation_id,
+            cur=cur,
         )
         checkout_url = checkout_result.get("checkout_url")
 
@@ -505,13 +507,14 @@ def _insert_outbox_event(
     """
     cur.execute(
         """
-        INSERT INTO outbox_events (event_type, property_id, contact_hash, payload_json, correlation_id)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO outbox_events (property_id, event_type, aggregate_type, aggregate_id, payload, correlation_id)
+        VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
-            "whatsapp.send_message",
             property_id,
+            "whatsapp.send_message",
+            "contact",
             contact_hash,
             json.dumps({"text": text}),
             correlation_id,
