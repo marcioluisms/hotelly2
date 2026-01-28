@@ -1,5 +1,7 @@
 """Worker route for sending WhatsApp messages."""
 
+import json
+
 from pydantic import BaseModel
 
 from fastapi import APIRouter, Response
@@ -86,4 +88,104 @@ async def send_message(req: SendMessageRequest) -> dict:
         )
         return Response(status_code=500, content="send failed")
 
+    return {"ok": True}
+
+
+class SendResponseRequest(BaseModel):
+    """Request for send-response task.
+
+    Security (ADR-006):
+    - PII-free: resolves contact_hash via outbox_events + vault
+    - No PII in request payload
+    - No PII logged
+    """
+
+    property_id: str
+    outbox_event_id: int
+    correlation_id: str | None = None
+
+
+@router.post("/send-response")
+async def send_response(req: SendResponseRequest) -> dict:
+    """Send response via Evolution API.
+
+    Resolves remote_jid from vault using contact_hash from outbox_events.
+
+    Security (ADR-006):
+    - remote_jid resolved in memory only
+    - Never logged
+    - Discarded after send
+
+    Args:
+        req: Request with property_id and outbox_event_id.
+
+    Returns:
+        {"ok": True} on success, {"ok": False, "error": "..."} on failure.
+    """
+    correlation_id = req.correlation_id or get_correlation_id()
+
+    # Log safe metadata only - NEVER log contact_hash, remote_jid, or text
+    log_ctx = safe_log_context(
+        correlationId=correlation_id,
+        property_id=req.property_id,
+        outbox_event_id=req.outbox_event_id,
+    )
+
+    logger.info("send-response task received", extra={"extra_fields": log_ctx})
+
+    # 1. Load outbox_event and validate
+    with txn() as cur:
+        cur.execute(
+            "SELECT event_type, contact_hash, payload_json FROM outbox_events WHERE id = %s",
+            (req.outbox_event_id,),
+        )
+        row = cur.fetchone()
+
+        if row is None:
+            logger.warning(
+                "send-response outbox_event not found",
+                extra={"extra_fields": log_ctx},
+            )
+            return {"ok": False, "error": "outbox_event_not_found"}
+
+        event_type, contact_hash, payload_json = row
+
+        if event_type != "whatsapp.send_message":
+            logger.warning(
+                "send-response wrong event_type",
+                extra={"extra_fields": log_ctx},
+            )
+            return {"ok": False, "error": "outbox_event_wrong_type"}
+
+        # 2. Lookup remote_jid from vault (in memory only)
+        remote_jid = get_remote_jid(
+            cur,
+            property_id=req.property_id,
+            channel="whatsapp",
+            contact_hash=contact_hash,
+        )
+
+    if remote_jid is None:
+        logger.warning(
+            "send-response contact_ref not found or expired",
+            extra={"extra_fields": log_ctx},
+        )
+        return {"ok": False, "error": "contact_ref_not_found"}
+
+    # 3. Send via Evolution (remote_jid in memory only, discarded after)
+    try:
+        text = json.loads(payload_json)["text"]
+        send_text_via_evolution(
+            to_ref=remote_jid,
+            text=text,
+            correlation_id=correlation_id,
+        )
+    except Exception:
+        logger.exception(
+            "send-response task failed",
+            extra={"extra_fields": log_ctx},
+        )
+        return {"ok": False, "error": "send_failed"}
+
+    # remote_jid goes out of scope - discarded
     return {"ok": True}
