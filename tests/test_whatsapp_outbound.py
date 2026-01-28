@@ -1,6 +1,5 @@
 """Tests for WhatsApp outbound messaging - verifies NO PII in logs."""
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
