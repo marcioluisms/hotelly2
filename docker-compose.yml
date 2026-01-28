@@ -16,5 +16,17 @@ services:
       timeout: 3s
       retries: 20
 
+  api:
+    build: .
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hotelly}
+      CONTACT_HASH_SECRET: ${CONTACT_HASH_SECRET}
+      CONTACT_REFS_KEY: ${CONTACT_REFS_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   hotelly_pgdata:
