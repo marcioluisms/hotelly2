@@ -1,6 +1,7 @@
 """Tests for WhatsApp outbound messaging - verifies NO PII in logs."""
 
-from unittest.mock import patch
+import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -76,12 +77,12 @@ def mock_evolution_env(monkeypatch):
 class TestNoPiiLeakage:
     """Tests that verify NO PII (to_ref, text) appears in logs."""
 
-    # Test data with identifiable PII
-    PHONE_NUMBER = "+5511999887766"
-    MESSAGE_TEXT = "Olá, sua reserva foi confirmada para quarto 101"
+    # Test data - use jid format, not phone numbers
+    TEST_JID = "jid_test@s.whatsapp.net"
+    MESSAGE_TEXT = "dummy_text"
 
     def test_send_text_logs_no_pii(self, mock_evolution_env):
-        """send_text_via_evolution MUST NOT log phone or message text."""
+        """send_text_via_evolution MUST NOT log jid or message text."""
         recorder = LogRecorder()
 
         with patch("hotelly.whatsapp.outbound.logger", recorder):
@@ -90,7 +91,7 @@ class TestNoPiiLeakage:
                 return_value={"status": "sent"},
             ):
                 send_text_via_evolution(
-                    to_ref=self.PHONE_NUMBER,
+                    to_ref=self.TEST_JID,
                     text=self.MESSAGE_TEXT,
                     correlation_id="test-corr-001",
                 )
@@ -98,14 +99,12 @@ class TestNoPiiLeakage:
         # Get all logged content
         all_logged = recorder.get_all_logged_content()
 
-        # CRITICAL: Phone number must NEVER appear
-        assert self.PHONE_NUMBER not in all_logged, "Phone number leaked!"
-        assert "999887766" not in all_logged, "Partial phone leaked!"
+        # CRITICAL: JID must NEVER appear
+        assert self.TEST_JID not in all_logged, "JID leaked!"
+        assert "jid_test" not in all_logged, "Partial JID leaked!"
 
         # CRITICAL: Message text must NEVER appear
         assert self.MESSAGE_TEXT not in all_logged, "Message text leaked!"
-        assert "reserva foi confirmada" not in all_logged, "Partial text leaked!"
-        assert "quarto 101" not in all_logged, "Partial text leaked!"
 
         # Verify we actually logged something (deterministic)
         assert len(recorder.calls) >= 1, "Should have logged at least 1 call"
@@ -134,15 +133,15 @@ class TestNoPiiLeakage:
                 side_effect=mock_request,
             ):
                 send_text_via_evolution(
-                    to_ref=self.PHONE_NUMBER,
+                    to_ref=self.TEST_JID,
                     text=self.MESSAGE_TEXT,
                     correlation_id="test-retry-001",
                 )
 
         all_logged = recorder.get_all_logged_content()
 
-        # Phone and text must NEVER appear even in retry logs
-        assert self.PHONE_NUMBER not in all_logged, "Phone leaked in retry logs!"
+        # JID and text must NEVER appear even in retry logs
+        assert self.TEST_JID not in all_logged, "JID leaked in retry logs!"
         assert self.MESSAGE_TEXT not in all_logged, "Text leaked in retry logs!"
 
         # Verify retry was logged
@@ -169,15 +168,15 @@ class TestNoPiiLeakage:
             ):
                 with pytest.raises(urllib.error.HTTPError):
                     send_text_via_evolution(
-                        to_ref=self.PHONE_NUMBER,
+                        to_ref=self.TEST_JID,
                         text=self.MESSAGE_TEXT,
                         correlation_id="test-error-001",
                     )
 
         all_logged = recorder.get_all_logged_content()
 
-        # Phone and text must NEVER appear even in error logs
-        assert self.PHONE_NUMBER not in all_logged, "Phone leaked in error logs!"
+        # JID and text must NEVER appear even in error logs
+        assert self.TEST_JID not in all_logged, "JID leaked in error logs!"
         assert self.MESSAGE_TEXT not in all_logged, "Text leaked in error logs!"
 
         # Verify error was logged
@@ -187,26 +186,46 @@ class TestNoPiiLeakage:
 
     def test_route_logs_no_pii(self, client, mock_evolution_env):
         """POST /tasks/whatsapp/send-message MUST NOT log PII."""
+        from contextlib import contextmanager
+
         outbound_recorder = LogRecorder()
         route_recorder = LogRecorder()
+
+        # Mock get_remote_jid to return the jid
+        mock_cur = MagicMock()
+
+        def mock_get_remote_jid(cur, *, property_id, channel, contact_hash):
+            return self.TEST_JID
+
+        @contextmanager
+        def mock_txn():
+            yield mock_cur
 
         with patch("hotelly.whatsapp.outbound.logger", outbound_recorder):
             with patch(
                 "hotelly.api.routes.tasks_whatsapp_send.logger", route_recorder
             ):
                 with patch(
-                    "hotelly.whatsapp.outbound._do_request",
-                    return_value={"status": "sent"},
+                    "hotelly.api.routes.tasks_whatsapp_send.get_remote_jid",
+                    mock_get_remote_jid,
                 ):
-                    response = client.post(
-                        "/tasks/whatsapp/send-message",
-                        json={
-                            "property_id": "prop-test-001",
-                            "to_ref": self.PHONE_NUMBER,
-                            "text": self.MESSAGE_TEXT,
-                            "correlation_id": "route-test-001",
-                        },
-                    )
+                    with patch(
+                        "hotelly.api.routes.tasks_whatsapp_send.txn",
+                        mock_txn,
+                    ):
+                        with patch(
+                            "hotelly.whatsapp.outbound._do_request",
+                            return_value={"status": "sent"},
+                        ):
+                            response = client.post(
+                                "/tasks/whatsapp/send-message",
+                                json={
+                                    "property_id": "prop-test-001",
+                                    "contact_hash": "hash_abc123",
+                                    "text": self.MESSAGE_TEXT,
+                                    "correlation_id": "route-test-001",
+                                },
+                            )
 
         assert response.status_code == 200
         assert response.json() == {"ok": True}
@@ -218,8 +237,8 @@ class TestNoPiiLeakage:
             + route_recorder.get_all_logged_content()
         )
 
-        # Phone and text must NEVER appear
-        assert self.PHONE_NUMBER not in all_logged, "Phone leaked in route!"
+        # JID and text must NEVER appear
+        assert self.TEST_JID not in all_logged, "JID leaked in route!"
         assert self.MESSAGE_TEXT not in all_logged, "Text leaked in route!"
 
         # Verify safe metadata IS logged
@@ -240,35 +259,55 @@ class TestRouteAvailability:
         client = TestClient(app)
         response = client.post(
             "/tasks/whatsapp/send-message",
-            json={"to_ref": "x", "text": "y"},
+            json={"property_id": "x", "contact_hash": "y", "text": "z"},
         )
         assert response.status_code == 404
 
     def test_send_message_in_worker(self, mock_evolution_env):
         """send-message route should be available in worker role."""
+        from contextlib import contextmanager
+
         from hotelly.api.factory import create_app
 
         app = create_app(role="worker")
         client = TestClient(app)
+
+        mock_cur = MagicMock()
+
+        def mock_get_remote_jid(cur, *, property_id, channel, contact_hash):
+            return "jid_test@s.whatsapp.net"
+
+        @contextmanager
+        def mock_txn():
+            yield mock_cur
+
         with patch(
-            "hotelly.whatsapp.outbound._do_request",
-            return_value={"status": "sent"},
+            "hotelly.api.routes.tasks_whatsapp_send.get_remote_jid",
+            mock_get_remote_jid,
         ):
-            response = client.post(
-                "/tasks/whatsapp/send-message",
-                json={"to_ref": "x", "text": "y"},
-            )
+            with patch(
+                "hotelly.api.routes.tasks_whatsapp_send.txn",
+                mock_txn,
+            ):
+                with patch(
+                    "hotelly.whatsapp.outbound._do_request",
+                    return_value={"status": "sent"},
+                ):
+                    response = client.post(
+                        "/tasks/whatsapp/send-message",
+                        json={"property_id": "x", "contact_hash": "y", "text": "z"},
+                    )
         assert response.status_code == 200
 
 
 class TestSendMessageValidation:
     """Tests for request validation."""
 
-    def test_missing_to_ref_returns_422(self, client):
-        """Missing to_ref returns 422."""
+    def test_missing_contact_hash_returns_422(self, client):
+        """Missing contact_hash returns 422."""
         response = client.post(
             "/tasks/whatsapp/send-message",
-            json={"text": "hello"},
+            json={"property_id": "x", "text": "hello"},
         )
         assert response.status_code == 422
 
@@ -276,6 +315,157 @@ class TestSendMessageValidation:
         """Missing text returns 422."""
         response = client.post(
             "/tasks/whatsapp/send-message",
-            json={"to_ref": "+5511999999999"},
+            json={"property_id": "x", "contact_hash": "hash_abc"},
         )
         assert response.status_code == 422
+
+    def test_missing_property_id_returns_422(self, client):
+        """Missing property_id returns 422."""
+        response = client.post(
+            "/tasks/whatsapp/send-message",
+            json={"contact_hash": "hash_abc", "text": "hello"},
+        )
+        assert response.status_code == 422
+
+
+class TestContactRefLookup:
+    """Tests for contact_ref vault integration."""
+
+    TEST_JID = "jid_test@s.whatsapp.net"
+    MESSAGE_TEXT = "dummy_text"
+
+    def test_with_contact_ref_calls_sender(self, client, mock_evolution_env):
+        """When contact_ref exists, calls sender with remote_jid."""
+        from contextlib import contextmanager
+
+        mock_cur = MagicMock()
+        call_params = {}
+
+        def mock_get_remote_jid(cur, *, property_id, channel, contact_hash):
+            call_params["property_id"] = property_id
+            call_params["channel"] = channel
+            call_params["contact_hash"] = contact_hash
+            return self.TEST_JID
+
+        @contextmanager
+        def mock_txn():
+            yield mock_cur
+
+        mock_do_request = MagicMock(return_value={"status": "sent"})
+
+        with patch(
+            "hotelly.api.routes.tasks_whatsapp_send.get_remote_jid",
+            mock_get_remote_jid,
+        ):
+            with patch(
+                "hotelly.api.routes.tasks_whatsapp_send.txn",
+                mock_txn,
+            ):
+                with patch(
+                    "hotelly.whatsapp.outbound._do_request",
+                    mock_do_request,
+                ):
+                    response = client.post(
+                        "/tasks/whatsapp/send-message",
+                        json={
+                            "property_id": "prop-001",
+                            "contact_hash": "hash_abc123",
+                            "text": self.MESSAGE_TEXT,
+                        },
+                    )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+        # Verify get_remote_jid was called with correct params
+        assert call_params["property_id"] == "prop-001"
+        assert call_params["channel"] == "whatsapp"
+        assert call_params["contact_hash"] == "hash_abc123"
+
+        # Verify sender was called
+        mock_do_request.assert_called_once()
+
+    def test_without_contact_ref_returns_404(self, client, mock_evolution_env):
+        """When contact_ref not found, returns 404 without calling sender."""
+        from contextlib import contextmanager
+
+        mock_cur = MagicMock()
+
+        def mock_get_remote_jid(cur, *, property_id, channel, contact_hash):
+            return None
+
+        @contextmanager
+        def mock_txn():
+            yield mock_cur
+
+        mock_do_request = MagicMock(return_value={"status": "sent"})
+
+        with patch(
+            "hotelly.api.routes.tasks_whatsapp_send.get_remote_jid",
+            mock_get_remote_jid,
+        ):
+            with patch(
+                "hotelly.api.routes.tasks_whatsapp_send.txn",
+                mock_txn,
+            ):
+                with patch(
+                    "hotelly.whatsapp.outbound._do_request",
+                    mock_do_request,
+                ):
+                    response = client.post(
+                        "/tasks/whatsapp/send-message",
+                        json={
+                            "property_id": "prop-001",
+                            "contact_hash": "hash_not_found",
+                            "text": self.MESSAGE_TEXT,
+                        },
+                    )
+
+        assert response.status_code == 404
+        assert response.text == "contact_ref_missing"
+
+        # Verify sender was NOT called
+        mock_do_request.assert_not_called()
+
+    def test_contact_ref_missing_logs_warning(self, client, mock_evolution_env):
+        """When contact_ref not found, logs warning without PII."""
+        from contextlib import contextmanager
+
+        recorder = LogRecorder()
+        mock_cur = MagicMock()
+
+        def mock_get_remote_jid(cur, *, property_id, channel, contact_hash):
+            return None
+
+        @contextmanager
+        def mock_txn():
+            yield mock_cur
+
+        with patch("hotelly.api.routes.tasks_whatsapp_send.logger", recorder):
+            with patch(
+                "hotelly.api.routes.tasks_whatsapp_send.get_remote_jid",
+                mock_get_remote_jid,
+            ):
+                with patch(
+                    "hotelly.api.routes.tasks_whatsapp_send.txn",
+                    mock_txn,
+                ):
+                    response = client.post(
+                        "/tasks/whatsapp/send-message",
+                        json={
+                            "property_id": "prop-001",
+                            "contact_hash": "hash_secret_xyz",
+                            "text": "dummy_text",
+                        },
+                    )
+
+        assert response.status_code == 404
+
+        # Verify warning was logged
+        warning_calls = [c for c in recorder.calls if c[0] == "warning"]
+        assert len(warning_calls) >= 1, "Should log warning for missing contact_ref"
+
+        # Verify NO PII in logs
+        all_logged = recorder.get_all_logged_content()
+        assert "hash_secret_xyz" not in all_logged, "contact_hash leaked!"
+        assert "dummy_text" not in all_logged, "text leaked!"

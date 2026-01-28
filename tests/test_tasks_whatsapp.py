@@ -1,12 +1,20 @@
-"""Tests for WhatsApp task handler (requires Postgres)."""
+"""Tests for WhatsApp task handler (requires Postgres).
 
+S05: Tests orchestration flow (zero PII).
+"""
+
+import json
 import os
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from hotelly.api.routes.tasks_whatsapp import router
+from hotelly.api.routes.tasks_whatsapp import (
+    router,
+    _get_tasks_client,
+    _set_stripe_client,
+)
 from hotelly.infra.db import get_conn, txn
 
 # Skip all tests if DATABASE_URL is not set
@@ -16,6 +24,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 TEST_PROPERTY_ID = "test-property-tasks"
+
+# PII patterns that should NEVER appear in logs
+PII_PATTERNS = [
+    "5511999999999",  # phone
+    "@s.whatsapp.net",  # remote_jid suffix
+    "hash_",  # contact_hash prefix (full hash)
+]
 
 
 def create_test_app() -> FastAPI:
@@ -48,7 +63,14 @@ def ensure_property():
         conn.commit()
     finally:
         conn.close()
+
+    # Clear tasks client state before test
+    _get_tasks_client().clear()
+    # Reset stripe client
+    _set_stripe_client(None)
+
     yield
+
     # Cleanup after test
     conn = get_conn()
     try:
@@ -61,9 +83,16 @@ def ensure_property():
                 "DELETE FROM processed_events WHERE property_id = %s",
                 (TEST_PROPERTY_ID,),
             )
+            cur.execute(
+                "DELETE FROM outbox_events WHERE property_id = %s",
+                (TEST_PROPERTY_ID,),
+            )
         conn.commit()
     finally:
         conn.close()
+
+    # Clear tasks client state after test
+    _get_tasks_client().clear()
 
 
 class TestHandleMessage:
@@ -231,6 +260,247 @@ class TestHandleMessage:
             },
         )
         assert response.status_code == 400
+
+    def test_missing_contact_hash_returns_400(self, client, ensure_property):
+        """S05: Missing contact_hash returns 400 (now required)."""
+        response = client.post(
+            "/tasks/whatsapp/handle-message",
+            json={
+                "task_id": "task-no-hash",
+                "property_id": TEST_PROPERTY_ID,
+                # contact_hash missing
+            },
+        )
+        assert response.status_code == 400
+        assert "missing required fields" in response.text
+
+
+class TestS05PiiSafety:
+    """S05: Tests that payload and logs are PII-free."""
+
+    def test_payload_requires_no_pii(self, client, ensure_property):
+        """S05: Payload contains NO PII - only contact_hash, not phone/remote_jid."""
+        # This payload is PII-free as per ADR-006
+        payload = {
+            "task_id": "task-pii-001",
+            "property_id": TEST_PROPERTY_ID,
+            "contact_hash": "abc123def456",  # hash, not phone
+            "intent": "booking",
+            "entities": {
+                "checkin": "2025-03-01",
+                "checkout": "2025-03-03",
+            },
+            # NO: remote_jid, phone, text, name
+        }
+
+        response = client.post("/tasks/whatsapp/handle-message", json=payload)
+
+        # Should process successfully with PII-free payload
+        assert response.status_code == 200
+        assert response.text == "ok"
+
+    def test_logs_do_not_contain_contact_hash(self, client, ensure_property, caplog):
+        """S05: Logs NEVER contain full contact_hash."""
+        import logging
+
+        contact_hash = "hash_secret_value_12345"
+
+        with caplog.at_level(logging.DEBUG):
+            response = client.post(
+                "/tasks/whatsapp/handle-message",
+                json={
+                    "task_id": "task-log-001",
+                    "property_id": TEST_PROPERTY_ID,
+                    "contact_hash": contact_hash,
+                },
+            )
+
+        assert response.status_code == 200
+
+        # Check that full contact_hash is NOT in any log message
+        for record in caplog.records:
+            log_text = record.getMessage()
+            assert contact_hash not in log_text, (
+                f"Full contact_hash leaked in log: {log_text}"
+            )
+
+    def test_outbox_event_created_for_missing_dates(self, client, ensure_property):
+        """S05: Missing dates triggers deterministic response in outbox."""
+        payload = {
+            "task_id": "task-outbox-001",
+            "property_id": TEST_PROPERTY_ID,
+            "contact_hash": "hash_outbox_test",
+            "intent": "booking",
+            "entities": {},  # No dates
+        }
+
+        response = client.post("/tasks/whatsapp/handle-message", json=payload)
+
+        assert response.status_code == 200
+        assert response.text == "ok"
+
+        # Verify outbox event was created with correct schema (S05/S06)
+        with txn() as cur:
+            cur.execute(
+                """
+                SELECT event_type, contact_hash, payload_json FROM outbox_events
+                WHERE property_id = %s AND event_type = 'whatsapp.send_message'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (TEST_PROPERTY_ID,),
+            )
+            row = cur.fetchone()
+            assert row is not None
+
+            event_type, contact_hash_col, payload_json = row
+            assert event_type == "whatsapp.send_message"
+            assert contact_hash_col == "hash_outbox_test"  # contact_hash in column
+
+            payload_data = json.loads(payload_json)
+            assert "text" in payload_data
+            assert "datas" in payload_data["text"].lower()  # Portuguese prompt
+            # contact_hash should NOT be in payload_json (it's in contact_hash column)
+            assert "contact_hash" not in payload_data
+
+    def test_send_task_enqueued(self, client, ensure_property):
+        """S05: send task is enqueued with PII-free payload."""
+        payload = {
+            "task_id": "task-enqueue-001",
+            "property_id": TEST_PROPERTY_ID,
+            "contact_hash": "hash_enqueue_test",
+            "entities": {},  # Will trigger prompt
+        }
+
+        response = client.post("/tasks/whatsapp/handle-message", json=payload)
+
+        assert response.status_code == 200
+
+        # Verify task was enqueued with "send:" prefix
+        tasks_client = _get_tasks_client()
+        send_tasks = [t for t in tasks_client._executed_ids if t.startswith("send:")]
+        assert len(send_tasks) > 0, "Expected send task to be enqueued"
+
+    def test_complete_entities_triggers_checkout(self, client, ensure_property):
+        """S05: Complete entities trigger quote → hold → checkout flow."""
+        from unittest.mock import MagicMock
+
+        # Setup mock stripe client
+        mock_stripe = MagicMock()
+        mock_stripe.create_checkout_session.return_value = {
+            "session_id": "cs_test_123",
+            "url": "https://checkout.stripe.com/test",
+            "status": "open",
+        }
+        mock_stripe.retrieve_checkout_session.return_value = {
+            "session_id": "cs_test_123",
+            "url": "https://checkout.stripe.com/test",
+            "status": "open",
+        }
+        _set_stripe_client(mock_stripe)
+
+        # Setup test data: property, room_type, ARI
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                # Room type
+                cur.execute(
+                    """
+                    INSERT INTO room_types (property_id, id, name)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (TEST_PROPERTY_ID, "rt_standard", "Standard"),
+                )
+                # ARI for test dates
+                for day_offset in range(3):
+                    cur.execute(
+                        """
+                        INSERT INTO ari_days (
+                            property_id, room_type_id, date,
+                            inv_total, inv_booked, inv_held,
+                            base_rate_cents, currency
+                        )
+                        VALUES (%s, %s, CURRENT_DATE + %s, 5, 0, 0, 25000, 'BRL')
+                        ON CONFLICT (property_id, room_type_id, date) DO UPDATE
+                        SET inv_total = 5, inv_booked = 0, inv_held = 0,
+                            base_rate_cents = 25000, currency = 'BRL'
+                        """,
+                        (TEST_PROPERTY_ID, "rt_standard", day_offset),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Get dates as ISO strings
+        from datetime import date, timedelta
+
+        checkin = date.today()
+        checkout = date.today() + timedelta(days=2)
+
+        payload = {
+            "task_id": "task-checkout-001",
+            "property_id": TEST_PROPERTY_ID,
+            "contact_hash": "hash_checkout_test",
+            "intent": "booking",
+            "entities": {
+                "checkin": checkin.isoformat(),
+                "checkout": checkout.isoformat(),
+                "room_type_id": "rt_standard",
+                "guest_count": 2,
+            },
+        }
+
+        response = client.post("/tasks/whatsapp/handle-message", json=payload)
+
+        assert response.status_code == 200
+
+        # Verify outbox event contains checkout URL
+        with txn() as cur:
+            cur.execute(
+                """
+                SELECT payload_json FROM outbox_events
+                WHERE property_id = %s AND event_type = 'whatsapp.send_message'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (TEST_PROPERTY_ID,),
+            )
+            row = cur.fetchone()
+            assert row is not None
+
+            payload_data = json.loads(row[0])
+            text = payload_data.get("text", "")
+            # Response should contain checkout URL
+            assert "http" in text.lower() or "checkout" in text.lower(), (
+                f"Expected checkout URL in response, got: {text}"
+            )
+
+        # Cleanup test data
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM payments WHERE property_id = %s",
+                    (TEST_PROPERTY_ID,),
+                )
+                cur.execute(
+                    "DELETE FROM hold_nights WHERE property_id = %s",
+                    (TEST_PROPERTY_ID,),
+                )
+                cur.execute(
+                    "DELETE FROM holds WHERE property_id = %s",
+                    (TEST_PROPERTY_ID,),
+                )
+                cur.execute(
+                    "DELETE FROM ari_days WHERE property_id = %s",
+                    (TEST_PROPERTY_ID,),
+                )
+                cur.execute(
+                    "DELETE FROM room_types WHERE property_id = %s",
+                    (TEST_PROPERTY_ID,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 class TestConversationsDomain:
