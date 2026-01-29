@@ -17,7 +17,6 @@ from hotelly.infra.db import txn
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
-from hotelly.api.routes.tasks_stripe import handle_stripe_event
 from hotelly.stripe.webhook import (
     InvalidPayloadError,
     InvalidSignatureError,

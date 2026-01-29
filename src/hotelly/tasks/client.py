@@ -8,7 +8,7 @@ Provides multiple backends selectable via TASKS_BACKEND env var:
 
 import os
 from datetime import datetime
-from typing import Any, Callable, Protocol
+from typing import Callable, Protocol
 
 
 TASKS_BACKEND = os.environ.get("TASKS_BACKEND", "inline")
