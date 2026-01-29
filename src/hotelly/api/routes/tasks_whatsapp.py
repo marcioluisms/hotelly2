@@ -4,7 +4,7 @@ S05: Orchestrates quote → hold → checkout flow (zero PII).
 Security (ADR-006):
 - Payload contains NO PII (contact_hash only, not remote_jid/phone/text)
 - Logs NEVER contain PII (no contact_hash, text, remote_jid)
-- Response text persisted in outbox_events (PII-free)
+- Outbox stores template_key + params only (text rendered at send time)
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ async def handle_message(request: Request) -> Response:
         },
     )
 
-    response_text: str | None = None
+    response_template: tuple[str, dict[str, Any]] | None = None
     outbox_event_id: int | None = None
     conv_id: str | None = None
 
@@ -183,7 +183,7 @@ async def handle_message(request: Request) -> Response:
             )
 
             # 3. Process intent and determine response (deterministic, no LLM)
-            response_text = _process_intent(
+            response_template = _process_intent(
                 cur,
                 property_id=property_id,
                 conversation_id=conv_id,
@@ -192,13 +192,15 @@ async def handle_message(request: Request) -> Response:
                 correlation_id=correlation_id,
             )
 
-            # 4. Persist outbox event (PII-free)
-            if response_text:
+            # 4. Persist outbox event (PII-free: template_key + params only)
+            if response_template:
+                template_key, params = response_template
                 outbox_event_id = _insert_outbox_event(
                     cur,
                     property_id=property_id,
                     contact_hash=contact_hash,
-                    text=response_text,
+                    template_key=template_key,
+                    params=params,
                     correlation_id=correlation_id,
                 )
 
@@ -208,7 +210,7 @@ async def handle_message(request: Request) -> Response:
                         "extra_fields": safe_log_context(
                             correlationId=correlation_id,
                             outbox_event_id=outbox_event_id,
-                            text_len=len(response_text),
+                            template_key=template_key,
                         )
                     },
                 )
@@ -227,7 +229,7 @@ async def handle_message(request: Request) -> Response:
 
     # 5. Enqueue send-response task (outside transaction)
     # Payload is PII-free: references outbox_event_id only
-    if response_text and outbox_event_id:
+    if response_template and outbox_event_id:
         _enqueue_send_response(
             property_id=property_id,
             outbox_event_id=outbox_event_id,
@@ -245,8 +247,8 @@ def _process_intent(
     intent: str,
     entities: dict[str, Any],
     correlation_id: str | None,
-) -> str | None:
-    """Process intent and return response text.
+) -> tuple[str, dict[str, Any]] | None:
+    """Process intent and return (template_key, params).
 
     Deterministic flow (no LLM):
     - Complete data → try quote → hold
@@ -261,7 +263,7 @@ def _process_intent(
         correlation_id: Request correlation ID.
 
     Returns:
-        Response text to send, or None if no response needed.
+        Tuple of (template_key, params) or None if no response needed.
     """
     # Extract entities (dates as ISO strings from webhook)
     checkin_str = entities.get("checkin")
@@ -294,15 +296,15 @@ def _process_intent(
     if not guest_count:
         missing.append("guest_count")
 
-    # Missing data → deterministic prompts
+    # Missing data → deterministic prompts (template_key, params)
     if "checkin" in missing or "checkout" in missing:
-        return "Por favor, informe as datas de entrada e saída (ex: 10/02 a 12/02)."
+        return ("prompt_dates", {})
 
     if "room_type" in missing:
-        return "Qual tipo de quarto prefere? Temos Standard e Suíte disponíveis."
+        return ("prompt_room_type", {})
 
     if "guest_count" in missing:
-        return "Quantos hóspedes serão?"
+        return ("prompt_guest_count", {})
 
     # All data present → try quote, hold, and checkout
     return _try_quote_hold_checkout(
@@ -327,7 +329,7 @@ def _try_quote_hold_checkout(
     room_type_id: str,
     guest_count: int,
     correlation_id: str | None,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     """Try to create quote, hold, and checkout session.
 
     Args:
@@ -341,7 +343,7 @@ def _try_quote_hold_checkout(
         correlation_id: Request correlation ID.
 
     Returns:
-        Response text describing result with checkout URL.
+        Tuple of (template_key, params) for the response.
     """
     # 1. Get quote
     quote = quote_minimum(
@@ -366,12 +368,15 @@ def _try_quote_hold_checkout(
             },
         )
         return (
-            f"Infelizmente não temos disponibilidade para {checkin.strftime('%d/%m')} "
-            f"a {checkout.strftime('%d/%m')}. Gostaria de tentar outras datas?"
+            "quote_unavailable",
+            {
+                "checkin": checkin.strftime("%d/%m"),
+                "checkout": checkout.strftime("%d/%m"),
+            },
         )
 
     # Format price (cents to BRL)
-    total_brl = quote["total_cents"] / 100
+    total_brl = f"{quote['total_cents'] / 100:,.2f}"
     nights = quote["nights"]
 
     # 2. Create hold (idempotency key based on conversation + dates)
@@ -401,10 +406,7 @@ def _try_quote_hold_checkout(
                 )
             },
         )
-        return (
-            "Ops! Parece que alguém acabou de reservar esse quarto. "
-            "Gostaria de tentar outras datas?"
-        )
+        return ("hold_unavailable", {})
 
     logger.info(
         "hold created",
@@ -459,25 +461,23 @@ def _try_quote_hold_checkout(
             },
         )
 
-    # 4. Return quote summary with checkout URL (no PII)
+    # 4. Return template_key + params (no PII, text rendered at send time)
+    base_params = {
+        "nights": nights,
+        "checkin": checkin.strftime("%d/%m"),
+        "checkout": checkout.strftime("%d/%m"),
+        "guest_count": guest_count,
+        "total_brl": total_brl,
+    }
+
     if checkout_url:
         return (
-            f"Ótimo! Encontrei disponibilidade:\n"
-            f"- {nights} noite(s) de {checkin.strftime('%d/%m')} a {checkout.strftime('%d/%m')}\n"
-            f"- {guest_count} hóspede(s)\n"
-            f"- Total: R$ {total_brl:,.2f}\n\n"
-            f"Reserva válida por 15 minutos.\n"
-            f"Pague aqui: {checkout_url}"
+            "quote_available",
+            {**base_params, "checkout_url": checkout_url},
         )
 
     # Fallback if checkout creation failed
-    return (
-        f"Ótimo! Encontrei disponibilidade:\n"
-        f"- {nights} noite(s) de {checkin.strftime('%d/%m')} a {checkout.strftime('%d/%m')}\n"
-        f"- {guest_count} hóspede(s)\n"
-        f"- Total: R$ {total_brl:,.2f}\n\n"
-        f"Reserva válida por 15 minutos. Deseja confirmar?"
-    )
+    return ("quote_available_no_checkout", base_params)
 
 
 def _insert_outbox_event(
@@ -485,21 +485,23 @@ def _insert_outbox_event(
     *,
     property_id: str,
     contact_hash: str,
-    text: str,
+    template_key: str,
+    params: dict[str, Any],
     correlation_id: str | None,
 ) -> int:
     """Insert a PII-free outbox event and return its id.
 
     Schema alignment (S05/S06 backlog):
     - event_type: "whatsapp.send_message"
-    - contact_hash: column for vault lookup by send-response
-    - payload_json: ONLY {"text": "..."} (no PII)
+    - aggregate_id: stores contact_hash for vault lookup by send-response
+    - payload: {"template_key": "...", "params": {...}} (PII-free, text rendered at send time)
 
     Args:
         cur: Database cursor (within transaction).
         property_id: Property identifier.
-        contact_hash: Hashed contact (stored in contact_hash column).
-        text: Response text to send.
+        contact_hash: Hashed contact (stored in aggregate_id column).
+        template_key: Template identifier for rendering.
+        params: Template parameters (must be PII-free).
         correlation_id: Request correlation ID.
 
     Returns:
@@ -516,7 +518,7 @@ def _insert_outbox_event(
             "whatsapp.send_message",
             "contact",
             contact_hash,
-            json.dumps({"text": text}),
+            json.dumps({"template_key": template_key, "params": params}),
             correlation_id,
         ),
     )
