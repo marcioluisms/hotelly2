@@ -209,16 +209,16 @@ async def stripe_webhook(
 
             # New event - enqueue task (inside transaction)
             # If enqueue fails, transaction rolls back and receipt is not saved
-            enqueued = tasks_client.enqueue(
+            enqueued = tasks_client.enqueue_http(
                 task_id=task_id,
-                handler=handle_stripe_event,
+                url_path="/tasks/stripe/handle-event",
                 payload={
                     "event_id": event.event_id,
                     "event_type": event.event_type,
                     "object_id": event.object_id,
                     "property_id": property_id,
-                    "correlation_id": correlation_id,
                 },
+                correlation_id=correlation_id,
             )
 
             if not enqueued:

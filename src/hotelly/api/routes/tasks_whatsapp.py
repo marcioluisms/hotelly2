@@ -544,16 +544,12 @@ def _enqueue_send_response(
     # Task ID per backlog: "send:{outbox_event_id}"
     task_id = f"send:{outbox_event_id}"
 
-    # Handler noop - actual implementation is S06
-    def _noop(payload: dict) -> None:
-        pass
-
-    _get_tasks_client().enqueue(
+    _get_tasks_client().enqueue_http(
         task_id=task_id,
-        handler=_noop,
+        url_path="/tasks/whatsapp/send-response",
         payload={
             "property_id": property_id,
             "outbox_event_id": outbox_event_id,
-            "correlation_id": correlation_id,
         },
+        correlation_id=correlation_id,
     )
