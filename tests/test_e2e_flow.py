@@ -169,7 +169,7 @@ def mock_tasks_client():
     import hotelly.api.routes.webhooks_whatsapp as webhook_module
 
     mock_client = MagicMock()
-    mock_client.enqueue.return_value = True
+    mock_client.enqueue_http.return_value = True
 
     original_getter = webhook_module._get_tasks_client
     webhook_module._get_tasks_client = lambda: mock_client
@@ -298,8 +298,8 @@ class TestE2EFlow:
         # ============================================================
         # PHASE 3: Verify enqueue and payload
         # ============================================================
-        mock_tasks_client.enqueue.assert_called_once()
-        call_kwargs = mock_tasks_client.enqueue.call_args[1]
+        mock_tasks_client.enqueue_http.assert_called_once()
+        call_kwargs = mock_tasks_client.enqueue_http.call_args[1]
         task_payload = call_kwargs["payload"]
         payload_str = str(task_payload)
 

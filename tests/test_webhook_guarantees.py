@@ -99,7 +99,7 @@ def mock_tasks_client():
     import hotelly.api.routes.webhooks_whatsapp as webhook_module
 
     mock_client = MagicMock()
-    mock_client.enqueue.return_value = True
+    mock_client.enqueue_http.return_value = True
 
     original_getter = webhook_module._get_tasks_client
     webhook_module._get_tasks_client = lambda: mock_client
@@ -158,7 +158,7 @@ class TestWebhookGuarantees:
         with txn() as cur:
             cur.execute(
                 """
-                SELECT id FROM contact_refs
+                SELECT 1 FROM contact_refs
                 WHERE property_id = %s AND channel = %s AND contact_hash = %s
                 """,
                 (TEST_PROPERTY_ID, "whatsapp", expected_contact_hash),
@@ -167,8 +167,8 @@ class TestWebhookGuarantees:
             assert contact_ref is not None, "Contact ref not found in contact_refs"
 
         # 4. Verify enqueue was called exactly once
-        mock_tasks_client.enqueue.assert_called_once()
-        call_kwargs = mock_tasks_client.enqueue.call_args[1]
+        mock_tasks_client.enqueue_http.assert_called_once()
+        call_kwargs = mock_tasks_client.enqueue_http.call_args[1]
         assert call_kwargs["task_id"] == f"whatsapp:{message_id}"
         # Verify payload has contact_hash (not PII)
         assert call_kwargs["payload"]["contact_hash"] == expected_contact_hash
@@ -203,7 +203,7 @@ class TestWebhookGuarantees:
         assert r1.text == "ok"
 
         # Verify enqueue was called on first request
-        mock_tasks_client.enqueue.assert_called_once()
+        mock_tasks_client.enqueue_http.assert_called_once()
 
         # Reset mock to track second call
         mock_tasks_client.reset_mock()
@@ -218,7 +218,7 @@ class TestWebhookGuarantees:
         assert r2.text == "duplicate"
 
         # Verify enqueue was NOT called on duplicate
-        mock_tasks_client.enqueue.assert_not_called()
+        mock_tasks_client.enqueue_http.assert_not_called()
 
         # Verify single receipt in processed_events
         with txn() as cur:

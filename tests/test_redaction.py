@@ -102,7 +102,7 @@ def mock_tasks_client():
     import hotelly.api.routes.webhooks_whatsapp as webhook_module
 
     mock_client = MagicMock()
-    mock_client.enqueue.return_value = True
+    mock_client.enqueue_http.return_value = True
 
     original_getter = webhook_module._get_tasks_client
     webhook_module._get_tasks_client = lambda: mock_client
@@ -188,8 +188,8 @@ class TestRedactionTaskPayload:
         assert response.status_code == 200
 
         # Get enqueued task payload
-        mock_tasks_client.enqueue.assert_called_once()
-        task_payload = mock_tasks_client.enqueue.call_args[1]["payload"]
+        mock_tasks_client.enqueue_http.assert_called_once()
+        task_payload = mock_tasks_client.enqueue_http.call_args[1]["payload"]
         payload_str = str(task_payload)
 
         # CRITICAL: No PII keys in payload

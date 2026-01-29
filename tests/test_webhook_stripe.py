@@ -81,7 +81,7 @@ def mock_tasks_client():
     import hotelly.api.routes.webhooks_stripe as webhook_module
 
     mock_client = MagicMock()
-    mock_client.enqueue.return_value = True
+    mock_client.enqueue_http.return_value = True
 
     original_getter = webhook_module._get_tasks_client
     webhook_module._get_tasks_client = lambda: mock_client
@@ -156,13 +156,11 @@ class TestStripeWebhook:
             count = cur.fetchone()[0]
             assert count == 1
 
-        # Verify enqueue was called with correct handler
-        from hotelly.api.routes.tasks_stripe import handle_stripe_event
-
-        mock_tasks_client.enqueue.assert_called_once()
-        call_args = mock_tasks_client.enqueue.call_args
+        # Verify enqueue was called with correct url_path
+        mock_tasks_client.enqueue_http.assert_called_once()
+        call_args = mock_tasks_client.enqueue_http.call_args
         assert call_args[1]["task_id"] == f"stripe:{TEST_EVENT_ID}"
-        assert call_args[1]["handler"] == handle_stripe_event
+        assert call_args[1]["url_path"] == "/tasks/stripe/handle-event"
         assert call_args[1]["payload"]["event_type"] == "checkout.session.completed"
         assert call_args[1]["payload"]["property_id"] == TEST_PROPERTY_ID
 
@@ -209,7 +207,7 @@ class TestStripeWebhook:
             assert count == 1
 
         # Verify enqueue was NOT called on second request
-        mock_tasks_client.enqueue.assert_not_called()
+        mock_tasks_client.enqueue_http.assert_not_called()
 
     def test_enqueue_exception_returns_500_no_receipt(
         self,
@@ -235,7 +233,7 @@ class TestStripeWebhook:
 
         # Create a failing tasks client (raises exception)
         failing_client = MagicMock()
-        failing_client.enqueue.side_effect = RuntimeError("Enqueue failed!")
+        failing_client.enqueue_http.side_effect = RuntimeError("Enqueue failed!")
 
         original_getter = webhook_module._get_tasks_client
         webhook_module._get_tasks_client = lambda: failing_client
@@ -293,7 +291,7 @@ class TestStripeWebhook:
 
         # Create a tasks client that returns False (idempotency collision)
         false_client = MagicMock()
-        false_client.enqueue.return_value = False
+        false_client.enqueue_http.return_value = False
 
         original_getter = webhook_module._get_tasks_client
         webhook_module._get_tasks_client = lambda: false_client

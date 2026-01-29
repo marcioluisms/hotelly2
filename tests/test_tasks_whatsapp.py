@@ -356,7 +356,7 @@ class TestS05PiiSafety:
             assert event_type == "whatsapp.send_message"
             assert contact_hash_col == "hash_outbox_test"  # contact_hash in aggregate_id
 
-            payload_data = json.loads(payload_json)
+            payload_data = payload_json  # JSONB already returns dict
             # S4.3: payload must NOT contain "text" - only template_key + params
             assert "text" not in payload_data, f"PII leak: 'text' in payload: {payload_data}"
             assert "template_key" in payload_data
@@ -475,7 +475,7 @@ class TestS05PiiSafety:
             assert row is not None
 
             event_type, payload_json = row
-            payload_data = json.loads(payload_json)
+            payload_data = payload_json  # JSONB already returns dict
 
             # S4.3: payload must NOT contain "text" - only template_key + params
             assert "text" not in payload_data, f"PII leak: 'text' in payload: {payload_data}"

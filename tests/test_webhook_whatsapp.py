@@ -89,7 +89,7 @@ def mock_tasks_client():
     import hotelly.api.routes.webhooks_whatsapp as webhook_module
 
     mock_client = MagicMock()
-    mock_client.enqueue.return_value = True
+    mock_client.enqueue_http.return_value = True
 
     original_getter = webhook_module._get_tasks_client
     webhook_module._get_tasks_client = lambda: mock_client
@@ -128,8 +128,8 @@ class TestWebhookEvolution:
             assert count == 1
 
         # Verify enqueue was called
-        mock_tasks_client.enqueue.assert_called_once()
-        call_args = mock_tasks_client.enqueue.call_args
+        mock_tasks_client.enqueue_http.assert_called_once()
+        call_args = mock_tasks_client.enqueue_http.call_args
         assert call_args[1]["task_id"] == "whatsapp:MSG123456789"
 
     def test_duplicate_post_returns_200_no_double_enqueue(
@@ -170,7 +170,7 @@ class TestWebhookEvolution:
             assert count == 1
 
         # Verify enqueue was NOT called on second request
-        mock_tasks_client.enqueue.assert_not_called()
+        mock_tasks_client.enqueue_http.assert_not_called()
 
     def test_enqueue_failure_returns_500_no_receipt(
         self, client, ensure_property, mock_secrets
@@ -180,7 +180,7 @@ class TestWebhookEvolution:
 
         # Create a failing tasks client
         failing_client = MagicMock()
-        failing_client.enqueue.side_effect = RuntimeError("Enqueue failed!")
+        failing_client.enqueue_http.side_effect = RuntimeError("Enqueue failed!")
 
         original_getter = webhook_module._get_tasks_client
         webhook_module._get_tasks_client = lambda: failing_client
@@ -345,8 +345,8 @@ class TestS04WebhookPiiSafety:
         assert response.status_code == 200
 
         # Verify enqueue was called
-        mock_tasks_client.enqueue.assert_called_once()
-        call_kwargs = mock_tasks_client.enqueue.call_args[1]
+        mock_tasks_client.enqueue_http.assert_called_once()
+        call_kwargs = mock_tasks_client.enqueue_http.call_args[1]
         task_payload = call_kwargs["payload"]
 
         # Task payload must NOT contain PII
@@ -416,7 +416,7 @@ class TestS04WebhookPiiSafety:
         assert response2.text == "duplicate"
 
         # Verify enqueue was NOT called on second request
-        mock_tasks_client.enqueue.assert_not_called()
+        mock_tasks_client.enqueue_http.assert_not_called()
 
         # Verify still only 1 receipt
         with txn() as cur:
@@ -455,7 +455,7 @@ class TestS04WebhookPiiSafety:
 
         assert response.status_code == 200
 
-        call_kwargs = mock_tasks_client.enqueue.call_args[1]
+        call_kwargs = mock_tasks_client.enqueue_http.call_args[1]
         task_payload = call_kwargs["payload"]
 
         # Verify intent was classified
