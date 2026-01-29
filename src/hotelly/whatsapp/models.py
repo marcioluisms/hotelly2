@@ -13,14 +13,14 @@ class InboundMessage:
     """
 
     message_id: str
-    provider: Literal["evolution"]
+    provider: Literal["evolution", "meta"]
     received_at: datetime
     kind: str  # e.g., "text", "image", "audio", etc.
 
 
 @dataclass(frozen=True)
 class NormalizedInbound:
-    """Payload normalizado da Evolution com PII.
+    """Payload normalizado da Evolution/Meta com PII.
 
     ATENÇÃO PII (ADR-006):
     - `remote_jid` e `text` são PII
@@ -30,7 +30,7 @@ class NormalizedInbound:
     """
 
     message_id: str
-    provider: Literal["evolution"]
+    provider: Literal["evolution", "meta"]
     received_at: datetime
     kind: str
     remote_jid: str

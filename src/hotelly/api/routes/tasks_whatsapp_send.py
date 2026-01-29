@@ -8,15 +8,54 @@ from fastapi import APIRouter, Response
 
 from hotelly.infra.contact_refs import get_remote_jid
 from hotelly.infra.db import txn
+from hotelly.infra.property_settings import get_whatsapp_config
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
+from hotelly.whatsapp.meta_sender import extract_phone_from_jid, send_text_via_meta
 from hotelly.whatsapp.outbound import send_text_via_evolution
 from hotelly.whatsapp.templates import render
 
 router = APIRouter(prefix="/tasks/whatsapp", tags=["tasks"])
 
 logger = get_logger(__name__)
+
+
+def _send_via_provider(
+    *,
+    property_id: str,
+    remote_jid: str,
+    text: str,
+    correlation_id: str | None = None,
+) -> None:
+    """Send message via configured provider.
+
+    Resolves provider from property whatsapp_config and routes to appropriate sender.
+
+    Args:
+        property_id: Property UUID for config lookup.
+        remote_jid: WhatsApp JID (e.g., "5511999999999@s.whatsapp.net").
+        text: Message text to send.
+        correlation_id: Optional correlation ID for tracing.
+    """
+    config = get_whatsapp_config(property_id)
+
+    if config.outbound_provider == "meta":
+        phone = extract_phone_from_jid(remote_jid)
+        send_text_via_meta(
+            to_phone=phone,
+            text=text,
+            correlation_id=correlation_id,
+            phone_number_id=config.meta.phone_number_id,
+            access_token=config.meta.access_token,
+        )
+    else:
+        # Default to evolution (backward compatible)
+        send_text_via_evolution(
+            to_ref=remote_jid,
+            text=text,
+            correlation_id=correlation_id,
+        )
 
 
 class SendMessageRequest(BaseModel):
@@ -77,8 +116,9 @@ async def send_message(req: SendMessageRequest) -> dict:
         return Response(status_code=404, content="contact_ref_missing")
 
     try:
-        send_text_via_evolution(
-            to_ref=to_ref,
+        _send_via_provider(
+            property_id=req.property_id,
+            remote_jid=to_ref,
             text=req.text,
             correlation_id=correlation_id,
         )
@@ -173,12 +213,13 @@ async def send_response(req: SendResponseRequest) -> dict:
         )
         return {"ok": False, "error": "contact_ref_not_found"}
 
-    # 3. Send via Evolution (remote_jid in memory only, discarded after)
+    # 3. Send via configured provider (remote_jid in memory only, discarded after)
     try:
         payload_data = json.loads(payload_json)
         text = render(payload_data["template_key"], payload_data["params"])
-        send_text_via_evolution(
-            to_ref=remote_jid,
+        _send_via_provider(
+            property_id=req.property_id,
+            remote_jid=remote_jid,
             text=text,
             correlation_id=correlation_id,
         )

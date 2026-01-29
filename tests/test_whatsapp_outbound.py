@@ -187,6 +187,8 @@ class TestNoPiiLeakage:
         """POST /tasks/whatsapp/send-message MUST NOT log PII."""
         from contextlib import contextmanager
 
+        from hotelly.infra.property_settings import WhatsAppConfig
+
         outbound_recorder = LogRecorder()
         route_recorder = LogRecorder()
 
@@ -199,6 +201,10 @@ class TestNoPiiLeakage:
         @contextmanager
         def mock_txn():
             yield mock_cur
+
+        # Mock get_whatsapp_config to return default (evolution)
+        def mock_get_whatsapp_config(property_id):
+            return WhatsAppConfig()
 
         with patch("hotelly.whatsapp.outbound.logger", outbound_recorder):
             with patch(
@@ -213,18 +219,22 @@ class TestNoPiiLeakage:
                         mock_txn,
                     ):
                         with patch(
-                            "hotelly.whatsapp.outbound._do_request",
-                            return_value={"status": "sent"},
+                            "hotelly.api.routes.tasks_whatsapp_send.get_whatsapp_config",
+                            mock_get_whatsapp_config,
                         ):
-                            response = client.post(
-                                "/tasks/whatsapp/send-message",
-                                json={
-                                    "property_id": "prop-test-001",
-                                    "contact_hash": "hash_abc123",
-                                    "text": self.MESSAGE_TEXT,
-                                    "correlation_id": "route-test-001",
-                                },
-                            )
+                            with patch(
+                                "hotelly.whatsapp.outbound._do_request",
+                                return_value={"status": "sent"},
+                            ):
+                                response = client.post(
+                                    "/tasks/whatsapp/send-message",
+                                    json={
+                                        "property_id": "prop-test-001",
+                                        "contact_hash": "hash_abc123",
+                                        "text": self.MESSAGE_TEXT,
+                                        "correlation_id": "route-test-001",
+                                    },
+                                )
 
         assert response.status_code == 200
         assert response.json() == {"ok": True}
@@ -267,6 +277,7 @@ class TestRouteAvailability:
         from contextlib import contextmanager
 
         from hotelly.api.factory import create_app
+        from hotelly.infra.property_settings import WhatsAppConfig
 
         app = create_app(role="worker")
         client = TestClient(app)
@@ -280,6 +291,9 @@ class TestRouteAvailability:
         def mock_txn():
             yield mock_cur
 
+        def mock_get_whatsapp_config(property_id):
+            return WhatsAppConfig()
+
         with patch(
             "hotelly.api.routes.tasks_whatsapp_send.get_remote_jid",
             mock_get_remote_jid,
@@ -289,13 +303,17 @@ class TestRouteAvailability:
                 mock_txn,
             ):
                 with patch(
-                    "hotelly.whatsapp.outbound._do_request",
-                    return_value={"status": "sent"},
+                    "hotelly.api.routes.tasks_whatsapp_send.get_whatsapp_config",
+                    mock_get_whatsapp_config,
                 ):
-                    response = client.post(
-                        "/tasks/whatsapp/send-message",
-                        json={"property_id": "x", "contact_hash": "y", "text": "z"},
-                    )
+                    with patch(
+                        "hotelly.whatsapp.outbound._do_request",
+                        return_value={"status": "sent"},
+                    ):
+                        response = client.post(
+                            "/tasks/whatsapp/send-message",
+                            json={"property_id": "x", "contact_hash": "y", "text": "z"},
+                        )
         assert response.status_code == 200
 
 
@@ -337,6 +355,8 @@ class TestContactRefLookup:
         """When contact_ref exists, calls sender with remote_jid."""
         from contextlib import contextmanager
 
+        from hotelly.infra.property_settings import WhatsAppConfig
+
         mock_cur = MagicMock()
         call_params = {}
 
@@ -350,6 +370,9 @@ class TestContactRefLookup:
         def mock_txn():
             yield mock_cur
 
+        def mock_get_whatsapp_config(property_id):
+            return WhatsAppConfig()
+
         mock_do_request = MagicMock(return_value={"status": "sent"})
 
         with patch(
@@ -361,17 +384,21 @@ class TestContactRefLookup:
                 mock_txn,
             ):
                 with patch(
-                    "hotelly.whatsapp.outbound._do_request",
-                    mock_do_request,
+                    "hotelly.api.routes.tasks_whatsapp_send.get_whatsapp_config",
+                    mock_get_whatsapp_config,
                 ):
-                    response = client.post(
-                        "/tasks/whatsapp/send-message",
-                        json={
-                            "property_id": "prop-001",
-                            "contact_hash": "hash_abc123",
-                            "text": self.MESSAGE_TEXT,
-                        },
-                    )
+                    with patch(
+                        "hotelly.whatsapp.outbound._do_request",
+                        mock_do_request,
+                    ):
+                        response = client.post(
+                            "/tasks/whatsapp/send-message",
+                            json={
+                                "property_id": "prop-001",
+                                "contact_hash": "hash_abc123",
+                                "text": self.MESSAGE_TEXT,
+                            },
+                        )
 
         assert response.status_code == 200
         assert response.json() == {"ok": True}

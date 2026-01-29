@@ -20,6 +20,7 @@ from .routes import (
     tasks_whatsapp_send,
     webhooks_stripe,
     webhooks_whatsapp,
+    webhooks_whatsapp_meta,
 )
 
 AppRole = Literal["public", "worker"]
@@ -60,6 +61,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
     # Mount public routes (always)
     app.include_router(public.router)
     app.include_router(webhooks_whatsapp.router)
+    app.include_router(webhooks_whatsapp_meta.router)
     app.include_router(webhooks_stripe.router)
 
     # Mount worker routes only for worker role
