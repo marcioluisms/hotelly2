@@ -188,10 +188,11 @@ async def evolution_webhook(
                 return Response(status_code=200, content="duplicate")
 
             # 8. Enqueue task (NO PII in payload)
-            enqueued = tasks_client.enqueue(
+            enqueued = tasks_client.enqueue_http(
                 task_id=task_id,
-                handler=_handle_whatsapp_message,
+                url_path="/tasks/whatsapp/handle-message",
                 payload=task_payload,
+                correlation_id=correlation_id,
             )
 
             if not enqueued:

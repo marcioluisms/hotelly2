@@ -12,6 +12,7 @@ from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
 from hotelly.whatsapp.outbound import send_text_via_evolution
+from hotelly.whatsapp.templates import render
 
 router = APIRouter(prefix="/tasks/whatsapp", tags=["tasks"])
 
@@ -136,7 +137,7 @@ async def send_response(req: SendResponseRequest) -> dict:
     # 1. Load outbox_event and validate
     with txn() as cur:
         cur.execute(
-            "SELECT event_type, contact_hash, payload_json FROM outbox_events WHERE id = %s",
+            "SELECT event_type, aggregate_id, payload FROM outbox_events WHERE id = %s",
             (req.outbox_event_id,),
         )
         row = cur.fetchone()
@@ -174,7 +175,8 @@ async def send_response(req: SendResponseRequest) -> dict:
 
     # 3. Send via Evolution (remote_jid in memory only, discarded after)
     try:
-        text = json.loads(payload_json)["text"]
+        payload_data = json.loads(payload_json)
+        text = render(payload_data["template_key"], payload_data["params"])
         send_text_via_evolution(
             to_ref=remote_jid,
             text=text,

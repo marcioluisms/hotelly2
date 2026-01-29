@@ -21,9 +21,26 @@ services:
     ports:
       - "${APP_PORT:-8000}:8000"
     environment:
+      APP_ROLE: public
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hotelly}
       CONTACT_HASH_SECRET: ${CONTACT_HASH_SECRET}
       CONTACT_REFS_KEY: ${CONTACT_REFS_KEY}
+      TASKS_BACKEND: http
+      WORKER_BASE_URL: http://worker:8000
+      INTERNAL_TASK_SECRET: ${INTERNAL_TASK_SECRET:-dev-secret}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    # NO ports: - worker is internal only, not exposed publicly
+    environment:
+      APP_ROLE: worker
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hotelly}
+      CONTACT_HASH_SECRET: ${CONTACT_HASH_SECRET}
+      CONTACT_REFS_KEY: ${CONTACT_REFS_KEY}
+      INTERNAL_TASK_SECRET: ${INTERNAL_TASK_SECRET:-dev-secret}
     depends_on:
       db:
         condition: service_healthy

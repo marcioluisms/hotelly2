@@ -325,7 +325,7 @@ class TestS05PiiSafety:
             )
 
     def test_outbox_event_created_for_missing_dates(self, client, ensure_property):
-        """S05: Missing dates triggers deterministic response in outbox."""
+        """S05/S4.3: Missing dates triggers template_key + params in outbox (no text)."""
         payload = {
             "task_id": "task-outbox-001",
             "property_id": TEST_PROPERTY_ID,
@@ -339,11 +339,11 @@ class TestS05PiiSafety:
         assert response.status_code == 200
         assert response.text == "ok"
 
-        # Verify outbox event was created with correct schema (S05/S06)
+        # Verify outbox event was created with PII-free schema (template_key + params)
         with txn() as cur:
             cur.execute(
                 """
-                SELECT event_type, contact_hash, payload_json FROM outbox_events
+                SELECT event_type, aggregate_id, payload FROM outbox_events
                 WHERE property_id = %s AND event_type = 'whatsapp.send_message'
                 ORDER BY id DESC LIMIT 1
                 """,
@@ -354,12 +354,19 @@ class TestS05PiiSafety:
 
             event_type, contact_hash_col, payload_json = row
             assert event_type == "whatsapp.send_message"
-            assert contact_hash_col == "hash_outbox_test"  # contact_hash in column
+            assert contact_hash_col == "hash_outbox_test"  # contact_hash in aggregate_id
 
             payload_data = json.loads(payload_json)
-            assert "text" in payload_data
-            assert "datas" in payload_data["text"].lower()  # Portuguese prompt
-            # contact_hash should NOT be in payload_json (it's in contact_hash column)
+            # S4.3: payload must NOT contain "text" - only template_key + params
+            assert "text" not in payload_data, f"PII leak: 'text' in payload: {payload_data}"
+            assert "template_key" in payload_data
+            assert isinstance(payload_data["template_key"], str)
+            assert payload_data["template_key"] == "prompt_dates"
+            assert "params" in payload_data
+            assert isinstance(payload_data["params"], dict)
+            # params should be empty for prompt_dates
+            assert payload_data["params"] == {}
+            # contact_hash should NOT be in payload (it's in aggregate_id column)
             assert "contact_hash" not in payload_data
 
     def test_send_task_enqueued(self, client, ensure_property):
@@ -454,11 +461,11 @@ class TestS05PiiSafety:
 
         assert response.status_code == 200
 
-        # Verify outbox event contains checkout URL
+        # Verify outbox event contains template_key + params with checkout_url
         with txn() as cur:
             cur.execute(
                 """
-                SELECT payload_json FROM outbox_events
+                SELECT event_type, payload FROM outbox_events
                 WHERE property_id = %s AND event_type = 'whatsapp.send_message'
                 ORDER BY id DESC LIMIT 1
                 """,
@@ -467,11 +474,24 @@ class TestS05PiiSafety:
             row = cur.fetchone()
             assert row is not None
 
-            payload_data = json.loads(row[0])
-            text = payload_data.get("text", "")
-            # Response should contain checkout URL
-            assert "http" in text.lower() or "checkout" in text.lower(), (
-                f"Expected checkout URL in response, got: {text}"
+            event_type, payload_json = row
+            payload_data = json.loads(payload_json)
+
+            # S4.3: payload must NOT contain "text" - only template_key + params
+            assert "text" not in payload_data, f"PII leak: 'text' in payload: {payload_data}"
+            assert "template_key" in payload_data
+            assert isinstance(payload_data["template_key"], str)
+            assert payload_data["template_key"] == "quote_available"
+            assert "params" in payload_data
+            assert isinstance(payload_data["params"], dict)
+
+            # Validate allowed params only (no PII)
+            params = payload_data["params"]
+            allowed_params = {"nights", "checkin", "checkout", "guest_count", "total_brl", "checkout_url"}
+            assert set(params.keys()) <= allowed_params, f"Unexpected params: {set(params.keys()) - allowed_params}"
+            assert "checkout_url" in params
+            assert "http" in params["checkout_url"].lower(), (
+                f"Expected checkout URL, got: {params['checkout_url']}"
             )
 
         # Cleanup test data
