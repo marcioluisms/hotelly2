@@ -136,7 +136,7 @@ async def send_response(req: SendResponseRequest) -> dict:
     # 1. Load outbox_event and validate
     with txn() as cur:
         cur.execute(
-            "SELECT event_type, contact_hash, payload_json FROM outbox_events WHERE id = %s",
+            "SELECT event_type, aggregate_id, payload FROM outbox_events WHERE id = %s",
             (req.outbox_event_id,),
         )
         row = cur.fetchone()

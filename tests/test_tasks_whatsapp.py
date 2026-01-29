@@ -343,7 +343,7 @@ class TestS05PiiSafety:
         with txn() as cur:
             cur.execute(
                 """
-                SELECT event_type, contact_hash, payload_json FROM outbox_events
+                SELECT event_type, aggregate_id, payload FROM outbox_events
                 WHERE property_id = %s AND event_type = 'whatsapp.send_message'
                 ORDER BY id DESC LIMIT 1
                 """,
@@ -458,7 +458,7 @@ class TestS05PiiSafety:
         with txn() as cur:
             cur.execute(
                 """
-                SELECT payload_json FROM outbox_events
+                SELECT payload FROM outbox_events
                 WHERE property_id = %s AND event_type = 'whatsapp.send_message'
                 ORDER BY id DESC LIMIT 1
                 """,
