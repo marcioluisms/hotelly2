@@ -15,12 +15,14 @@ from hotelly.observability.correlation import (
 from .routers import public, worker
 from .routes import (
     auth,
+    conversations,
     frontdesk,
     me,
     properties_read,
     properties_write,
     rbac,
     reservations,
+    tasks_conversations,
     tasks_holds,
     tasks_properties,
     tasks_reservations,
@@ -76,6 +78,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
     # Mount auth routes only for public role (dashboard/API)
     if role == "public":
         app.include_router(auth.router)
+        app.include_router(conversations.router)
         app.include_router(frontdesk.router)
         app.include_router(me.router)
         app.include_router(properties_read.router)
@@ -86,6 +89,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
     # Mount worker routes only for worker role
     if role == "worker":
         app.include_router(worker.router)
+        app.include_router(tasks_conversations.router)
         app.include_router(tasks_whatsapp.router)
         app.include_router(tasks_whatsapp_send.router)
         app.include_router(tasks_holds.router)
