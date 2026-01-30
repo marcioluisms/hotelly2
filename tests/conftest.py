@@ -1,0 +1,18 @@
+"""Shared pytest fixtures for Hotelly V2 tests."""
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_oidc_jwks_cache():
+    """Reset global JWKS cache to avoid cross-test contamination.
+
+    The OIDC JWKS cache is a module-level global that persists between tests.
+    Without this reset, tests may fail intermittently with 401 errors when
+    a cached JWKS from a previous test doesn't match the current test's keys.
+    """
+    import hotelly.api.auth as auth_module
+
+    auth_module._jwks_cache = None
+    auth_module._jwks_cache_time = 0
+    yield
