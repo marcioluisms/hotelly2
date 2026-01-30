@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS properties (
   id            TEXT PRIMARY KEY,
   name          TEXT NOT NULL,
   timezone      TEXT NOT NULL DEFAULT 'America/Sao_Paulo',
+  whatsapp_config JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -96,6 +97,22 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 CREATE INDEX IF NOT EXISTS idx_conversations_property_state
   ON conversations(property_id, state);
+
+-- ---------------------------------------------------------------------
+-- Contact refs (encrypted PII vault for response delivery, TTL 1 hour)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS contact_refs (
+  property_id   TEXT NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  channel       TEXT NOT NULL,
+  contact_hash  TEXT NOT NULL,
+  remote_jid_enc TEXT NOT NULL,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (property_id, channel, contact_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_refs_expires_at ON contact_refs(expires_at);
 
 -- ---------------------------------------------------------------------
 -- Quote options (snapshot used to create holds)
