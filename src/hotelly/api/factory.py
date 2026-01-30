@@ -18,12 +18,14 @@ from .routes import (
     conversations,
     frontdesk,
     me,
+    payments,
     properties_read,
     properties_write,
     rbac,
     reservations,
     tasks_conversations,
     tasks_holds,
+    tasks_payments,
     tasks_properties,
     tasks_reservations,
     tasks_stripe,
@@ -81,6 +83,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(conversations.router)
         app.include_router(frontdesk.router)
         app.include_router(me.router)
+        app.include_router(payments.router)
         app.include_router(properties_read.router)
         app.include_router(properties_write.router)
         app.include_router(rbac.router)
@@ -93,6 +96,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(tasks_whatsapp.router)
         app.include_router(tasks_whatsapp_send.router)
         app.include_router(tasks_holds.router)
+        app.include_router(tasks_payments.router)
         app.include_router(tasks_stripe.router)
         app.include_router(tasks_properties.router)
         app.include_router(tasks_reservations.router)
