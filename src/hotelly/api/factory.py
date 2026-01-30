@@ -15,6 +15,7 @@ from hotelly.observability.correlation import (
 from .routers import public, worker
 from .routes import (
     auth,
+    rbac,
     tasks_holds,
     tasks_stripe,
     tasks_whatsapp,
@@ -68,6 +69,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
     # Mount auth routes only for public role (dashboard/API)
     if role == "public":
         app.include_router(auth.router)
+        app.include_router(rbac.router)
 
     # Mount worker routes only for worker role
     if role == "worker":
