@@ -854,10 +854,10 @@ class TestOIDCVerificationFailClosed:
         }
 
         with patch(
-            "hotelly.api.routes.tasks_properties.id_token.verify_oauth2_token",
+            "hotelly.api.task_auth.id_token.verify_oauth2_token",
             return_value=mock_claims,
         ):
-            from hotelly.api.routes.tasks_properties import verify_task_oidc
+            from hotelly.api.task_auth import verify_task_oidc
 
             result = verify_task_oidc("some-token")
             assert result is False
@@ -873,10 +873,10 @@ class TestOIDCVerificationFailClosed:
         }
 
         with patch(
-            "hotelly.api.routes.tasks_properties.id_token.verify_oauth2_token",
+            "hotelly.api.task_auth.id_token.verify_oauth2_token",
             return_value=mock_claims,
         ):
-            from hotelly.api.routes.tasks_properties import verify_task_oidc
+            from hotelly.api.task_auth import verify_task_oidc
 
             result = verify_task_oidc("valid-google-oidc-token")
             assert result is True
@@ -889,10 +889,10 @@ class TestOIDCVerificationFailClosed:
         }
 
         with patch(
-            "hotelly.api.routes.tasks_properties.id_token.verify_oauth2_token",
+            "hotelly.api.task_auth.id_token.verify_oauth2_token",
             return_value=mock_claims,
         ):
-            from hotelly.api.routes.tasks_properties import verify_task_oidc
+            from hotelly.api.task_auth import verify_task_oidc
 
             result = verify_task_oidc("valid-google-oidc-token")
             assert result is True
@@ -900,10 +900,10 @@ class TestOIDCVerificationFailClosed:
     def test_invalid_token_raises_valueerror_returns_false(self, tasks_oidc_env):
         """When google library raises ValueError, should return False."""
         with patch(
-            "hotelly.api.routes.tasks_properties.id_token.verify_oauth2_token",
+            "hotelly.api.task_auth.id_token.verify_oauth2_token",
             side_effect=ValueError("Token expired or invalid"),
         ):
-            from hotelly.api.routes.tasks_properties import verify_task_oidc
+            from hotelly.api.task_auth import verify_task_oidc
 
             result = verify_task_oidc("invalid-token")
             assert result is False

@@ -1,11 +1,12 @@
-"""Worker routes for property update task handling.
+"""Worker routes for reservation task handling.
 
-V2-S15: POST /tasks/properties/update - executes property UPDATE in DB.
-Only accepts requests with valid Cloud Tasks OIDC token (Authorization: Bearer).
+V2-S17: POST /tasks/reservations/resend-payment-link - creates outbox event.
+Only accepts requests with valid Cloud Tasks OIDC token.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -16,73 +17,69 @@ from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
 
-router = APIRouter(prefix="/tasks/properties", tags=["tasks"])
+router = APIRouter(prefix="/tasks/reservations", tags=["tasks"])
 
 logger = get_logger(__name__)
 
 
-def _update_property(property_id: str, updates: dict[str, Any]) -> bool:
-    """Update property fields in database.
+def _insert_outbox_event(
+    property_id: str,
+    reservation_id: str,
+    correlation_id: str | None,
+) -> int:
+    """Insert outbox event for resend-payment-link action.
 
     Args:
-        property_id: Property ID to update.
-        updates: Dict of field -> value to update.
+        property_id: Property ID.
+        reservation_id: Reservation UUID.
+        correlation_id: Request correlation ID.
 
     Returns:
-        True if property was found and updated, False if not found.
+        Inserted outbox event ID.
     """
-    # Build SET clause dynamically (only allowed fields)
-    allowed_fields = {"name", "timezone"}
-    set_parts = []
-    params: list[Any] = []
-
-    for field, value in updates.items():
-        if field in allowed_fields:
-            set_parts.append(f"{field} = %s")
-            params.append(value)
-
-    # Handle outbound_provider separately (updates whatsapp_config JSONB)
-    if "outbound_provider" in updates:
-        set_parts.append(
-            "whatsapp_config = jsonb_set(whatsapp_config, '{outbound_provider}', %s::jsonb)"
-        )
-        # JSON string needs quotes
-        params.append(f'"{updates["outbound_provider"]}"')
-
-    if not set_parts:
-        return False
-
-    # Always update updated_at
-    set_parts.append("updated_at = now()")
-
-    params.append(property_id)
-
-    sql = f"UPDATE properties SET {', '.join(set_parts)} WHERE id = %s"
-
     with txn() as cur:
-        cur.execute(sql, params)
-        return cur.rowcount > 0
+        cur.execute(
+            """
+            INSERT INTO outbox_events
+                (property_id, event_type, aggregate_type, aggregate_id, correlation_id, message_type, payload)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                property_id,
+                "whatsapp.send_message",  # Standard event_type for outbound WhatsApp
+                "reservation",
+                reservation_id,
+                correlation_id,
+                "confirmacao",
+                json.dumps({"reservation_id": reservation_id, "action": "resend_payment_link"}),
+            ),
+        )
+        row = cur.fetchone()
+        return row[0]
 
 
-@router.post("/update")
-async def update_property_task(request: Request) -> Response:
-    """Handle property update task from Cloud Tasks/worker.
+@router.post("/resend-payment-link")
+async def resend_payment_link_task(request: Request) -> Response:
+    """Handle resend-payment-link task from Cloud Tasks.
 
     Expected payload (no PII):
     - property_id: Property identifier (required)
-    - user_id: User who initiated update (required, for audit)
-    - updates: Dict of field -> value (required)
+    - reservation_id: Reservation UUID (required)
+    - user_id: User who initiated action (required, for audit)
     - correlation_id: Optional correlation ID
+
+    Creates outbox_events entry with message_type='confirmacao'.
 
     Returns:
         200 OK if successful.
         400 if missing required fields.
         401 if task auth fails.
-        404 if property not found.
     """
     correlation_id = get_correlation_id()
 
-    # Verify OIDC task authentication (Authorization: Bearer required)
+    # Verify OIDC task authentication
     token = extract_bearer_token(request)
     if token is None:
         logger.warning(
@@ -109,57 +106,46 @@ async def update_property_task(request: Request) -> Response:
 
     # Extract required fields
     property_id = payload.get("property_id", "")
+    reservation_id = payload.get("reservation_id", "")
     user_id = payload.get("user_id", "")
-    updates = payload.get("updates", {})
     req_correlation_id = payload.get("correlation_id") or correlation_id
 
-    if not property_id or not user_id or not updates:
+    if not property_id or not reservation_id or not user_id:
         logger.warning(
             "missing required fields",
             extra={
                 "extra_fields": safe_log_context(
                     correlationId=req_correlation_id,
                     has_property_id=bool(property_id),
+                    has_reservation_id=bool(reservation_id),
                     has_user_id=bool(user_id),
-                    has_updates=bool(updates),
                 )
             },
         )
         return Response(status_code=400, content="missing required fields")
 
     logger.info(
-        "property update task received",
+        "resend-payment-link task received",
         extra={
             "extra_fields": safe_log_context(
                 correlationId=req_correlation_id,
                 property_id=property_id,
-                update_fields=list(updates.keys()),
+                reservation_id=reservation_id,
             )
         },
     )
 
-    # Execute update
-    updated = _update_property(property_id, updates)
-
-    if not updated:
-        logger.warning(
-            "property not found or no valid fields",
-            extra={
-                "extra_fields": safe_log_context(
-                    correlationId=req_correlation_id,
-                    property_id=property_id,
-                )
-            },
-        )
-        return Response(status_code=404, content="property not found")
+    # Insert outbox event
+    outbox_id = _insert_outbox_event(property_id, reservation_id, req_correlation_id)
 
     logger.info(
-        "property update task completed",
+        "resend-payment-link task completed",
         extra={
             "extra_fields": safe_log_context(
                 correlationId=req_correlation_id,
                 property_id=property_id,
-                status="updated",
+                reservation_id=reservation_id,
+                outbox_id=outbox_id,
             )
         },
     )

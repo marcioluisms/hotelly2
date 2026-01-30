@@ -20,8 +20,10 @@ from .routes import (
     properties_read,
     properties_write,
     rbac,
+    reservations,
     tasks_holds,
     tasks_properties,
+    tasks_reservations,
     tasks_stripe,
     tasks_whatsapp,
     tasks_whatsapp_send,
@@ -79,6 +81,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(properties_read.router)
         app.include_router(properties_write.router)
         app.include_router(rbac.router)
+        app.include_router(reservations.router)
 
     # Mount worker routes only for worker role
     if role == "worker":
@@ -88,5 +91,6 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(tasks_holds.router)
         app.include_router(tasks_stripe.router)
         app.include_router(tasks_properties.router)
+        app.include_router(tasks_reservations.router)
 
     return app
