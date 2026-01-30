@@ -15,6 +15,7 @@ from hotelly.observability.correlation import (
 from .routers import public, worker
 from .routes import (
     auth,
+    frontdesk,
     me,
     properties_read,
     properties_write,
@@ -73,6 +74,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
     # Mount auth routes only for public role (dashboard/API)
     if role == "public":
         app.include_router(auth.router)
+        app.include_router(frontdesk.router)
         app.include_router(me.router)
         app.include_router(properties_read.router)
         app.include_router(properties_write.router)
