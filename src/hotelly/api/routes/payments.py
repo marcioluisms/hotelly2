@@ -6,14 +6,20 @@ V2-S19: READ + resend-link action (via enqueue to worker).
 from __future__ import annotations
 
 from datetime import date
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
+from hotelly.domain.payments import HoldNotActiveError, create_checkout_session
+from hotelly.infra.db import txn
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
 from hotelly.tasks.client import TasksClient
+
+if TYPE_CHECKING:
+    from hotelly.stripe.client import StripeClient
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -22,10 +28,22 @@ logger = get_logger(__name__)
 # Module-level tasks client (singleton)
 _tasks_client = TasksClient()
 
+# Module-level stripe client (lazy init, can be overridden for tests)
+_stripe_client: StripeClient | None = None
+
 
 def _get_tasks_client() -> TasksClient:
     """Get tasks client (allows override in tests)."""
     return _tasks_client
+
+
+def _get_stripe_client() -> StripeClient:
+    """Get stripe client (allows override in tests)."""
+    global _stripe_client
+    if _stripe_client is None:
+        from hotelly.stripe.client import StripeClient
+        _stripe_client = StripeClient()
+    return _stripe_client
 
 
 def _list_payments(
@@ -208,3 +226,55 @@ def resend_link(
     )
 
     return {"status": "enqueued"}
+
+
+@router.post("/holds/{hold_id}/checkout")
+def create_hold_checkout(
+    hold_id: str = Path(..., description="Hold UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> dict:
+    """Generate or retrieve Stripe Checkout Session for a hold.
+
+    Idempotent: if a checkout session already exists for the hold, returns
+    the existing checkout URL.
+
+    Requires staff role or higher.
+    """
+    correlation_id = get_correlation_id()
+
+    logger.info(
+        "creating checkout session for hold",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                hold_id=hold_id,
+            )
+        },
+    )
+
+    with txn() as cur:
+        # Verify hold exists and belongs to this property
+        cur.execute(
+            "SELECT 1 FROM holds WHERE id = %s AND property_id = %s",
+            (hold_id, ctx.property_id),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Hold not found")
+
+        try:
+            result = create_checkout_session(
+                hold_id,
+                stripe_client=_get_stripe_client(),
+                correlation_id=correlation_id,
+                cur=cur,
+            )
+        except HoldNotActiveError:
+            raise HTTPException(status_code=409, detail="hold not active")
+
+    return {
+        "payment_id": result["payment_id"],
+        "provider": "stripe",
+        "provider_object_id": result["provider_object_id"],
+        "checkout_url": result["checkout_url"],
+    }
