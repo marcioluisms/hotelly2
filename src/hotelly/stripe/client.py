@@ -73,6 +73,13 @@ class StripeClient:
         """
         client = stripe.StripeClient(self._api_key)
 
+        default_success = os.environ.get(
+            "STRIPE_SUCCESS_URL", "https://app.hotelly.ia.br/stripe/success"
+        )
+        default_cancel = os.environ.get(
+            "STRIPE_CANCEL_URL", "https://app.hotelly.ia.br/stripe/cancel"
+        )
+
         params: dict[str, Any] = {
             "mode": "payment",
             "line_items": [
@@ -87,8 +94,8 @@ class StripeClient:
                     "quantity": 1,
                 }
             ],
-            "success_url": success_url or "https://hotelly.app/success",
-            "cancel_url": cancel_url or "https://hotelly.app/cancel",
+            "success_url": success_url or default_success,
+            "cancel_url": cancel_url or default_cancel,
         }
 
         if metadata:
