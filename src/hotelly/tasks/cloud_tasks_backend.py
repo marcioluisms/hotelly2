@@ -1,4 +1,3 @@
-cat > src/hotelly/tasks/cloud_tasks_backend.py << 'EOF'
 """Cloud Tasks backend for GCP deployment."""
 import json
 import os
@@ -122,4 +121,3 @@ def enqueue_cloud_task(
             },
         )
         raise
-EOF
