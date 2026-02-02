@@ -18,6 +18,7 @@ from .routes import (
     conversations,
     frontdesk,
     me,
+    outbox,
     payments,
     properties_read,
     properties_write,
@@ -84,6 +85,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(conversations.router)
         app.include_router(frontdesk.router)
         app.include_router(me.router)
+        app.include_router(outbox.router)
         app.include_router(payments.router)
         app.include_router(properties_read.router)
         app.include_router(properties_write.router)

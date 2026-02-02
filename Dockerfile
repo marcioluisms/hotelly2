@@ -5,7 +5,7 @@ WORKDIR /app
 
 RUN pip install uv
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md alembic.ini ./
 RUN uv sync --frozen --no-dev
 
 COPY src/ src/
