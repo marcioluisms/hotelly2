@@ -372,7 +372,7 @@ async def assign_room_task(request: Request) -> Response:
                 "reservation",
                 reservation_id,
                 req_correlation_id,
-                "room_assigned",
+                None,  # message_type
                 outbox_payload,
             ),
         )
