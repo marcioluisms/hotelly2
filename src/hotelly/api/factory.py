@@ -26,6 +26,7 @@ from .routes import (
     rbac,
     reports,
     reservations,
+    rooms,
     tasks_conversations,
     tasks_holds,
     tasks_payments,
@@ -94,6 +95,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(reports.router)
         app.include_router(reservations.router)
         app.include_router(occupancy.router)
+        app.include_router(rooms.router)
 
     # Mount worker routes only for worker role
     if role == "worker":
