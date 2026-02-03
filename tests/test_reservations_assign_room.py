@@ -292,22 +292,19 @@ class TestWorkerAssignRoomSuccess:
         app = create_app(role="worker")
         client = TestClient(app)
         res_id = str(uuid4())
-        hold_id = uuid4()
 
         mock_cursor = MagicMock()
-        # Sequence of fetchone/fetchall calls:
-        # 1. reservation lookup -> (hold_id,)
+        # Sequence of fetchone calls:
+        # 1. reservation lookup -> (room_type_id,)
         # 2. room lookup -> (room_type_id,)
-        # 3. hold_nights distinct -> [(room_type_id,)]
-        # 4. outbox insert -> (outbox_id,)
+        # 3. outbox insert -> (outbox_id,)
         mock_cursor.fetchone.side_effect = [
-            (hold_id,),  # reservation
-            ("standard",),  # room
+            ("standard",),  # reservation room_type_id
+            ("standard",),  # room room_type_id
             (456,),  # outbox id
         ]
-        mock_cursor.fetchall.return_value = [("standard",)]  # hold_nights
 
-        with patch("hotelly.api.routes.tasks_reservations.verify_task_oidc", return_value=True):
+        with patch("hotelly.api.routes.tasks_reservations.verify_task_auth", return_value=True):
             with patch("hotelly.api.routes.tasks_reservations.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
                 response = client.post(
@@ -326,16 +323,16 @@ class TestWorkerAssignRoomSuccess:
 
                 # Verify UPDATE and INSERT were called
                 calls = mock_cursor.execute.call_args_list
-                # Should have: reservation select, room select, hold_nights select, update, insert
-                assert len(calls) == 5
+                # Should have: reservation select, room select, update, insert
+                assert len(calls) == 4
 
                 # Check UPDATE call
-                update_call = calls[3][0]
+                update_call = calls[2][0]
                 assert "UPDATE reservations" in update_call[0]
                 assert "room_id" in update_call[0]
 
                 # Check INSERT outbox call
-                insert_call = calls[4][0]
+                insert_call = calls[3][0]
                 assert "INSERT INTO outbox_events" in insert_call[0]
                 # Validate params: (property_id, event_type, aggregate_type, aggregate_id, ...)
                 insert_params = insert_call[1]
@@ -351,16 +348,14 @@ class TestWorkerAssignRoomMismatch:
         app = create_app(role="worker")
         client = TestClient(app)
         res_id = str(uuid4())
-        hold_id = uuid4()
 
         mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
-            (hold_id,),  # reservation
+            ("standard",),  # reservation room_type_id = "standard"
             ("deluxe",),  # room has room_type_id = "deluxe"
         ]
-        mock_cursor.fetchall.return_value = [("standard",)]  # hold expects "standard"
 
-        with patch("hotelly.api.routes.tasks_reservations.verify_task_oidc", return_value=True):
+        with patch("hotelly.api.routes.tasks_reservations.verify_task_auth", return_value=True):
             with patch("hotelly.api.routes.tasks_reservations.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
                 response = client.post(
@@ -377,24 +372,23 @@ class TestWorkerAssignRoomMismatch:
                 assert "room_type mismatch" in response.text
 
 
-class TestWorkerAssignRoomMultiType:
-    """Test worker task multi room_type -> 422."""
+class TestWorkerAssignRoomNullRoomType:
+    """Test worker task when reservation.room_type_id is NULL -> allow with WARN."""
 
-    def test_worker_multi_room_type_returns_422(self):
+    def test_worker_null_room_type_allows_assign(self):
+        """When reservation has no room_type_id, allow assign and log warning."""
         app = create_app(role="worker")
         client = TestClient(app)
         res_id = str(uuid4())
-        hold_id = uuid4()
 
         mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
-            (hold_id,),  # reservation
+            (None,),  # reservation room_type_id is NULL
             ("standard",),  # room
+            (456,),  # outbox id
         ]
-        # Multiple room types in hold_nights
-        mock_cursor.fetchall.return_value = [("standard",), ("deluxe",)]
 
-        with patch("hotelly.api.routes.tasks_reservations.verify_task_oidc", return_value=True):
+        with patch("hotelly.api.routes.tasks_reservations.verify_task_auth", return_value=True):
             with patch("hotelly.api.routes.tasks_reservations.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
                 response = client.post(
@@ -407,35 +401,11 @@ class TestWorkerAssignRoomMultiType:
                     },
                     headers={"Authorization": "Bearer valid-token"},
                 )
-                assert response.status_code == 422
-                assert "multi room_type not supported" in response.text
+                # Should succeed (200), not reject
+                assert response.status_code == 200
+                assert response.json()["ok"] is True
 
-    def test_worker_no_room_type_returns_422(self):
-        app = create_app(role="worker")
-        client = TestClient(app)
-        res_id = str(uuid4())
-        hold_id = uuid4()
-
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.side_effect = [
-            (hold_id,),  # reservation
-            ("standard",),  # room
-        ]
-        # No room types in hold_nights
-        mock_cursor.fetchall.return_value = []
-
-        with patch("hotelly.api.routes.tasks_reservations.verify_task_oidc", return_value=True):
-            with patch("hotelly.api.routes.tasks_reservations.txn") as mock_txn:
-                mock_txn.return_value.__enter__.return_value = mock_cursor
-                response = client.post(
-                    "/tasks/reservations/assign-room",
-                    json={
-                        "property_id": "prop-1",
-                        "reservation_id": res_id,
-                        "room_id": "101",
-                        "user_id": str(uuid4()),
-                    },
-                    headers={"Authorization": "Bearer valid-token"},
-                )
-                assert response.status_code == 422
-                assert "no room_type found" in response.text
+                # Verify UPDATE and INSERT were called
+                calls = mock_cursor.execute.call_args_list
+                # Should have: reservation select, room select, update, insert
+                assert len(calls) == 4

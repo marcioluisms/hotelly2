@@ -18,6 +18,7 @@ def insert_reservation(
     checkout: date,
     total_cents: int,
     currency: str,
+    room_type_id: str | None = None,
 ) -> tuple[str | None, bool]:
     """Insert a reservation with idempotency via UNIQUE(property_id, hold_id).
 
@@ -32,6 +33,7 @@ def insert_reservation(
         checkout: Check-out date.
         total_cents: Total price in cents.
         currency: Currency code.
+        room_type_id: Optional room type identifier.
 
     Returns:
         Tuple of (reservation_id, created).
@@ -42,9 +44,9 @@ def insert_reservation(
         """
         INSERT INTO reservations (
             property_id, hold_id, conversation_id,
-            checkin, checkout, total_cents, currency
+            checkin, checkout, total_cents, currency, room_type_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (property_id, hold_id) DO NOTHING
         RETURNING id
         """,
@@ -56,6 +58,7 @@ def insert_reservation(
             checkout,
             total_cents,
             currency,
+            room_type_id,
         ),
     )
     row = cur.fetchone()

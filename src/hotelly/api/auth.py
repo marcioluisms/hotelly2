@@ -124,15 +124,15 @@ def verify_token(token: str) -> str:
     if key_data is None:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Build public key from JWK
-    try:
-        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(key_data)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    # Build public key from JWK and verify token
+    # If signature fails, try refetching JWKS once (key may have rotated)
+    def _try_verify(jwk_data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            public_key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk_data)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Verify and decode token
-    try:
-        payload = jwt.decode(
+        return jwt.decode(
             token,
             public_key,
             algorithms=["RS256"],
@@ -140,6 +140,19 @@ def verify_token(token: str) -> str:
             audience=audience,
             options={"require": ["exp", "iss", "aud", "sub"]},
         )
+
+    try:
+        payload = _try_verify(key_data)
+    except jwt.InvalidSignatureError:
+        # Signature failed - key might be stale, try refetch
+        jwks = _get_jwks(jwks_url, force_refresh=True)
+        key_data = _find_key(jwks, kid)
+        if key_data is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        try:
+            payload = _try_verify(key_data)
+        except jwt.InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid token")
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidIssuerError:

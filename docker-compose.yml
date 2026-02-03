@@ -34,13 +34,15 @@ services:
 
   worker:
     build: .
-    # NO ports: - worker is internal only, not exposed publicly
+    ports:
+      - "${WORKER_PORT:-8001}:8000"
     environment:
       APP_ROLE: worker
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hotelly}
       CONTACT_HASH_SECRET: ${CONTACT_HASH_SECRET}
       CONTACT_REFS_KEY: ${CONTACT_REFS_KEY}
       INTERNAL_TASK_SECRET: ${INTERNAL_TASK_SECRET:-dev-secret}
+      TASKS_OIDC_AUDIENCE: ${TASKS_OIDC_AUDIENCE:-hotelly-tasks-local}
     depends_on:
       db:
         condition: service_healthy

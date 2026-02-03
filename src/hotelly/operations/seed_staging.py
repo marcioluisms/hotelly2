@@ -1,5 +1,4 @@
 import os
-import sys
 from datetime import date, datetime, timedelta
 from datetime import timezone as tz
 
@@ -50,7 +49,28 @@ def main() -> int:
                 (external_subject, property_id, role),
             )
 
-            # 3) Hold + Reservation (idempotente)
+            # 3) Room type (idempotente)
+            room_type_id = "rt_standard"
+            cur.execute(
+                """
+                INSERT INTO room_types (property_id, id, name)
+                VALUES (%s, %s, 'Quarto Standard')
+                ON CONFLICT (property_id, id) DO NOTHING
+                """,
+                (property_id, room_type_id),
+            )
+
+            # 4) Room (idempotente)
+            cur.execute(
+                """
+                INSERT INTO rooms (property_id, id, room_type_id, name, is_active)
+                VALUES (%s, '101', %s, 'Quarto 101', true)
+                ON CONFLICT (property_id, id) DO NOTHING
+                """,
+                (property_id, room_type_id),
+            )
+
+            # 5) Hold + Reservation (idempotente)
             checkin = date.today() + timedelta(days=7)
             checkout = checkin + timedelta(days=2)
             expires_at = datetime.now(tz.utc) + timedelta(hours=2)
@@ -78,8 +98,8 @@ def main() -> int:
                   RETURNING id
                 ),
                 r AS (
-                  INSERT INTO reservations (property_id, hold_id, status, checkin, checkout, total_cents, currency, guest_count)
-                  SELECT %s, h.id, 'confirmed', %s, %s, %s, %s, %s
+                  INSERT INTO reservations (property_id, hold_id, status, checkin, checkout, total_cents, currency, guest_count, room_type_id)
+                  SELECT %s, h.id, 'confirmed', %s, %s, %s, %s, %s, %s
                   FROM h
                   ON CONFLICT (property_id, hold_id)
                   DO UPDATE SET
@@ -89,6 +109,7 @@ def main() -> int:
                     total_cents = EXCLUDED.total_cents,
                     currency = EXCLUDED.currency,
                     guest_count = EXCLUDED.guest_count,
+                    room_type_id = EXCLUDED.room_type_id,
                     updated_at = now()
                   RETURNING id
                 )
@@ -96,7 +117,7 @@ def main() -> int:
                 """,
                 (
                     property_id, checkin, checkout, expires_at, create_idem_key, total_cents, currency, guest_count,
-                    property_id, checkin, checkout, total_cents, currency, guest_count,
+                    property_id, checkin, checkout, total_cents, currency, guest_count, room_type_id,
                 ),
             )
             hold_id, reservation_id = cur.fetchone()

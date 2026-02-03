@@ -12,7 +12,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from hotelly.api.task_auth import extract_bearer_token, verify_task_oidc
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.infra.db import txn
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
@@ -80,18 +80,10 @@ async def resend_payment_link_task(request: Request) -> Response:
     """
     correlation_id = get_correlation_id()
 
-    # Verify OIDC task authentication
-    token = extract_bearer_token(request)
-    if token is None:
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
         logger.warning(
-            "missing or malformed Authorization header",
-            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
-        )
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not verify_task_oidc(token):
-        logger.warning(
-            "OIDC token validation failed",
+            "task auth failed",
             extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
         )
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -176,18 +168,10 @@ async def assign_room_task(request: Request) -> Response:
     """
     correlation_id = get_correlation_id()
 
-    # Verify OIDC task authentication
-    token = extract_bearer_token(request)
-    if token is None:
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
         logger.warning(
-            "missing or malformed Authorization header",
-            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
-        )
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not verify_task_oidc(token):
-        logger.warning(
-            "OIDC token validation failed",
+            "task auth failed",
             extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
         )
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -237,10 +221,10 @@ async def assign_room_task(request: Request) -> Response:
 
     # Execute in transaction
     with txn() as cur:
-        # Check reservation exists and get hold_id
+        # Check reservation exists and get room_type_id
         cur.execute(
             """
-            SELECT hold_id FROM reservations
+            SELECT room_type_id FROM reservations
             WHERE property_id = %s AND id = %s
             """,
             (property_id, reservation_id),
@@ -259,7 +243,7 @@ async def assign_room_task(request: Request) -> Response:
             )
             return Response(status_code=404, content="reservation not found")
 
-        hold_id = res_row[0]
+        expected_room_type_id = res_row[0]
 
         # Check room exists and is active, get room_type_id
         cur.execute(
@@ -285,49 +269,20 @@ async def assign_room_task(request: Request) -> Response:
 
         actual_room_type_id = room_row[0]
 
-        # Get expected room_type_id from hold_nights
-        cur.execute(
-            """
-            SELECT DISTINCT room_type_id FROM hold_nights
-            WHERE hold_id = %s
-            """,
-            (hold_id,),
-        )
-        hold_room_types = cur.fetchall()
-
-        if len(hold_room_types) == 0:
+        # Validate room_type compatibility using reservations.room_type_id
+        if expected_room_type_id is None:
+            # Legacy reservation without room_type_id - allow assign but warn
             logger.warning(
-                "no room_type found for hold",
+                "reservation has no room_type_id, allowing assign",
                 extra={
                     "extra_fields": safe_log_context(
                         correlationId=req_correlation_id,
                         property_id=property_id,
                         reservation_id=reservation_id,
-                        hold_id=str(hold_id),
                     )
                 },
             )
-            return Response(status_code=422, content="no room_type found for reservation")
-
-        if len(hold_room_types) > 1:
-            logger.warning(
-                "multi room_type not supported",
-                extra={
-                    "extra_fields": safe_log_context(
-                        correlationId=req_correlation_id,
-                        property_id=property_id,
-                        reservation_id=reservation_id,
-                        hold_id=str(hold_id),
-                        room_type_count=len(hold_room_types),
-                    )
-                },
-            )
-            return Response(status_code=422, content="multi room_type not supported")
-
-        expected_room_type_id = hold_room_types[0][0]
-
-        # Validate room_type compatibility
-        if actual_room_type_id != expected_room_type_id:
+        elif actual_room_type_id != expected_room_type_id:
             logger.warning(
                 "room_type mismatch",
                 extra={
