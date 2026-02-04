@@ -172,7 +172,10 @@ async def handle_event(request: Request) -> Response:
         # Return 500 to trigger retry
         return Response(status_code=500, content="stripe error")
 
-    # Look up payment in our DB
+    # Map Stripe payment_status to our status
+    new_status = _map_payment_status(stripe_payment_status)
+
+    # Look up payment and update in a single transaction
     with txn() as cur:
         payment = get_payment_by_provider_object(
             cur,
@@ -181,27 +184,40 @@ async def handle_event(request: Request) -> Response:
             provider_object_id=object_id,
         )
 
-    if payment is None:
-        logger.warning(
-            "unknown payment",
-            extra={
-                "extra_fields": safe_log_context(
-                    correlationId=req_correlation_id,
-                    object_id_prefix=object_id[:8] if len(object_id) >= 8 else object_id,
-                    property_id=property_id,
-                )
-            },
-        )
-        return Response(status_code=200, content="ok")
+        if payment is None:
+            logger.warning(
+                "unknown payment",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=req_correlation_id,
+                        object_id_prefix=object_id[:8]
+                        if len(object_id) >= 8
+                        else object_id,
+                        property_id=property_id,
+                    )
+                },
+            )
+            return Response(status_code=200, content="ok")
 
-    payment_id = payment["id"]
-    hold_id = payment["hold_id"]
+        payment_id = payment["id"]
+        hold_id = payment["hold_id"]
+        current_status = payment["status"]
 
-    # Map Stripe payment_status to our status
-    new_status = _map_payment_status(stripe_payment_status)
+        # Idempotency guard: skip update if already at target status
+        if current_status == new_status:
+            logger.info(
+                "payment already at target status; skipping update",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=req_correlation_id,
+                        payment_id=payment_id,
+                        provider_object_id=object_id,
+                        current_status=current_status,
+                    )
+                },
+            )
+            return Response(status_code=200, content="ok")
 
-    # Update payment status
-    with txn() as cur:
         update_payment_status(cur, payment_id=payment_id, status=new_status)
 
     logger.info(

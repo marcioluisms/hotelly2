@@ -13,6 +13,10 @@ def _reset_oidc_jwks_cache():
     """
     import hotelly.api.auth as auth_module
 
+    # Reset before test
     auth_module._jwks_cache = None
     auth_module._jwks_cache_time = 0
     yield
+    # Reset after test (teardown)
+    auth_module._jwks_cache = None
+    auth_module._jwks_cache_time = 0
