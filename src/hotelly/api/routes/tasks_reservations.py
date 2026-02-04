@@ -297,14 +297,16 @@ async def assign_room_task(request: Request) -> Response:
             )
             return Response(status_code=409, content="room_type mismatch")
 
-        # Update reservation with room_id
+        # Update reservation with room_id and fill room_type_id if missing
         cur.execute(
             """
             UPDATE reservations
-            SET room_id = %s, updated_at = now()
+            SET room_id = %s,
+                room_type_id = COALESCE(room_type_id, %s),
+                updated_at = now()
             WHERE property_id = %s AND id = %s
             """,
-            (room_id, property_id, reservation_id),
+            (room_id, actual_room_type_id, property_id, reservation_id),
         )
 
         # Insert outbox event

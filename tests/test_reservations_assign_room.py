@@ -373,10 +373,10 @@ class TestWorkerAssignRoomMismatch:
 
 
 class TestWorkerAssignRoomNullRoomType:
-    """Test worker task when reservation.room_type_id is NULL -> allow with WARN."""
+    """Test worker task when reservation.room_type_id is NULL -> allow and fill."""
 
-    def test_worker_null_room_type_allows_assign(self):
-        """When reservation has no room_type_id, allow assign and log warning."""
+    def test_worker_null_room_type_fills_from_room(self):
+        """When reservation has no room_type_id, fill it from the assigned room."""
         app = create_app(role="worker")
         client = TestClient(app)
         res_id = str(uuid4())
@@ -384,7 +384,7 @@ class TestWorkerAssignRoomNullRoomType:
         mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
             (None,),  # reservation room_type_id is NULL
-            ("standard",),  # room
+            ("standard",),  # room has room_type_id = "standard"
             (456,),  # outbox id
         ]
 
@@ -401,11 +401,60 @@ class TestWorkerAssignRoomNullRoomType:
                     },
                     headers={"Authorization": "Bearer valid-token"},
                 )
-                # Should succeed (200), not reject
+                # Should succeed (200)
                 assert response.status_code == 200
                 assert response.json()["ok"] is True
 
-                # Verify UPDATE and INSERT were called
+                # Verify UPDATE fills room_type_id via COALESCE
                 calls = mock_cursor.execute.call_args_list
-                # Should have: reservation select, room select, update, insert
                 assert len(calls) == 4
+
+                # Check UPDATE call includes room_type_id
+                update_call = calls[2][0]
+                assert "UPDATE reservations" in update_call[0]
+                assert "room_type_id = COALESCE" in update_call[0]
+                # Params: (room_id, actual_room_type_id, property_id, reservation_id)
+                update_params = update_call[1]
+                assert update_params[0] == "101"  # room_id
+                assert update_params[1] == "standard"  # room_type_id from room
+
+
+class TestWorkerAssignRoomExistingRoomType:
+    """Test worker task preserves existing room_type_id."""
+
+    def test_worker_existing_room_type_not_overwritten(self):
+        """When reservation already has room_type_id, COALESCE preserves it."""
+        app = create_app(role="worker")
+        client = TestClient(app)
+        res_id = str(uuid4())
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.side_effect = [
+            ("deluxe",),  # reservation already has room_type_id = "deluxe"
+            ("deluxe",),  # room also has room_type_id = "deluxe" (compatible)
+            (789,),  # outbox id
+        ]
+
+        with patch("hotelly.api.routes.tasks_reservations.verify_task_auth", return_value=True):
+            with patch("hotelly.api.routes.tasks_reservations.txn") as mock_txn:
+                mock_txn.return_value.__enter__.return_value = mock_cursor
+                response = client.post(
+                    "/tasks/reservations/assign-room",
+                    json={
+                        "property_id": "prop-1",
+                        "reservation_id": res_id,
+                        "room_id": "202",
+                        "user_id": str(uuid4()),
+                    },
+                    headers={"Authorization": "Bearer valid-token"},
+                )
+                assert response.status_code == 200
+                assert response.json()["ok"] is True
+
+                # Verify UPDATE uses COALESCE (existing value preserved by DB)
+                calls = mock_cursor.execute.call_args_list
+                assert len(calls) == 4
+
+                update_call = calls[2][0]
+                assert "COALESCE(room_type_id" in update_call[0]
+                # The COALESCE will keep existing "deluxe" since it's not NULL
