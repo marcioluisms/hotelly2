@@ -388,6 +388,7 @@ class TestS05PiiSafety:
 
     def test_complete_entities_triggers_checkout(self, client, ensure_property):
         """S05: Complete entities trigger quote → hold → checkout flow."""
+        from datetime import timedelta
         from unittest.mock import MagicMock
 
         # Setup mock stripe client
@@ -408,6 +409,10 @@ class TestS05PiiSafety:
         conn = get_conn()
         try:
             with conn.cursor() as cur:
+                # Get database's current date to avoid timezone mismatch
+                cur.execute("SELECT CURRENT_DATE")
+                db_today = cur.fetchone()[0]
+
                 # Room type
                 cur.execute(
                     """
@@ -417,8 +422,9 @@ class TestS05PiiSafety:
                     """,
                     (TEST_PROPERTY_ID, "rt_standard", "Standard"),
                 )
-                # ARI for test dates
+                # ARI for test dates (using db_today to stay consistent)
                 for day_offset in range(3):
+                    d = db_today + timedelta(days=day_offset)
                     cur.execute(
                         """
                         INSERT INTO ari_days (
@@ -426,22 +432,20 @@ class TestS05PiiSafety:
                             inv_total, inv_booked, inv_held,
                             base_rate_cents, currency
                         )
-                        VALUES (%s, %s, CURRENT_DATE + %s, 5, 0, 0, 25000, 'BRL')
+                        VALUES (%s, %s, %s, 5, 0, 0, 25000, 'BRL')
                         ON CONFLICT (property_id, room_type_id, date) DO UPDATE
                         SET inv_total = 5, inv_booked = 0, inv_held = 0,
                             base_rate_cents = 25000, currency = 'BRL'
                         """,
-                        (TEST_PROPERTY_ID, "rt_standard", day_offset),
+                        (TEST_PROPERTY_ID, "rt_standard", d),
                     )
             conn.commit()
+
+            # Define checkin/checkout using db_today (same source as ARI)
+            checkin = db_today
+            checkout = db_today + timedelta(days=2)
         finally:
             conn.close()
-
-        # Get dates as ISO strings
-        from datetime import date, timedelta
-
-        checkin = date.today()
-        checkout = date.today() + timedelta(days=2)
 
         payload = {
             "task_id": "task-checkout-001",
