@@ -311,6 +311,7 @@ async def assign_room_task(request: Request) -> Response:
 
         # Insert outbox event
         outbox_payload = json.dumps({
+            "reservation_id": reservation_id,
             "room_id": room_id,
             "room_type_id": actual_room_type_id,
             "assigned_by": user_id,

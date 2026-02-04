@@ -340,6 +340,13 @@ class TestWorkerAssignRoomSuccess:
                 assert insert_params[2] == "reservation"  # aggregate_type
                 assert insert_params[3] == res_id  # aggregate_id
 
+                # Validate payload includes reservation_id
+                import json
+                payload = json.loads(insert_params[6])
+                assert payload["reservation_id"] == res_id
+                assert payload["room_id"] == "101"
+                assert payload["room_type_id"] == "standard"
+
 
 class TestWorkerAssignRoomMismatch:
     """Test worker task room_type mismatch -> 409."""
