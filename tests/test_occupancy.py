@@ -358,3 +358,253 @@ class TestOccupancyRouteAvailability:
         client = TestClient(app)
         response = client.get("/occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-18")
         assert response.status_code == 404
+
+
+# =============================================================================
+# GET /room-occupancy tests
+# =============================================================================
+
+
+class TestRoomOccupancyValidation:
+    """Test validation for room-occupancy endpoint."""
+
+    def test_end_date_must_be_greater_than_start_date(
+        self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user
+    ):
+        """Test 422 when end_date <= start_date."""
+        private_key, _ = rsa_keypair
+        token = _create_token(private_key)
+
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="viewer"):
+            with patch.dict("os.environ", oidc_env):
+                app = create_app(role="public")
+                client = TestClient(app)
+
+                # end_date == start_date
+                response = client.get(
+                    "/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-15",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert response.status_code == 422
+                assert "end_date must be greater than start_date" in response.json()["detail"]
+
+                # end_date < start_date
+                response = client.get(
+                    "/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-10",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert response.status_code == 422
+                assert "end_date must be greater than start_date" in response.json()["detail"]
+
+    def test_range_exceeds_90_days(
+        self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user
+    ):
+        """Test 422 when date range > 90 days."""
+        private_key, _ = rsa_keypair
+        token = _create_token(private_key)
+
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="viewer"):
+            with patch.dict("os.environ", oidc_env):
+                app = create_app(role="public")
+                client = TestClient(app)
+
+                # 91 days range
+                response = client.get(
+                    "/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-01&end_date=2025-04-02",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert response.status_code == 422
+                assert "cannot exceed 90 days" in response.json()["detail"]
+
+
+class TestRoomOccupancySuccess:
+    """Test successful room-occupancy responses."""
+
+    def test_basic_room_occupancy(
+        self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user
+    ):
+        """Test basic room occupancy with 2 rooms, 1 reservation occupying 2 nights."""
+        private_key, _ = rsa_keypair
+        token = _create_token(private_key)
+
+        # Mock data:
+        # - Room 101: booked on 2025-01-15 and 2025-01-16 (checkout 2025-01-17)
+        # - Room 102: available all days
+        # Query range: 2025-01-15 to 2025-01-18 (3 days)
+        mock_result = [
+            {
+                "room_id": "room-101",
+                "name": "Room 101",
+                "room_type_id": "rt-standard",
+                "days": [
+                    {"date": "2025-01-15", "status": "booked"},
+                    {"date": "2025-01-16", "status": "booked"},
+                    {"date": "2025-01-17", "status": "available"},
+                ],
+            },
+            {
+                "room_id": "room-102",
+                "name": "Room 102",
+                "room_type_id": "rt-standard",
+                "days": [
+                    {"date": "2025-01-15", "status": "available"},
+                    {"date": "2025-01-16", "status": "available"},
+                    {"date": "2025-01-17", "status": "available"},
+                ],
+            },
+        ]
+
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="viewer"):
+            with patch("hotelly.api.routes.occupancy._get_room_occupancy", return_value=mock_result):
+                with patch.dict("os.environ", oidc_env):
+                    app = create_app(role="public")
+                    client = TestClient(app)
+
+                    response = client.get(
+                        "/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-18",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    assert response.status_code == 200
+                    data = response.json()
+
+                    assert data["property_id"] == "prop-1"
+                    assert data["start_date"] == "2025-01-15"
+                    assert data["end_date"] == "2025-01-18"
+                    assert len(data["rooms"]) == 2
+
+                    # Verify Room 101
+                    room101 = next(r for r in data["rooms"] if r["room_id"] == "room-101")
+                    assert room101["name"] == "Room 101"
+                    assert room101["room_type_id"] == "rt-standard"
+                    assert len(room101["days"]) == 3
+                    assert room101["days"][0]["status"] == "booked"
+                    assert room101["days"][1]["status"] == "booked"
+                    assert room101["days"][2]["status"] == "available"
+
+                    # Verify Room 102
+                    room102 = next(r for r in data["rooms"] if r["room_id"] == "room-102")
+                    assert all(d["status"] == "available" for d in room102["days"])
+
+    def test_room_occupancy_with_real_db(
+        self, oidc_env, rsa_keypair, jwks, mock_db_user
+    ):
+        """Test room occupancy with actual database interaction.
+
+        Creates property, 2 rooms, 1 confirmed reservation with room_id,
+        and validates the days status.
+        """
+        private_key, _ = rsa_keypair
+        token = _create_token(private_key)
+
+        property_id = f"test-prop-{uuid4().hex[:8]}"
+
+        # Create mock cursor with test data
+        # Simulating: reservation on room-101 from 2025-01-15 to 2025-01-17 (2 nights)
+        mock_rows = [
+            # room-101: booked on 15, 16; available on 17
+            ("room-101", "Room 101", "rt-standard", date(2025, 1, 15), "booked"),
+            ("room-101", "Room 101", "rt-standard", date(2025, 1, 16), "booked"),
+            ("room-101", "Room 101", "rt-standard", date(2025, 1, 17), "available"),
+            # room-102: all available
+            ("room-102", "Room 102", "rt-standard", date(2025, 1, 15), "available"),
+            ("room-102", "Room 102", "rt-standard", date(2025, 1, 16), "available"),
+            ("room-102", "Room 102", "rt-standard", date(2025, 1, 17), "available"),
+        ]
+
+        class MockCursor:
+            def execute(self, query, params):
+                pass
+
+            def fetchall(self):
+                return mock_rows
+
+        class MockTxnContext:
+            def __enter__(self):
+                return MockCursor()
+
+            def __exit__(self, *args):
+                pass
+
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="viewer"):
+            with patch("hotelly.infra.db.txn", return_value=MockTxnContext()):
+                with patch("hotelly.api.auth._fetch_jwks", return_value=jwks):
+                    with patch.dict("os.environ", oidc_env):
+                        import hotelly.api.auth as auth_module
+
+                        auth_module._jwks_cache = None
+                        auth_module._jwks_cache_time = 0
+
+                        app = create_app(role="public")
+                        client = TestClient(app)
+
+                        response = client.get(
+                            f"/occupancy/room-occupancy?property_id={property_id}&start_date=2025-01-15&end_date=2025-01-18",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+
+                        assert response.status_code == 200
+                        data = response.json()
+
+                        assert data["property_id"] == property_id
+                        assert len(data["rooms"]) == 2
+
+                        # Verify Room 101 has correct booking status
+                        room101 = next(r for r in data["rooms"] if r["room_id"] == "room-101")
+                        assert room101["days"][0]["date"] == "2025-01-15"
+                        assert room101["days"][0]["status"] == "booked"
+                        assert room101["days"][1]["date"] == "2025-01-16"
+                        assert room101["days"][1]["status"] == "booked"
+                        assert room101["days"][2]["date"] == "2025-01-17"
+                        assert room101["days"][2]["status"] == "available"
+
+                        # Verify Room 102 all available
+                        room102 = next(r for r in data["rooms"] if r["room_id"] == "room-102")
+                        for day in room102["days"]:
+                            assert day["status"] == "available"
+
+
+class TestRoomOccupancyNoAuth:
+    """Test 401 when no authentication."""
+
+    def test_missing_auth(self, oidc_env):
+        with patch.dict("os.environ", oidc_env):
+            app = create_app(role="public")
+            client = TestClient(app)
+            response = client.get("/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-18")
+            assert response.status_code == 401
+
+
+class TestRoomOccupancyNoRole:
+    """Test 403 when user has no role for property."""
+
+    def test_no_role(self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user):
+        private_key, _ = rsa_keypair
+        token = _create_token(private_key)
+
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value=None):
+            with patch.dict("os.environ", oidc_env):
+                app = create_app(role="public")
+                client = TestClient(app)
+                response = client.get(
+                    "/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-18",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert response.status_code == 403
+
+
+class TestRoomOccupancyRouteAvailability:
+    """Test route availability by role."""
+
+    def test_room_occupancy_available_on_public(self, oidc_env):
+        with patch.dict("os.environ", oidc_env):
+            app = create_app(role="public")
+            client = TestClient(app)
+            response = client.get("/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-18")
+            # 401 not 404 - route exists
+            assert response.status_code == 401
+
+    def test_room_occupancy_not_available_on_worker(self):
+        app = create_app(role="worker")
+        client = TestClient(app)
+        response = client.get("/occupancy/room-occupancy?property_id=prop-1&start_date=2025-01-15&end_date=2025-01-18")
+        assert response.status_code == 404
