@@ -16,6 +16,9 @@ from hotelly.observability.redaction import safe_log_context
 
 logger = get_logger(__name__)
 
+# Local dev audience - enables X-Internal-Task-Secret fallback
+_LOCAL_DEV_AUDIENCE = "hotelly-tasks-local"
+
 
 def extract_bearer_token(request: Request) -> str | None:
     """Extract Bearer token from Authorization header.
@@ -88,3 +91,36 @@ def verify_task_oidc(token: str) -> bool:
             extra={"extra_fields": safe_log_context(error=str(e))},
         )
         return False
+
+
+def verify_task_auth(request: Request) -> bool:
+    """Verify task authentication via OIDC or internal secret (local dev only).
+
+    In local dev mode (TASKS_OIDC_AUDIENCE == "hotelly-tasks-local"),
+    accepts X-Internal-Task-Secret header as alternative to OIDC.
+    In production, only OIDC is accepted.
+
+    Args:
+        request: FastAPI request object.
+
+    Returns:
+        True if authenticated, False otherwise.
+    """
+    audience = os.environ.get("TASKS_OIDC_AUDIENCE", "")
+
+    # Local dev fallback: check X-Internal-Task-Secret header
+    if audience == _LOCAL_DEV_AUDIENCE:
+        internal_secret = os.environ.get("INTERNAL_TASK_SECRET", "")
+        request_secret = request.headers.get("X-Internal-Task-Secret", "")
+        if internal_secret and request_secret == internal_secret:
+            logger.info(
+                "task auth via internal secret (local dev)",
+                extra={"extra_fields": safe_log_context(auth_method="internal_secret")},
+            )
+            return True
+
+    # Standard OIDC verification
+    token = extract_bearer_token(request)
+    if not token:
+        return False
+    return verify_task_oidc(token)

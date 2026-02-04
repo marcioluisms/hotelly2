@@ -274,18 +274,24 @@ class TestConvertHold:
         assert inv_held == 0, f"Expected inv_held=0 after convert, got {inv_held}"
         assert inv_booked == 2, f"Expected inv_booked=2 after convert, got {inv_booked}"
 
-        # Verify reservation was created
+        # Verify reservation was created with room_type_id
         with txn() as cur:
             cur.execute(
                 """
-                SELECT COUNT(*) FROM reservations
+                SELECT COUNT(*), room_type_id FROM reservations
                 WHERE property_id = %s AND hold_id = %s
+                GROUP BY room_type_id
                 """,
                 (TEST_PROPERTY_ID, hold_id),
             )
-            count = cur.fetchone()[0]
+            row = cur.fetchone()
+            count = row[0]
+            res_room_type_id = row[1]
 
         assert count == 1, f"Expected 1 reservation, got {count}"
+        assert res_room_type_id == TEST_ROOM_TYPE_ID, (
+            f"Expected room_type_id={TEST_ROOM_TYPE_ID}, got {res_room_type_id}"
+        )
 
         # Verify outbox events
         with txn() as cur:

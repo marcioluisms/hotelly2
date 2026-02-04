@@ -1,6 +1,7 @@
 """Reservations endpoints for dashboard.
 
 V2-S17: READ + resend-payment-link action (via enqueue to worker).
+V2-S13: assign-room action for room assignment.
 """
 
 from __future__ import annotations
@@ -9,12 +10,19 @@ import hashlib
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from pydantic import BaseModel
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
 from hotelly.tasks.client import TasksClient
+
+
+class AssignRoomRequest(BaseModel):
+    """Request body for assign-room action."""
+
+    room_id: str
 
 router = APIRouter(prefix="/reservations", tags=["reservations"])
 
@@ -130,6 +138,29 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
     }
 
 
+def _room_exists_and_active(property_id: str, room_id: str) -> bool:
+    """Check if room exists and is active.
+
+    Args:
+        property_id: Property ID.
+        room_id: Room ID.
+
+    Returns:
+        True if room exists and is_active=true, False otherwise.
+    """
+    from hotelly.infra.db import txn
+
+    with txn() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM rooms
+            WHERE property_id = %s AND id = %s AND is_active = true
+            """,
+            (property_id, room_id),
+        )
+        return cur.fetchone() is not None
+
+
 @router.get("")
 def list_reservations(
     ctx: PropertyRoleContext = Depends(require_property_role("viewer")),
@@ -206,6 +237,66 @@ def resend_payment_link(
     tasks_client.enqueue_http(
         task_id=task_id,
         url_path="/tasks/reservations/resend-payment-link",
+        payload=task_payload,
+        correlation_id=correlation_id,
+    )
+
+    return {"status": "enqueued"}
+
+
+@router.post("/{reservation_id}/actions/assign-room", status_code=202)
+def assign_room(
+    body: AssignRoomRequest,
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> dict:
+    """Assign a room to a reservation.
+
+    Enqueues task to worker, returns 202.
+    Requires staff role or higher.
+    """
+    correlation_id = get_correlation_id()
+
+    # Verify reservation exists and belongs to this property
+    reservation = _get_reservation(ctx.property_id, reservation_id)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    # Verify room exists and is active
+    if not _room_exists_and_active(ctx.property_id, body.room_id):
+        raise HTTPException(status_code=404, detail="Room not found or inactive")
+
+    # Generate deterministic task_id for idempotency
+    hash_input = f"{ctx.property_id}:{reservation_id}:{body.room_id}"
+    content_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+    task_id = f"assign-room:{reservation_id}:{content_hash}"
+
+    # Build task payload (NO PII)
+    task_payload = {
+        "property_id": ctx.property_id,
+        "reservation_id": reservation_id,
+        "room_id": body.room_id,
+        "user_id": ctx.user.id,
+        "correlation_id": correlation_id,
+    }
+
+    logger.info(
+        "enqueuing assign-room task",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                room_id=body.room_id,
+            )
+        },
+    )
+
+    # Enqueue task to worker
+    tasks_client = _get_tasks_client()
+    tasks_client.enqueue_http(
+        task_id=task_id,
+        url_path="/tasks/reservations/assign-room",
         payload=task_payload,
         correlation_id=correlation_id,
     )

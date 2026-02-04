@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import tasks_v2
 from google.protobuf import timestamp_pb2
 
@@ -97,26 +98,24 @@ def enqueue_cloud_task(
             },
         )
         return True
-    except Exception as e:
-        # Task may already exist (deduplication)
-        if "ALREADY_EXISTS" in str(e):
-            logger.info(
-                "cloud task already exists (dedupe)",
-                extra={
-                    "extra_fields": {
-                        "task_id": task_id,
-                        "correlationId": correlation_id,
-                    }
-                },
-            )
-            return True
+    except AlreadyExists:
+        logger.info(
+            "cloud task already exists (dedupe)",
+            extra={
+                "extra_fields": {
+                    "task_id": task_id,
+                    "correlationId": correlation_id,
+                }
+            },
+        )
+        return True
+    except Exception:
         logger.exception(
             "failed to enqueue cloud task",
             extra={
                 "extra_fields": {
                     "task_id": task_id,
                     "correlationId": correlation_id,
-                    "error": str(e),
                 }
             },
         )

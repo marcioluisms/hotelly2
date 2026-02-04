@@ -147,6 +147,7 @@ def convert_hold(
             checkout=checkout,
             total_cents=total_cents,
             currency=currency,
+            room_type_id=room_type_id,
         )
 
         if reservation_id is None:
