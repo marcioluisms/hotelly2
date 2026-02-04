@@ -76,7 +76,8 @@ def _list_reservations(
     with txn() as cur:
         cur.execute(
             f"""
-            SELECT id, checkin, checkout, status, total_cents, currency, created_at
+            SELECT id, checkin, checkout, status, total_cents, currency,
+                   room_id, room_type_id, created_at
             FROM reservations
             WHERE {where_clause}
             ORDER BY checkin DESC
@@ -94,7 +95,9 @@ def _list_reservations(
             "status": row[3],
             "total_cents": row[4],
             "currency": row[5],
-            "created_at": row[6].isoformat(),
+            "room_id": row[6],
+            "room_type_id": row[7],
+            "created_at": row[8].isoformat(),
         }
         for row in rows
     ]
@@ -115,7 +118,8 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
     with txn() as cur:
         cur.execute(
             """
-            SELECT id, checkin, checkout, status, total_cents, currency, hold_id, created_at
+            SELECT id, checkin, checkout, status, total_cents, currency,
+                   hold_id, room_id, room_type_id, created_at
             FROM reservations
             WHERE property_id = %s AND id = %s
             """,
@@ -134,7 +138,9 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
         "total_cents": row[4],
         "currency": row[5],
         "hold_id": str(row[6]),
-        "created_at": row[7].isoformat(),
+        "room_id": row[7],
+        "room_type_id": row[8],
+        "created_at": row[9].isoformat(),
     }
 
 

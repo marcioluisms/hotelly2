@@ -213,6 +213,8 @@ class TestReservationsReadSuccess:
                 "status": "confirmed",
                 "total_cents": 50000,
                 "currency": "BRL",
+                "room_id": "room-101",
+                "room_type_id": "standard",
                 "created_at": "2025-05-20T10:00:00+00:00",
             }
         ]
@@ -232,6 +234,11 @@ class TestReservationsReadSuccess:
                     data = response.json()
                     assert "reservations" in data
                     assert len(data["reservations"]) == 1
+                    # Verify room fields are included
+                    assert "room_id" in data["reservations"][0]
+                    assert "room_type_id" in data["reservations"][0]
+                    assert data["reservations"][0]["room_id"] == "room-101"
+                    assert data["reservations"][0]["room_type_id"] == "standard"
 
     def test_detail_returns_reservation(self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user):
         private_key, _ = rsa_keypair
@@ -246,6 +253,8 @@ class TestReservationsReadSuccess:
             "total_cents": 50000,
             "currency": "BRL",
             "hold_id": str(uuid4()),
+            "room_id": "room-202",
+            "room_type_id": "deluxe",
             "created_at": "2025-05-20T10:00:00+00:00",
         }
 
@@ -263,6 +272,11 @@ class TestReservationsReadSuccess:
                     assert response.status_code == 200
                     data = response.json()
                     assert data["id"] == res_id
+                    # Verify room fields are included
+                    assert "room_id" in data
+                    assert "room_type_id" in data
+                    assert data["room_id"] == "room-202"
+                    assert data["room_type_id"] == "deluxe"
 
     def test_detail_not_found(self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user):
         private_key, _ = rsa_keypair
