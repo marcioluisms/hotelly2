@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
 from hotelly.infra.db import txn
@@ -28,14 +28,34 @@ class RateDay(BaseModel):
     price_2pax_cents: int | None = None
     price_3pax_cents: int | None = None
     price_4pax_cents: int | None = None
-    price_1chd_cents: int | None = None
-    price_2chd_cents: int | None = None
-    price_3chd_cents: int | None = None
+    price_bucket1_chd_cents: int | None = None
+    price_bucket2_chd_cents: int | None = None
+    price_bucket3_chd_cents: int | None = None
     min_nights: int | None = None
     max_nights: int | None = None
     closed_checkin: bool = False
     closed_checkout: bool = False
     is_blocked: bool = False
+
+    # Legacy aliases (accepted on input, mapped to bucket fields)
+    price_1chd_cents: int | None = None
+    price_2chd_cents: int | None = None
+    price_3chd_cents: int | None = None
+
+    @model_validator(mode="after")
+    def _normalise_chd_fields(self) -> RateDay:
+        """Merge legacy chd fields into bucket fields (no conflict check here)."""
+        pairs = (
+            ("price_bucket1_chd_cents", "price_1chd_cents"),
+            ("price_bucket2_chd_cents", "price_2chd_cents"),
+            ("price_bucket3_chd_cents", "price_3chd_cents"),
+        )
+        for new, legacy in pairs:
+            new_val = getattr(self, new)
+            legacy_val = getattr(self, legacy)
+            if legacy_val is not None and new_val is None:
+                object.__setattr__(self, new, legacy_val)
+        return self
 
 
 class PutRatesRequest(BaseModel):
@@ -79,7 +99,7 @@ def get_rates(
                 """
                 SELECT room_type_id, date,
                        price_1pax_cents, price_2pax_cents, price_3pax_cents, price_4pax_cents,
-                       price_1chd_cents, price_2chd_cents, price_3chd_cents,
+                       price_bucket1_chd_cents, price_bucket2_chd_cents, price_bucket3_chd_cents,
                        min_nights, max_nights,
                        closed_checkin, closed_checkout, is_blocked
                 FROM room_type_rates
@@ -96,7 +116,7 @@ def get_rates(
                 """
                 SELECT room_type_id, date,
                        price_1pax_cents, price_2pax_cents, price_3pax_cents, price_4pax_cents,
-                       price_1chd_cents, price_2chd_cents, price_3chd_cents,
+                       price_bucket1_chd_cents, price_bucket2_chd_cents, price_bucket3_chd_cents,
                        min_nights, max_nights,
                        closed_checkin, closed_checkout, is_blocked
                 FROM room_type_rates
@@ -118,6 +138,9 @@ def get_rates(
             "price_2pax_cents": r[3],
             "price_3pax_cents": r[4],
             "price_4pax_cents": r[5],
+            "price_bucket1_chd_cents": r[6],
+            "price_bucket2_chd_cents": r[7],
+            "price_bucket3_chd_cents": r[8],
             "price_1chd_cents": r[6],
             "price_2chd_cents": r[7],
             "price_3chd_cents": r[8],
@@ -147,6 +170,21 @@ def put_rates(
     """
     property_id = ctx.property_id
 
+    _CHD_PAIRS = (
+        ("price_bucket1_chd_cents", "price_1chd_cents"),
+        ("price_bucket2_chd_cents", "price_2chd_cents"),
+        ("price_bucket3_chd_cents", "price_3chd_cents"),
+    )
+    for rate in body.rates:
+        for new, legacy in _CHD_PAIRS:
+            new_val = getattr(rate, new)
+            legacy_val = getattr(rate, legacy)
+            if new_val is not None and legacy_val is not None and new_val != legacy_val:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{new} ({new_val}) and {legacy} ({legacy_val}) conflict",
+                )
+
     with txn() as cur:
         for rate in body.rates:
             cur.execute(
@@ -154,7 +192,7 @@ def put_rates(
                 INSERT INTO room_type_rates (
                     property_id, room_type_id, date,
                     price_1pax_cents, price_2pax_cents, price_3pax_cents, price_4pax_cents,
-                    price_1chd_cents, price_2chd_cents, price_3chd_cents,
+                    price_bucket1_chd_cents, price_bucket2_chd_cents, price_bucket3_chd_cents,
                     min_nights, max_nights,
                     closed_checkin, closed_checkout, is_blocked,
                     updated_at
@@ -172,9 +210,9 @@ def put_rates(
                     price_2pax_cents = EXCLUDED.price_2pax_cents,
                     price_3pax_cents = EXCLUDED.price_3pax_cents,
                     price_4pax_cents = EXCLUDED.price_4pax_cents,
-                    price_1chd_cents = EXCLUDED.price_1chd_cents,
-                    price_2chd_cents = EXCLUDED.price_2chd_cents,
-                    price_3chd_cents = EXCLUDED.price_3chd_cents,
+                    price_bucket1_chd_cents = EXCLUDED.price_bucket1_chd_cents,
+                    price_bucket2_chd_cents = EXCLUDED.price_bucket2_chd_cents,
+                    price_bucket3_chd_cents = EXCLUDED.price_bucket3_chd_cents,
                     min_nights = EXCLUDED.min_nights,
                     max_nights = EXCLUDED.max_nights,
                     closed_checkin = EXCLUDED.closed_checkin,
@@ -190,9 +228,9 @@ def put_rates(
                     rate.price_2pax_cents,
                     rate.price_3pax_cents,
                     rate.price_4pax_cents,
-                    rate.price_1chd_cents,
-                    rate.price_2chd_cents,
-                    rate.price_3chd_cents,
+                    rate.price_bucket1_chd_cents,
+                    rate.price_bucket2_chd_cents,
+                    rate.price_bucket3_chd_cents,
                     rate.min_nights,
                     rate.max_nights,
                     rate.closed_checkin,

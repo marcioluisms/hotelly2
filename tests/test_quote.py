@@ -114,16 +114,16 @@ def seed_room_type_rates(
     """Seed room_type_rates rows for testing.
 
     Each dict in rates must contain 'date' and any price columns, e.g.:
-    {"date": date(2025,6,1), "price_2pax_cents": 15000, "price_1chd_cents": 3000}
+    {"date": date(2025,6,1), "price_2pax_cents": 15000, "price_bucket1_chd_cents": 3000}
     """
     cols = (
         "price_1pax_cents",
         "price_2pax_cents",
         "price_3pax_cents",
         "price_4pax_cents",
-        "price_1chd_cents",
-        "price_2chd_cents",
-        "price_3chd_cents",
+        "price_bucket1_chd_cents",
+        "price_bucket2_chd_cents",
+        "price_bucket3_chd_cents",
     )
     for r in rates:
         cur.execute(
@@ -132,7 +132,7 @@ def seed_room_type_rates(
                 property_id, room_type_id, date,
                 price_1pax_cents, price_2pax_cents,
                 price_3pax_cents, price_4pax_cents,
-                price_1chd_cents, price_2chd_cents, price_3chd_cents
+                price_bucket1_chd_cents, price_bucket2_chd_cents, price_bucket3_chd_cents
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (property_id, room_type_id, date) DO UPDATE
@@ -140,9 +140,9 @@ def seed_room_type_rates(
                 price_2pax_cents = EXCLUDED.price_2pax_cents,
                 price_3pax_cents = EXCLUDED.price_3pax_cents,
                 price_4pax_cents = EXCLUDED.price_4pax_cents,
-                price_1chd_cents = EXCLUDED.price_1chd_cents,
-                price_2chd_cents = EXCLUDED.price_2chd_cents,
-                price_3chd_cents = EXCLUDED.price_3chd_cents
+                price_bucket1_chd_cents = EXCLUDED.price_bucket1_chd_cents,
+                price_bucket2_chd_cents = EXCLUDED.price_bucket2_chd_cents,
+                price_bucket3_chd_cents = EXCLUDED.price_bucket3_chd_cents
             """,
             (
                 property_id,
@@ -467,12 +467,12 @@ class TestQuoteMinimum:
                 currency="BRL",
             )
 
-            # Case 1: price_1chd_cents is NULL → child_add = 0
+            # Case 1: price_bucket1_chd_cents is NULL → child_add = 0
             seed_room_type_rates(
                 cur,
                 TEST_PROPERTY_ID,
                 TEST_ROOM_TYPE_ID,
-                [{"date": d, "price_2pax_cents": 15000, "price_1chd_cents": None}],
+                [{"date": d, "price_2pax_cents": 15000, "price_bucket1_chd_cents": None}],
             )
 
             result = quote_minimum(
@@ -489,12 +489,12 @@ class TestQuoteMinimum:
         assert result["total_cents"] == 15000  # 15000 + 0
 
         with txn() as cur:
-            # Case 2: price_1chd_cents = 3000
+            # Case 2: price_bucket1_chd_cents = 3000
             seed_room_type_rates(
                 cur,
                 TEST_PROPERTY_ID,
                 TEST_ROOM_TYPE_ID,
-                [{"date": d, "price_2pax_cents": 15000, "price_1chd_cents": 3000}],
+                [{"date": d, "price_2pax_cents": 15000, "price_bucket1_chd_cents": 3000}],
             )
 
             result = quote_minimum(

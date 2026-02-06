@@ -70,6 +70,19 @@ def main() -> int:
                 (property_id, room_type_id),
             )
 
+            # 4b) Child age buckets (idempotente)
+            cur.execute(
+                """
+                INSERT INTO property_child_age_buckets (property_id, bucket, min_age, max_age)
+                VALUES
+                    (%s, 1, 0, 3),
+                    (%s, 2, 4, 12),
+                    (%s, 3, 13, 17)
+                ON CONFLICT (property_id, bucket) DO NOTHING
+                """,
+                (property_id, property_id, property_id),
+            )
+
             # 5) Hold + Reservation (idempotente)
             checkin = date.today() + timedelta(days=7)
             checkout = checkin + timedelta(days=2)
