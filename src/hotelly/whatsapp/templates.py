@@ -19,6 +19,18 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "text": "Quantos hóspedes serão?",
         "allowed_params": [],
     },
+    "prompt_adult_count": {
+        "text": "Quantos adultos serão?",
+        "allowed_params": [],
+    },
+    "prompt_child_count": {
+        "text": "Quantas crianças estarão na hospedagem?",
+        "allowed_params": [],
+    },
+    "prompt_children_ages": {
+        "text": "Quais as idades das crianças? (ex.: 3 e 7)",
+        "allowed_params": [],
+    },
     "quote_unavailable": {
         "text": (
             "Infelizmente não temos disponibilidade para {checkin} a {checkout}. "

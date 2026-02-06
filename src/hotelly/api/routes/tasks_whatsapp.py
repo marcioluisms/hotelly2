@@ -266,9 +266,9 @@ def _process_intent(
 ) -> tuple[str, dict[str, Any]] | None:
     """Process intent and return (template_key, params).
 
-    Deterministic flow (no LLM):
-    - Complete data → try quote → hold
-    - Missing data → prompt for specific field
+    Multi-turn flow: loads existing context from conversation, merges
+    entities from current message, persists updated context, then checks
+    what is still missing before proceeding to quote/hold.
 
     Args:
         cur: Database cursor (within transaction).
@@ -281,56 +281,103 @@ def _process_intent(
     Returns:
         Tuple of (template_key, params) or None if no response needed.
     """
-    # Extract entities (dates as ISO strings from webhook)
+    # 1. Load existing context
+    cur.execute("SELECT context FROM conversations WHERE id = %s", (conversation_id,))
+    row = cur.fetchone()
+    context: dict[str, Any] = row[0] if row and row[0] else {}
+
+    # 2. Extract entities from current message
     checkin_str = entities.get("checkin")
     checkout_str = entities.get("checkout")
     room_type_id = entities.get("room_type_id")
-    guest_count = entities.get("guest_count")
+    adult_count = entities.get("adult_count")
+    children_ages = entities.get("children_ages")  # list or None
+    guest_count = entities.get("guest_count")  # legacy compat
+    child_count = entities.get("child_count")
 
     # Parse dates if provided
-    checkin: date | None = None
-    checkout: date | None = None
     if checkin_str:
         try:
-            checkin = date.fromisoformat(checkin_str)
+            context["checkin"] = date.fromisoformat(checkin_str).isoformat()
         except (ValueError, TypeError):
             pass
     if checkout_str:
         try:
-            checkout = date.fromisoformat(checkout_str)
+            context["checkout"] = date.fromisoformat(checkout_str).isoformat()
         except (ValueError, TypeError):
             pass
 
-    # Check what's missing
-    missing: list[str] = []
-    if not checkin:
-        missing.append("checkin")
-    if not checkout:
-        missing.append("checkout")
-    if not room_type_id:
-        missing.append("room_type")
-    if not guest_count:
-        missing.append("guest_count")
+    # 3. Merge non-None values into context
+    if room_type_id is not None:
+        context["room_type_id"] = room_type_id
+    if adult_count is not None:
+        context["adult_count"] = adult_count
+    if guest_count is not None:
+        context["guest_count"] = guest_count
 
-    # Missing data → deterministic prompts (template_key, params)
-    if "checkin" in missing or "checkout" in missing:
+    # children_ages: list → overwrite; explicit None with children mentioned → set None
+    if children_ages is not None:
+        context["children_ages"] = children_ages
+    elif child_count is not None and "children_ages" not in context:
+        context["children_ages"] = None  # children mentioned but no ages yet
+
+    if child_count is not None:
+        context["child_count"] = child_count
+
+    # If adult_count came but guest_count didn't, derive guest_count
+    if adult_count is not None and guest_count is None:
+        c_count = len(context.get("children_ages") or [])
+        context["guest_count"] = adult_count + c_count
+
+    # 4. Persist updated context
+    cur.execute(
+        "UPDATE conversations SET context = %s, updated_at = now() WHERE id = %s",
+        (json.dumps(context, default=str), conversation_id),
+    )
+
+    # 5. Calculate missing from accumulated context
+    ctx_checkin_str = context.get("checkin")
+    ctx_checkout_str = context.get("checkout")
+    ctx_checkin: date | None = None
+    ctx_checkout: date | None = None
+    if ctx_checkin_str:
+        try:
+            ctx_checkin = date.fromisoformat(ctx_checkin_str)
+        except (ValueError, TypeError):
+            pass
+    if ctx_checkout_str:
+        try:
+            ctx_checkout = date.fromisoformat(ctx_checkout_str)
+        except (ValueError, TypeError):
+            pass
+
+    if not ctx_checkin or not ctx_checkout:
         return ("prompt_dates", {})
 
-    if "room_type" in missing:
+    if not context.get("room_type_id"):
         return ("prompt_room_type", {})
 
-    if "guest_count" in missing:
-        return ("prompt_guest_count", {})
+    if not context.get("adult_count"):
+        return ("prompt_adult_count", {})
 
-    # All data present → try quote, hold, and checkout
+    # Children ages required if children were mentioned
+    ctx_child_count = context.get("child_count")
+    if ctx_child_count is not None and ctx_child_count > 0 and context.get("children_ages") is None:
+        return ("prompt_children_ages", {})
+
+    # 6. All data present → derive guest_count and try quote/hold/checkout
+    ctx_adult_count = context["adult_count"]
+    ctx_children_ages = context.get("children_ages") or []
+    derived_guest_count = ctx_adult_count + len(ctx_children_ages)
+
     return _try_quote_hold_checkout(
         cur,
         property_id=property_id,
         conversation_id=conversation_id,
-        checkin=checkin,
-        checkout=checkout,
-        room_type_id=room_type_id,
-        guest_count=guest_count,
+        checkin=ctx_checkin,
+        checkout=ctx_checkout,
+        room_type_id=context["room_type_id"],
+        guest_count=derived_guest_count,
         correlation_id=correlation_id,
     )
 

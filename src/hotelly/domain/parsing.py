@@ -45,6 +45,29 @@ _GUEST_PATTERNS = [
     r"para\s+(\d+)\s*(?:pessoas?|hóspedes?|hospedes?|pax|adultos?)?",
 ]
 
+# Adult-specific patterns
+_ADULT_PATTERNS = [
+    r"(\d+)\s*(?:adultos?|adts?)",
+    r"para\s+(\d+)\s*(?:adultos?|adts?)",
+]
+
+# Child count patterns (without ages)
+_CHILD_COUNT_PATTERNS = [
+    r"(\d+)\s*(?:crianças?|criancas?|kids?|chd)",
+]
+
+# Children ages patterns (strict: "3 e 7", "3,7", "3 7", optionally with "anos")
+_CHILDREN_AGES_PATTERN = re.compile(
+    r"(?:crianças?|criancas?|kids?|chd)\s*(?:de\s+)?(\d{1,2}(?:\s*(?:e|,|\s)\s*\d{1,2})*)\s*(?:anos?)?",
+    re.IGNORECASE,
+)
+
+# Standalone ages pattern (for multi-turn: "3 e 7 anos", "3,7", "3 7")
+_STANDALONE_AGES_PATTERN = re.compile(
+    r"^(\d{1,2}(?:\s*(?:e|,)\s*\d{1,2})+)\s*(?:anos?)?$",
+    re.IGNORECASE,
+)
+
 
 def _parse_date(day: str, month: str, year: str | None, reference_year: int) -> date | None:
     """Parse date components into a date object."""
@@ -132,6 +155,87 @@ def _extract_room_type(text: str, aliases: dict[str, str]) -> str | None:
     return None
 
 
+def _extract_adults(text: str) -> int | None:
+    """Extract adult count from text."""
+    text_lower = text.lower()
+    for pattern in _ADULT_PATTERNS:
+        match = re.search(pattern, text_lower)
+        if match:
+            try:
+                count = int(match.group(1))
+                if 1 <= count <= 20:
+                    return count
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def _parse_age_list(ages_str: str) -> list[int] | None:
+    """Parse a string of ages like '3 e 7', '3,7', '3 7' into a list of ints.
+
+    Returns list of ages (each 0..17) or None if parsing fails.
+    """
+    # Normalize separators: replace "e" and "," with space
+    normalized = re.sub(r'\s*[e,]\s*', ' ', ages_str.strip())
+    parts = normalized.split()
+
+    ages = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            age = int(p)
+            if 0 <= age <= 17:
+                ages.append(age)
+            else:
+                return None  # invalid age
+        except ValueError:
+            return None
+
+    return ages if ages else None
+
+
+def _extract_children(text: str) -> tuple[int | None, list[int] | None]:
+    """Extract child count and ages from text.
+
+    Returns:
+        Tuple of (child_count, children_ages).
+        - child_count: number of children mentioned, or None
+        - children_ages: list of ages if parsed, or None if children mentioned but ages missing
+    """
+    text_lower = text.lower()
+
+    # Try to extract ages with context (e.g., "crianças de 3 e 7")
+    ages_match = _CHILDREN_AGES_PATTERN.search(text_lower)
+    if ages_match:
+        ages_str = ages_match.group(1)
+        ages = _parse_age_list(ages_str)
+        if ages is not None:
+            return (len(ages), ages)
+
+    # Try standalone ages (multi-turn: just "3 e 7 anos")
+    stripped = text.strip()
+    standalone_match = _STANDALONE_AGES_PATTERN.match(stripped)
+    if standalone_match:
+        ages = _parse_age_list(standalone_match.group(1))
+        if ages is not None:
+            return (len(ages), ages)
+
+    # Try child count only (no ages)
+    for pattern in _CHILD_COUNT_PATTERNS:
+        match = re.search(pattern, text_lower)
+        if match:
+            try:
+                count = int(match.group(1))
+                if 1 <= count <= 10:
+                    return (count, None)  # children mentioned but no ages
+            except (ValueError, IndexError):
+                continue
+
+    return (None, None)
+
+
 def parse_intent(
     text: str,
     *,
@@ -164,6 +268,19 @@ def parse_intent(
         checkin = None
         checkout = None
 
+    # Extract adult count and children
+    adult_count = _extract_adults(text)
+    child_count_parsed, children_ages = _extract_children(text)
+
+    # If "X pessoas/hóspedes" used without explicit adults, treat as adults (legacy compat)
+    if adult_count is None and guest_count is not None and child_count_parsed is None:
+        adult_count = guest_count
+
+    # Validate: if both child_count and ages exist, they must match
+    if child_count_parsed is not None and children_ages is not None:
+        if len(children_ages) != child_count_parsed:
+            children_ages = None  # force re-prompt
+
     # Build missing list
     missing: list[str] = []
     if checkin is None:
@@ -172,13 +289,17 @@ def parse_intent(
         missing.append("checkout")
     if room_type_id is None:
         missing.append("room_type")
-    if guest_count is None:
-        missing.append("guest_count")
+    if adult_count is None:
+        missing.append("adult_count")
+    if child_count_parsed is not None and child_count_parsed > 0 and children_ages is None:
+        missing.append("children_ages")
 
     return ParsedIntent(
         checkin=checkin,
         checkout=checkout,
         room_type_id=room_type_id,
         guest_count=guest_count,
+        adult_count=adult_count,
+        children_ages=children_ages,
         missing=missing,
     )

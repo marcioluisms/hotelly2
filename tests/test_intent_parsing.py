@@ -65,7 +65,7 @@ class TestParseIntentPartial:
         assert result.checkout == date(2026, 2, 12)
         assert result.room_type_id == "rt_suite"
         assert result.guest_count is None
-        assert result.missing == ["guest_count"]
+        assert result.missing == ["adult_count"]
         assert not result.is_complete()
 
     def test_missing_room_type(self):
@@ -102,7 +102,7 @@ class TestParseIntentPartial:
         assert result.checkout is None
         assert result.room_type_id is None
         assert result.guest_count is None
-        assert set(result.missing) == {"checkin", "checkout", "room_type", "guest_count"}
+        assert set(result.missing) == {"checkin", "checkout", "room_type", "adult_count"}
 
 
 class TestParseIntentDates:
@@ -200,7 +200,7 @@ class TestParseIntentGuestCount:
         assert result.checkout == date(2026, 2, 12)
         # Room number 101 should NOT be guest count
         assert result.guest_count is None
-        assert "guest_count" in result.missing
+        assert "adult_count" in result.missing
 
 
 class TestParseIntentRoomType:
