@@ -39,6 +39,7 @@ def enqueue_cloud_task(
     queue = os.environ.get("GCP_TASKS_QUEUE", "hotelly-default")
     worker_url = os.environ.get("WORKER_BASE_URL")
     oidc_service_account = os.environ.get("TASKS_OIDC_SERVICE_ACCOUNT")
+    oidc_audience = os.environ.get("TASKS_OIDC_AUDIENCE")
 
     if not project:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT or GCP_PROJECT_ID required")
@@ -46,6 +47,8 @@ def enqueue_cloud_task(
         raise RuntimeError("WORKER_BASE_URL required for Cloud Tasks")
     if not oidc_service_account:
         raise RuntimeError("TASKS_OIDC_SERVICE_ACCOUNT required for Cloud Tasks")
+    if not oidc_audience:
+        raise RuntimeError("TASKS_OIDC_AUDIENCE required for Cloud Tasks")
 
     client = tasks_v2.CloudTasksClient()
 
@@ -70,7 +73,7 @@ def enqueue_cloud_task(
             "body": json.dumps(payload).encode(),
             "oidc_token": {
                 "service_account_email": oidc_service_account,
-                "audience": worker_url,
+                "audience": oidc_audience,
             },
         },
     }
