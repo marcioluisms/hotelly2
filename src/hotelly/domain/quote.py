@@ -33,19 +33,13 @@ def quote_minimum(
     room_type_id: str,
     checkin: date,
     checkout: date,
-    adult_count: int | None = None,
+    adult_count: int,
     children_ages: list[int] | None = None,
-    # Legacy compat bridge:
-    guest_count: int | None = None,
 ) -> dict | None:
     """Calculate minimum quote from ARI data with PAX + child-bucket pricing.
 
     Returns dict with quote data or raises QuoteUnavailable.
     """
-    # --- Legacy compat bridge ---
-    if guest_count is not None and adult_count is None:
-        adult_count = guest_count
-        children_ages = []
     if children_ages is None:
         children_ages = []
 

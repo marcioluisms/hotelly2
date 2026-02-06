@@ -464,7 +464,7 @@ class TestS05PiiSafety:
                 "checkin": checkin.isoformat(),
                 "checkout": checkout.isoformat(),
                 "room_type_id": "rt_standard",
-                "guest_count": 2,
+                "adult_count": 2,
             },
         }
 
@@ -498,7 +498,7 @@ class TestS05PiiSafety:
 
             # Validate allowed params only (no PII)
             params = payload_data["params"]
-            allowed_params = {"nights", "checkin", "checkout", "guest_count", "total_brl", "checkout_url"}
+            allowed_params = {"nights", "checkin", "checkout", "adult_count", "total_brl", "checkout_url"}
             assert set(params.keys()) <= allowed_params, f"Unexpected params: {set(params.keys()) - allowed_params}"
             assert "checkout_url" in params
             assert "http" in params["checkout_url"].lower(), (

@@ -466,4 +466,4 @@ class TestS04WebhookPiiSafety:
         assert entities["checkin"] is not None  # 10/02
         assert entities["checkout"] is not None  # 12/02
         assert entities["room_type_id"] == "rt_suite"
-        assert entities["guest_count"] == 2
+        assert entities["adult_count"] == 2

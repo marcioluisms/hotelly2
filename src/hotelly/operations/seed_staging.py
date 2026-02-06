@@ -89,14 +89,14 @@ def main() -> int:
             expires_at = datetime.now(tz.utc) + timedelta(hours=2)
             total_cents = 19900
             currency = "BRL"
-            guest_count = 2
+            adult_count = 2
             create_idem_key = "seed-staging-demo-hold"
 
             cur.execute(
                 """
                 WITH h AS (
-                  INSERT INTO holds (property_id, status, checkin, checkout, expires_at, create_idempotency_key, total_cents, currency, guest_count)
-                  VALUES (%s, 'active', %s, %s, %s, %s, %s, %s, %s)
+                  INSERT INTO holds (property_id, status, checkin, checkout, expires_at, create_idempotency_key, total_cents, currency, adult_count, children_ages)
+                  VALUES (%s, 'active', %s, %s, %s, %s, %s, %s, %s, '[]'::jsonb)
                   ON CONFLICT (property_id, create_idempotency_key)
                   WHERE create_idempotency_key IS NOT NULL
                   DO UPDATE SET
@@ -106,13 +106,14 @@ def main() -> int:
                     expires_at = EXCLUDED.expires_at,
                     total_cents = EXCLUDED.total_cents,
                     currency = EXCLUDED.currency,
-                    guest_count = EXCLUDED.guest_count,
+                    adult_count = EXCLUDED.adult_count,
+                    children_ages = EXCLUDED.children_ages,
                     updated_at = now()
                   RETURNING id
                 ),
                 r AS (
-                  INSERT INTO reservations (property_id, hold_id, status, checkin, checkout, total_cents, currency, guest_count, room_type_id)
-                  SELECT %s, h.id, 'confirmed', %s, %s, %s, %s, %s, %s
+                  INSERT INTO reservations (property_id, hold_id, status, checkin, checkout, total_cents, currency, adult_count, children_ages, room_type_id)
+                  SELECT %s, h.id, 'confirmed', %s, %s, %s, %s, %s, '[]'::jsonb, %s
                   FROM h
                   ON CONFLICT (property_id, hold_id)
                   DO UPDATE SET
@@ -121,7 +122,8 @@ def main() -> int:
                     checkout = EXCLUDED.checkout,
                     total_cents = EXCLUDED.total_cents,
                     currency = EXCLUDED.currency,
-                    guest_count = EXCLUDED.guest_count,
+                    adult_count = EXCLUDED.adult_count,
+                    children_ages = EXCLUDED.children_ages,
                     room_type_id = EXCLUDED.room_type_id,
                     updated_at = now()
                   RETURNING id
@@ -129,8 +131,8 @@ def main() -> int:
                 SELECT (SELECT id FROM h) AS hold_id, (SELECT id FROM r) AS reservation_id
                 """,
                 (
-                    property_id, checkin, checkout, expires_at, create_idem_key, total_cents, currency, guest_count,
-                    property_id, checkin, checkout, total_cents, currency, guest_count, room_type_id,
+                    property_id, checkin, checkout, expires_at, create_idem_key, total_cents, currency, adult_count,
+                    property_id, checkin, checkout, total_cents, currency, adult_count, room_type_id,
                 ),
             )
             hold_id, reservation_id = cur.fetchone()

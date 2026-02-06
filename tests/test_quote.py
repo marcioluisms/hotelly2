@@ -550,39 +550,16 @@ class TestQuoteMinimum:
                 )
             assert exc_info.value.reason_code == "invalid_child_age"
 
-    def test_legacy_guest_count_bridge(self, ensure_property):
-        """guest_count=2 without adult_count works as adult_count=2."""
+    def test_adult_count_is_required(self, ensure_property):
+        """adult_count is required (no default)."""
         from hotelly.domain.quote import quote_minimum
 
-        checkin = date(2025, 12, 1)
-        checkout = date(2025, 12, 3)
-
         with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 12, 1), date(2025, 12, 2)],
-            )
-            seed_room_type_rates(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [
-                    {"date": date(2025, 12, 1), "price_2pax_cents": 12000},
-                    {"date": date(2025, 12, 2), "price_2pax_cents": 12000},
-                ],
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-                guest_count=2,
-            )
-
-        assert result is not None
-        assert result["total_cents"] == 24000
-        assert result["nights"] == 2
+            with pytest.raises(TypeError):
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=date(2025, 12, 1),
+                    checkout=date(2025, 12, 3),
+                )

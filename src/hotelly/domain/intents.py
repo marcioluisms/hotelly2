@@ -18,17 +18,9 @@ class ParsedIntent:
     checkin: date | None = None
     checkout: date | None = None
     room_type_id: str | None = None
-    guest_count: int | None = None
     adult_count: int | None = None
     children_ages: list[int] | None = None
     missing: list[str] = field(default_factory=list)
-
-    def derived_guest_count(self) -> int | None:
-        """Derive guest_count from adult_count + children for compat."""
-        if self.adult_count is None:
-            return self.guest_count  # fallback to legacy
-        child_count = len(self.children_ages) if self.children_ages else 0
-        return self.adult_count + child_count
 
     def is_complete(self) -> bool:
         """Check if all required fields are present."""

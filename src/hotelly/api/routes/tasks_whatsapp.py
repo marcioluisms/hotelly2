@@ -292,7 +292,6 @@ def _process_intent(
     room_type_id = entities.get("room_type_id")
     adult_count = entities.get("adult_count")
     children_ages = entities.get("children_ages")  # list or None
-    guest_count = entities.get("guest_count")  # legacy compat
     child_count = entities.get("child_count")
 
     # Parse dates if provided
@@ -312,8 +311,6 @@ def _process_intent(
         context["room_type_id"] = room_type_id
     if adult_count is not None:
         context["adult_count"] = adult_count
-    if guest_count is not None:
-        context["guest_count"] = guest_count
 
     # children_ages: list → overwrite; explicit None with children mentioned → set None
     if children_ages is not None:
@@ -323,11 +320,6 @@ def _process_intent(
 
     if child_count is not None:
         context["child_count"] = child_count
-
-    # If adult_count came but guest_count didn't, derive guest_count
-    if adult_count is not None and guest_count is None:
-        c_count = len(context.get("children_ages") or [])
-        context["guest_count"] = adult_count + c_count
 
     # 4. Persist updated context
     cur.execute(
@@ -365,10 +357,9 @@ def _process_intent(
     if ctx_child_count is not None and ctx_child_count > 0 and context.get("children_ages") is None:
         return ("prompt_children_ages", {})
 
-    # 6. All data present → derive guest_count and try quote/hold/checkout
+    # 6. All data present → try quote/hold/checkout
     ctx_adult_count = context["adult_count"]
     ctx_children_ages = context.get("children_ages") or []
-    derived_guest_count = ctx_adult_count + len(ctx_children_ages)
 
     return _try_quote_hold_checkout(
         cur,
@@ -377,7 +368,8 @@ def _process_intent(
         checkin=ctx_checkin,
         checkout=ctx_checkout,
         room_type_id=context["room_type_id"],
-        guest_count=derived_guest_count,
+        adult_count=ctx_adult_count,
+        children_ages=ctx_children_ages,
         correlation_id=correlation_id,
     )
 
@@ -390,7 +382,8 @@ def _try_quote_hold_checkout(
     checkin: date,
     checkout: date,
     room_type_id: str,
-    guest_count: int,
+    adult_count: int,
+    children_ages: list[int],
     correlation_id: str | None,
 ) -> tuple[str, dict[str, Any]]:
     """Try to create quote, hold, and checkout session.
@@ -402,7 +395,8 @@ def _try_quote_hold_checkout(
         checkin: Check-in date.
         checkout: Check-out date (the date field, not the payment checkout).
         room_type_id: Room type identifier.
-        guest_count: Number of guests.
+        adult_count: Number of adults.
+        children_ages: List of children ages.
         correlation_id: Request correlation ID.
 
     Returns:
@@ -416,7 +410,8 @@ def _try_quote_hold_checkout(
             room_type_id=room_type_id,
             checkin=checkin,
             checkout=checkout,
-            guest_count=guest_count,
+            adult_count=adult_count,
+            children_ages=children_ages,
         )
     except QuoteUnavailable as e:
         logger.info(
@@ -455,7 +450,8 @@ def _try_quote_hold_checkout(
             currency=quote["currency"],
             create_idempotency_key=idempotency_key,
             conversation_id=conversation_id,
-            guest_count=guest_count,
+            adult_count=adult_count,
+            children_ages=children_ages,
             correlation_id=correlation_id,
             cur=cur,
         )
@@ -529,7 +525,7 @@ def _try_quote_hold_checkout(
         "nights": nights,
         "checkin": checkin.strftime("%d/%m"),
         "checkout": checkout.strftime("%d/%m"),
-        "guest_count": guest_count,
+        "adult_count": adult_count,
         "total_brl": total_brl,
     }
 

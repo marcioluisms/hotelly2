@@ -39,16 +39,10 @@ _DATE_PARTS = r"(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{4}))?"
 # Groups: 1=day1, 2=month1, 3=year1, 4=day2, 5=month2, 6=year2
 _DATE_RANGE_PATTERN = rf"{_DATE_PARTS}\s*(?:a|até|ate|-)\s*{_DATE_PARTS}"
 
-# Guest count patterns
-_GUEST_PATTERNS = [
-    r"(\d+)\s*(?:hóspedes?|hospedes?|pessoas?|pax|adultos?)",
-    r"para\s+(\d+)\s*(?:pessoas?|hóspedes?|hospedes?|pax|adultos?)?",
-]
-
-# Adult-specific patterns
+# Adult-specific patterns (includes pessoas/hóspedes/pax as adult synonyms)
 _ADULT_PATTERNS = [
-    r"(\d+)\s*(?:adultos?|adts?)",
-    r"para\s+(\d+)\s*(?:adultos?|adts?)",
+    r"(\d+)\s*(?:adultos?|adts?|hóspedes?|hospedes?|pessoas?|pax)",
+    r"para\s+(\d+)\s*(?:adultos?|adts?|hóspedes?|hospedes?|pessoas?|pax)",
 ]
 
 # Child count patterns (without ages)
@@ -120,23 +114,6 @@ def _extract_dates(text: str, reference_year: int) -> tuple[date | None, date | 
         return (checkin, None)
 
     return (None, None)
-
-
-def _extract_guest_count(text: str) -> int | None:
-    """Extract guest count from text."""
-    text_lower = text.lower()
-
-    for pattern in _GUEST_PATTERNS:
-        match = re.search(pattern, text_lower)
-        if match:
-            try:
-                count = int(match.group(1))
-                if 1 <= count <= 20:  # Reasonable range
-                    return count
-            except (ValueError, IndexError):
-                continue
-
-    return None
 
 
 def _extract_room_type(text: str, aliases: dict[str, str]) -> str | None:
@@ -259,7 +236,6 @@ def parse_intent(
 
     # Extract all fields
     checkin, checkout = _extract_dates(text, reference_date.year)
-    guest_count = _extract_guest_count(text)
     room_type_id = _extract_room_type(text, aliases)
 
     # Validate dates: checkin must be before checkout
@@ -271,10 +247,6 @@ def parse_intent(
     # Extract adult count and children
     adult_count = _extract_adults(text)
     child_count_parsed, children_ages = _extract_children(text)
-
-    # If "X pessoas/hóspedes" used without explicit adults, treat as adults (legacy compat)
-    if adult_count is None and guest_count is not None and child_count_parsed is None:
-        adult_count = guest_count
 
     # Validate: if both child_count and ages exist, they must match
     if child_count_parsed is not None and children_ages is not None:
@@ -298,7 +270,6 @@ def parse_intent(
         checkin=checkin,
         checkout=checkout,
         room_type_id=room_type_id,
-        guest_count=guest_count,
         adult_count=adult_count,
         children_ages=children_ages,
         missing=missing,

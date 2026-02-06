@@ -145,7 +145,8 @@ async def evolution_webhook(
             "checkin": parsed.checkin.isoformat() if parsed.checkin else None,
             "checkout": parsed.checkout.isoformat() if parsed.checkout else None,
             "room_type_id": parsed.room_type_id,
-            "guest_count": parsed.guest_count,
+            "adult_count": parsed.adult_count,
+            "children_ages": parsed.children_ages,
         },
         # NO remote_jid - ADR-006
         # NO text - ADR-006
