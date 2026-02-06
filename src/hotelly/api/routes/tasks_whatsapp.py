@@ -21,7 +21,7 @@ from hotelly.domain.conversations import upsert_conversation
 from hotelly.domain.holds import UnavailableError as HoldUnavailableError
 from hotelly.domain.holds import create_hold
 from hotelly.domain.payments import create_checkout_session, HoldNotActiveError
-from hotelly.domain.quote import quote_minimum
+from hotelly.domain.quote import quote_minimum, QuoteUnavailable
 from hotelly.infra.db import txn
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
@@ -409,16 +409,16 @@ def _try_quote_hold_checkout(
         Tuple of (template_key, params) for the response.
     """
     # 1. Get quote
-    quote = quote_minimum(
-        cur,
-        property_id=property_id,
-        room_type_id=room_type_id,
-        checkin=checkin,
-        checkout=checkout,
-        guest_count=guest_count,
-    )
-
-    if quote is None:
+    try:
+        quote = quote_minimum(
+            cur,
+            property_id=property_id,
+            room_type_id=room_type_id,
+            checkin=checkin,
+            checkout=checkout,
+            guest_count=guest_count,
+        )
+    except QuoteUnavailable as e:
         logger.info(
             "quote unavailable",
             extra={
@@ -426,8 +426,7 @@ def _try_quote_hold_checkout(
                     correlationId=correlation_id,
                     property_id=property_id,
                     room_type_id=room_type_id,
-                    checkin=checkin.isoformat(),
-                    checkout=checkout.isoformat(),
+                    reason_code=e.reason_code,
                 )
             },
         )

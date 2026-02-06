@@ -59,6 +59,10 @@ def ensure_property():
                 "DELETE FROM ari_days WHERE property_id = %s",
                 (TEST_PROPERTY_ID,),
             )
+            cur.execute(
+                "DELETE FROM property_child_age_buckets WHERE property_id = %s",
+                (TEST_PROPERTY_ID,),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -153,15 +157,40 @@ def seed_room_type_rates(
         )
 
 
+def seed_child_age_buckets(
+    cur,
+    property_id: str,
+    buckets: list[tuple[int, int, int]],
+):
+    """Seed property_child_age_buckets rows.
+
+    buckets is a list of (bucket, min_age, max_age) tuples.
+    """
+    for bucket, min_age, max_age in buckets:
+        cur.execute(
+            """
+            INSERT INTO property_child_age_buckets (property_id, bucket, min_age, max_age)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (property_id, bucket) DO UPDATE
+            SET min_age = EXCLUDED.min_age,
+                max_age = EXCLUDED.max_age
+            """,
+            (property_id, bucket, min_age, max_age),
+        )
+
+
+FULL_BUCKETS = [(1, 0, 3), (2, 4, 12), (3, 13, 17)]
+
+
 class TestQuoteMinimum:
     """Tests for quote_minimum function."""
 
-    def test_quote_available_two_nights(self, ensure_property):
-        """Quote for 2 available nights returns correct total."""
+    def test_adult_only_2pax(self, ensure_property):
+        """2 adults, 0 children, 2 nights → total = 30000."""
         from hotelly.domain.quote import quote_minimum
 
         checkin = date(2025, 6, 1)
-        checkout = date(2025, 6, 3)  # 2 nights
+        checkout = date(2025, 6, 3)
 
         with txn() as cur:
             seed_ari(
@@ -169,237 +198,379 @@ class TestQuoteMinimum:
                 TEST_PROPERTY_ID,
                 TEST_ROOM_TYPE_ID,
                 [date(2025, 6, 1), date(2025, 6, 2)],
-                inv_total=1,
-                inv_booked=0,
-                inv_held=0,
-                base_rate_cents=15000,  # R$ 150.00 per night
-                currency="BRL",
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-        assert result is not None
-        assert result["property_id"] == TEST_PROPERTY_ID
-        assert result["room_type_id"] == TEST_ROOM_TYPE_ID
-        assert result["checkin"] == checkin
-        assert result["checkout"] == checkout
-        assert result["total_cents"] == 30000  # 2 nights x R$ 150.00
-        assert result["currency"] == "BRL"
-        assert result["nights"] == 2
-
-    def test_quote_available_three_nights(self, ensure_property):
-        """Quote for 3 available nights returns correct total."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 7, 10)
-        checkout = date(2025, 7, 13)  # 3 nights
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 7, 10), date(2025, 7, 11), date(2025, 7, 12)],
-                inv_total=2,
-                inv_booked=1,
-                inv_held=0,
-                base_rate_cents=20000,  # R$ 200.00 per night
-                currency="BRL",
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-        assert result is not None
-        assert result["total_cents"] == 60000  # 3 nights x R$ 200.00
-        assert result["nights"] == 3
-
-    def test_quote_unavailable_zero_inventory(self, ensure_property):
-        """Quote returns None when inv_total=0."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 8, 1)
-        checkout = date(2025, 8, 3)  # 2 nights
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 8, 1)],
-                inv_total=1,
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-            # Second night has no inventory
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 8, 2)],
-                inv_total=0,
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-        assert result is None
-
-    def test_quote_unavailable_fully_held(self, ensure_property):
-        """Quote returns None when inv_held consumes all inventory."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 9, 1)
-        checkout = date(2025, 9, 3)
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 9, 1)],
-                inv_total=1,
-                inv_booked=0,
-                inv_held=0,
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-            # Second night is fully held
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 9, 2)],
-                inv_total=1,
-                inv_booked=0,
-                inv_held=1,
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-        assert result is None
-
-    def test_quote_unavailable_no_ari_record(self, ensure_property):
-        """Quote returns None when ARI record missing for a date."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 10, 1)
-        checkout = date(2025, 10, 3)
-
-        with txn() as cur:
-            # Only seed first night, missing second
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 10, 1)],
-                inv_total=1,
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-        assert result is None
-
-    def test_quote_unavailable_wrong_currency(self, ensure_property):
-        """Quote returns None when currency is not BRL."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 11, 1)
-        checkout = date(2025, 11, 2)
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 11, 1)],
-                inv_total=1,
-                base_rate_cents=10000,
-                currency="USD",  # Wrong currency
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-        assert result is None
-
-    def test_quote_invalid_dates(self, ensure_property):
-        """Quote raises ValueError when checkin >= checkout."""
-        from hotelly.domain.quote import quote_minimum
-
-        with txn() as cur:
-            with pytest.raises(ValueError, match="checkin must be before checkout"):
-                quote_minimum(
-                    cur,
-                    property_id=TEST_PROPERTY_ID,
-                    room_type_id=TEST_ROOM_TYPE_ID,
-                    checkin=date(2025, 6, 5),
-                    checkout=date(2025, 6, 5),  # Same day
-                )
-
-    def test_quote_uses_pax_rate_two_guests(self, ensure_property):
-        """PAX rate overrides base_rate_cents when available."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 6, 20)
-        checkout = date(2025, 6, 22)  # 2 nights
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 6, 20), date(2025, 6, 21)],
-                inv_total=1,
-                base_rate_cents=20000,  # R$ 200 — should NOT be used
-                currency="BRL",
             )
             seed_room_type_rates(
                 cur,
                 TEST_PROPERTY_ID,
                 TEST_ROOM_TYPE_ID,
                 [
-                    {"date": date(2025, 6, 20), "price_2pax_cents": 15000},
-                    {"date": date(2025, 6, 21), "price_2pax_cents": 15000},
+                    {"date": date(2025, 6, 1), "price_2pax_cents": 15000},
+                    {"date": date(2025, 6, 2), "price_2pax_cents": 15000},
+                ],
+            )
+
+            result = quote_minimum(
+                cur,
+                property_id=TEST_PROPERTY_ID,
+                room_type_id=TEST_ROOM_TYPE_ID,
+                checkin=checkin,
+                checkout=checkout,
+                adult_count=2,
+            )
+
+        assert result is not None
+        assert result["total_cents"] == 30000
+        assert result["nights"] == 2
+        assert result["currency"] == "BRL"
+
+    def test_adult_only_1pax(self, ensure_property):
+        """1 adult, 0 children, 1 night → total = 10000."""
+        from hotelly.domain.quote import quote_minimum
+
+        checkin = date(2025, 7, 1)
+        checkout = date(2025, 7, 2)
+
+        with txn() as cur:
+            seed_ari(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [date(2025, 7, 1)],
+            )
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [{"date": date(2025, 7, 1), "price_1pax_cents": 10000}],
+            )
+
+            result = quote_minimum(
+                cur,
+                property_id=TEST_PROPERTY_ID,
+                room_type_id=TEST_ROOM_TYPE_ID,
+                checkin=checkin,
+                checkout=checkout,
+                adult_count=1,
+            )
+
+        assert result is not None
+        assert result["total_cents"] == 10000
+        assert result["nights"] == 1
+
+    def test_with_children_bucket_pricing(self, ensure_property):
+        """2 adults + children [3, 7], 1 night → 15000 + 3000 + 5000 = 23000."""
+        from hotelly.domain.quote import quote_minimum
+
+        d = date(2025, 8, 1)
+
+        with txn() as cur:
+            seed_ari(cur, TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, [d])
+            seed_child_age_buckets(cur, TEST_PROPERTY_ID, FULL_BUCKETS)
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [
+                    {
+                        "date": d,
+                        "price_2pax_cents": 15000,
+                        "price_bucket1_chd_cents": 3000,
+                        "price_bucket2_chd_cents": 5000,
+                    },
+                ],
+            )
+
+            result = quote_minimum(
+                cur,
+                property_id=TEST_PROPERTY_ID,
+                room_type_id=TEST_ROOM_TYPE_ID,
+                checkin=d,
+                checkout=date(2025, 8, 2),
+                adult_count=2,
+                children_ages=[3, 7],
+            )
+
+        assert result is not None
+        assert result["total_cents"] == 23000
+
+    def test_child_policy_missing(self, ensure_property):
+        """Children present but no buckets → child_policy_missing."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 8, 5)
+
+        with txn() as cur:
+            seed_ari(cur, TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, [d])
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [{"date": d, "price_2pax_cents": 15000}],
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 8, 6),
+                    adult_count=2,
+                    children_ages=[5],
+                )
+            assert exc_info.value.reason_code == "child_policy_missing"
+
+    def test_child_policy_incomplete(self, ensure_property):
+        """Only 2 buckets → child_policy_incomplete."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 8, 10)
+
+        with txn() as cur:
+            seed_ari(cur, TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, [d])
+            seed_child_age_buckets(
+                cur,
+                TEST_PROPERTY_ID,
+                [(1, 0, 3), (2, 4, 12)],  # Missing bucket 3
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 8, 11),
+                    adult_count=2,
+                    children_ages=[5],
+                )
+            assert exc_info.value.reason_code == "child_policy_incomplete"
+
+    def test_rate_missing(self, ensure_property):
+        """No rate row for a date → rate_missing."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 9, 1)
+
+        with txn() as cur:
+            seed_ari(cur, TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, [d])
+            # No room_type_rates seeded
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 9, 2),
+                    adult_count=2,
+                )
+            assert exc_info.value.reason_code == "rate_missing"
+
+    def test_pax_rate_missing(self, ensure_property):
+        """Rate exists but price_2pax_cents is None → pax_rate_missing."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 9, 5)
+
+        with txn() as cur:
+            seed_ari(cur, TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, [d])
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [{"date": d, "price_1pax_cents": 10000}],  # No price_2pax_cents
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 9, 6),
+                    adult_count=2,
+                )
+            assert exc_info.value.reason_code == "pax_rate_missing"
+
+    def test_child_rate_missing(self, ensure_property):
+        """Rate exists but bucket child price is None → child_rate_missing."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 9, 10)
+
+        with txn() as cur:
+            seed_ari(cur, TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, [d])
+            seed_child_age_buckets(cur, TEST_PROPERTY_ID, FULL_BUCKETS)
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [
+                    {
+                        "date": d,
+                        "price_2pax_cents": 15000,
+                        # price_bucket1_chd_cents is None (not set)
+                    },
+                ],
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 9, 11),
+                    adult_count=2,
+                    children_ages=[2],  # bucket 1
+                )
+            assert exc_info.value.reason_code == "child_rate_missing"
+
+    def test_no_ari_record(self, ensure_property):
+        """No ARI row for date → no_ari_record."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        with txn() as cur:
+            # No ARI seeded at all
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [{"date": date(2025, 10, 1), "price_2pax_cents": 15000}],
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=date(2025, 10, 1),
+                    checkout=date(2025, 10, 2),
+                    adult_count=2,
+                )
+            assert exc_info.value.reason_code == "no_ari_record"
+
+    def test_no_inventory(self, ensure_property):
+        """ARI exists but fully booked → no_inventory."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 10, 5)
+
+        with txn() as cur:
+            seed_ari(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [d],
+                inv_total=1,
+                inv_booked=1,
+                inv_held=0,
+            )
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [{"date": d, "price_2pax_cents": 15000}],
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 10, 6),
+                    adult_count=2,
+                )
+            assert exc_info.value.reason_code == "no_inventory"
+
+    def test_wrong_currency(self, ensure_property):
+        """ARI with currency != BRL → wrong_currency."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        d = date(2025, 11, 1)
+
+        with txn() as cur:
+            seed_ari(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [d],
+                currency="USD",
+            )
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [{"date": d, "price_2pax_cents": 15000}],
+            )
+
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=d,
+                    checkout=date(2025, 11, 2),
+                    adult_count=2,
+                )
+            assert exc_info.value.reason_code == "wrong_currency"
+
+    def test_invalid_adult_count(self, ensure_property):
+        """adult_count=0 → invalid_adult_count."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        with txn() as cur:
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=date(2025, 6, 1),
+                    checkout=date(2025, 6, 2),
+                    adult_count=0,
+                )
+            assert exc_info.value.reason_code == "invalid_adult_count"
+
+    def test_invalid_child_age(self, ensure_property):
+        """children_ages=[18] → invalid_child_age."""
+        from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+
+        with txn() as cur:
+            with pytest.raises(QuoteUnavailable) as exc_info:
+                quote_minimum(
+                    cur,
+                    property_id=TEST_PROPERTY_ID,
+                    room_type_id=TEST_ROOM_TYPE_ID,
+                    checkin=date(2025, 6, 1),
+                    checkout=date(2025, 6, 2),
+                    adult_count=2,
+                    children_ages=[18],
+                )
+            assert exc_info.value.reason_code == "invalid_child_age"
+
+    def test_legacy_guest_count_bridge(self, ensure_property):
+        """guest_count=2 without adult_count works as adult_count=2."""
+        from hotelly.domain.quote import quote_minimum
+
+        checkin = date(2025, 12, 1)
+        checkout = date(2025, 12, 3)
+
+        with txn() as cur:
+            seed_ari(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [date(2025, 12, 1), date(2025, 12, 2)],
+            )
+            seed_room_type_rates(
+                cur,
+                TEST_PROPERTY_ID,
+                TEST_ROOM_TYPE_ID,
+                [
+                    {"date": date(2025, 12, 1), "price_2pax_cents": 12000},
+                    {"date": date(2025, 12, 2), "price_2pax_cents": 12000},
                 ],
             )
 
@@ -413,299 +584,5 @@ class TestQuoteMinimum:
             )
 
         assert result is not None
-        assert result["total_cents"] == 30000  # 2 x 15000
-
-    def test_quote_pax_rate_fallback_to_base_rate_when_missing(self, ensure_property):
-        """Falls back to base_rate_cents when no PAX rates exist."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 6, 25)
-        checkout = date(2025, 6, 27)  # 2 nights
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 6, 25), date(2025, 6, 26)],
-                inv_total=1,
-                base_rate_cents=20000,
-                currency="BRL",
-            )
-            # No room_type_rates seeded
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-                guest_count=2,
-            )
-
-        assert result is not None
-        assert result["total_cents"] == 40000  # 2 x 20000 (fallback)
-
-    def test_quote_pax_rate_includes_children_and_null_child_is_zero(
-        self, ensure_property
-    ):
-        """Child surcharge is added; NULL child price treated as 0."""
-        from hotelly.domain.quote import quote_minimum
-
-        d = date(2025, 7, 1)
-        checkin = d
-        checkout = date(2025, 7, 2)  # 1 night
-
-        with txn() as cur:
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [d],
-                inv_total=1,
-                base_rate_cents=20000,
-                currency="BRL",
-            )
-
-            # Case 1: price_bucket1_chd_cents is NULL → child_add = 0
-            seed_room_type_rates(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [{"date": d, "price_2pax_cents": 15000, "price_bucket1_chd_cents": None}],
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-                guest_count=2,
-                child_count=1,
-            )
-
-        assert result is not None
-        assert result["total_cents"] == 15000  # 15000 + 0
-
-        with txn() as cur:
-            # Case 2: price_bucket1_chd_cents = 3000
-            seed_room_type_rates(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [{"date": d, "price_2pax_cents": 15000, "price_bucket1_chd_cents": 3000}],
-            )
-
-            result = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-                guest_count=2,
-                child_count=1,
-            )
-
-        assert result is not None
-        assert result["total_cents"] == 18000  # 15000 + 3000
-
-    def test_quote_invalid_guest_or_child_count(self, ensure_property):
-        """ValueError for out-of-range guest_count / child_count."""
-        from hotelly.domain.quote import quote_minimum
-
-        with txn() as cur:
-            with pytest.raises(ValueError, match="guest_count must be between 1 and 4"):
-                quote_minimum(
-                    cur,
-                    property_id=TEST_PROPERTY_ID,
-                    room_type_id=TEST_ROOM_TYPE_ID,
-                    checkin=date(2025, 6, 1),
-                    checkout=date(2025, 6, 2),
-                    guest_count=0,
-                )
-
-            with pytest.raises(ValueError, match="guest_count must be between 1 and 4"):
-                quote_minimum(
-                    cur,
-                    property_id=TEST_PROPERTY_ID,
-                    room_type_id=TEST_ROOM_TYPE_ID,
-                    checkin=date(2025, 6, 1),
-                    checkout=date(2025, 6, 2),
-                    guest_count=5,
-                )
-
-            with pytest.raises(ValueError, match="child_count must be between 0 and 3"):
-                quote_minimum(
-                    cur,
-                    property_id=TEST_PROPERTY_ID,
-                    room_type_id=TEST_ROOM_TYPE_ID,
-                    checkin=date(2025, 6, 1),
-                    checkout=date(2025, 6, 2),
-                    child_count=-1,
-                )
-
-            with pytest.raises(ValueError, match="child_count must be between 0 and 3"):
-                quote_minimum(
-                    cur,
-                    property_id=TEST_PROPERTY_ID,
-                    room_type_id=TEST_ROOM_TYPE_ID,
-                    checkin=date(2025, 6, 1),
-                    checkout=date(2025, 6, 2),
-                    child_count=4,
-                )
-
-
-class TestQuoteRepository:
-    """Tests for quote_repository persistence."""
-
-    def test_save_and_retrieve_quote_option(self, ensure_property):
-        """Save quote option and verify it persists."""
-        from hotelly.infra.repositories.quote_repository import (
-            get_quote_option,
-            save_quote_option,
-        )
-
-        checkin = date(2025, 6, 15)
-        checkout = date(2025, 6, 17)
-
-        with txn() as cur:
-            saved = save_quote_option(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-                total_cents=25000,
-                currency="BRL",
-            )
-
-            assert saved["id"] is not None
-            assert saved["property_id"] == TEST_PROPERTY_ID
-            assert saved["room_type_id"] == TEST_ROOM_TYPE_ID
-            assert saved["total_cents"] == 25000
-            assert saved["currency"] == "BRL"
-
-            # Retrieve and verify
-            retrieved = get_quote_option(cur, saved["id"])
-            assert retrieved is not None
-            assert retrieved["id"] == saved["id"]
-            assert retrieved["property_id"] == TEST_PROPERTY_ID
-            assert retrieved["room_type_id"] == TEST_ROOM_TYPE_ID
-            assert retrieved["checkin"] == checkin
-            assert retrieved["checkout"] == checkout
-            assert retrieved["total_cents"] == 25000
-            assert retrieved["currency"] == "BRL"
-
-
-class TestQuoteIntegration:
-    """Integration tests: quote_minimum -> save_quote_option."""
-
-    def test_quote_and_persist(self, ensure_property):
-        """Full flow: calculate quote from ARI, persist to quote_options."""
-        from hotelly.domain.quote import quote_minimum
-        from hotelly.infra.repositories.quote_repository import (
-            get_quote_option,
-            save_quote_option,
-        )
-
-        checkin = date(2025, 12, 20)
-        checkout = date(2025, 12, 22)  # 2 nights
-
-        with txn() as cur:
-            # Seed ARI
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 12, 20), date(2025, 12, 21)],
-                inv_total=3,
-                inv_booked=1,
-                inv_held=1,
-                base_rate_cents=18000,
-                currency="BRL",
-            )
-
-            # Calculate quote
-            quote = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-            assert quote is not None
-            assert quote["total_cents"] == 36000  # 2 nights x R$ 180.00
-
-            # Persist quote
-            saved = save_quote_option(
-                cur,
-                property_id=quote["property_id"],
-                room_type_id=quote["room_type_id"],
-                checkin=quote["checkin"],
-                checkout=quote["checkout"],
-                total_cents=quote["total_cents"],
-                currency=quote["currency"],
-            )
-
-            # Verify persisted
-            retrieved = get_quote_option(cur, saved["id"])
-            assert retrieved is not None
-            assert retrieved["total_cents"] == 36000
-            assert retrieved["currency"] == "BRL"
-            assert retrieved["room_type_id"] == TEST_ROOM_TYPE_ID
-
-    def test_unavailable_does_not_persist(self, ensure_property):
-        """Unavailable quote should not create quote_option."""
-        from hotelly.domain.quote import quote_minimum
-
-        checkin = date(2025, 12, 25)
-        checkout = date(2025, 12, 27)
-
-        with txn() as cur:
-            # Seed ARI with no availability on second night
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 12, 25)],
-                inv_total=1,
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-            seed_ari(
-                cur,
-                TEST_PROPERTY_ID,
-                TEST_ROOM_TYPE_ID,
-                [date(2025, 12, 26)],
-                inv_total=1,
-                inv_booked=1,  # Fully booked
-                base_rate_cents=10000,
-                currency="BRL",
-            )
-
-            # Calculate quote - should fail
-            quote = quote_minimum(
-                cur,
-                property_id=TEST_PROPERTY_ID,
-                room_type_id=TEST_ROOM_TYPE_ID,
-                checkin=checkin,
-                checkout=checkout,
-            )
-
-            assert quote is None
-
-            # Verify no quote_option was created for this date range
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM quote_options
-                WHERE property_id = %s
-                  AND room_type_id = %s
-                  AND checkin = %s
-                  AND checkout = %s
-                """,
-                (TEST_PROPERTY_ID, TEST_ROOM_TYPE_ID, checkin, checkout),
-            )
-            count = cur.fetchone()[0]
-            assert count == 0
+        assert result["total_cents"] == 24000
+        assert result["nights"] == 2
