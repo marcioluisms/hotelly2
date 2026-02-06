@@ -10,7 +10,7 @@ Tests the full flow:
 
 import logging
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -159,8 +159,11 @@ def webhook_client():
 @pytest.fixture
 def worker_client():
     """Create test client for worker (worker role)."""
-    app = create_app(role="worker")
-    return TestClient(app)
+    with patch(
+        "hotelly.api.routes.tasks_whatsapp.verify_task_auth", return_value=True
+    ):
+        app = create_app(role="worker")
+        yield TestClient(app)
 
 
 @pytest.fixture

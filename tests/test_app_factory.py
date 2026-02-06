@@ -1,5 +1,7 @@
 """Tests for app factory and role-based routing."""
 
+from unittest.mock import patch
+
 from fastapi.testclient import TestClient
 
 from hotelly.api.factory import create_app
@@ -60,12 +62,15 @@ class TestWorkerRole:
 
     def test_tasks_whatsapp_mounted(self):
         """Tasks whatsapp handle-message should be available in worker."""
-        app = create_app(role="worker")
-        client = TestClient(app)
-        # Empty payload returns 400 (missing fields), not 404
-        response = client.post("/tasks/whatsapp/handle-message", json={})
-        assert response.status_code != 404
-        assert response.status_code == 400  # missing required fields
+        with patch(
+            "hotelly.api.routes.tasks_whatsapp.verify_task_auth", return_value=True
+        ):
+            app = create_app(role="worker")
+            client = TestClient(app)
+            # Empty payload returns 400 (missing fields), not 404
+            response = client.post("/tasks/whatsapp/handle-message", json={})
+            assert response.status_code != 404
+            assert response.status_code == 400  # missing required fields
 
 
 class TestCorrelationId:

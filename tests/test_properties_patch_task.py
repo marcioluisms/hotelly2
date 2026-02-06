@@ -176,7 +176,7 @@ class TestPatchPropertyNoRole:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property", return_value=None
+            "hotelly.api.rbac._get_user_role_for_property", return_value=None
         ):
             with patch.dict("os.environ", oidc_env):
                 app = create_app(role="public")
@@ -198,7 +198,7 @@ class TestPatchPropertyInsufficientRole:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="viewer",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -217,7 +217,7 @@ class TestPatchPropertyInsufficientRole:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="staff",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -245,7 +245,7 @@ class TestPatchPropertySuccess:
         mock_tasks_client.enqueue_http.return_value = True
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch(
@@ -284,7 +284,7 @@ class TestPatchPropertySuccess:
         mock_tasks_client.enqueue_http.return_value = True
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="owner",
         ):
             with patch(
@@ -313,7 +313,7 @@ class TestPatchPropertySuccess:
         mock_tasks_client.enqueue_http.return_value = True
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="owner",
         ):
             with patch(
@@ -363,7 +363,7 @@ class TestPatchPropertyIdempotency:
         mock_tasks_client.enqueue_http.side_effect = capture_enqueue
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch(
@@ -416,7 +416,7 @@ class TestPatchPropertyIdempotency:
         mock_tasks_client.enqueue_http.side_effect = capture_enqueue
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch(
@@ -453,7 +453,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -471,7 +471,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -491,7 +491,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -509,7 +509,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -527,7 +527,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):

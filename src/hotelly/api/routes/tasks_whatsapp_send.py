@@ -4,8 +4,9 @@ import json
 
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.infra.contact_refs import get_remote_jid
 from hotelly.infra.db import txn
 from hotelly.infra.property_settings import get_whatsapp_config
@@ -74,7 +75,7 @@ class SendMessageRequest(BaseModel):
 
 
 @router.post("/send-message")
-async def send_message(req: SendMessageRequest) -> dict:
+async def send_message(request: Request, req: SendMessageRequest) -> dict:
     """Send WhatsApp message via Evolution API.
 
     Security (ADR-006):
@@ -83,12 +84,21 @@ async def send_message(req: SendMessageRequest) -> dict:
     - Returns 404 if contact_ref not found/expired
 
     Args:
+        request: FastAPI request object (for auth).
         req: Request with property_id, contact_hash, and text.
 
     Returns:
         {"ok": true} on success.
     """
     correlation_id = req.correlation_id or get_correlation_id()
+
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
+        logger.warning(
+            "task auth failed",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Log only safe metadata - NEVER log contact_hash or text
     log_ctx = safe_log_context(
@@ -147,7 +157,7 @@ class SendResponseRequest(BaseModel):
 
 
 @router.post("/send-response")
-async def send_response(req: SendResponseRequest) -> dict:
+async def send_response(request: Request, req: SendResponseRequest) -> dict:
     """Send response via Evolution API.
 
     Resolves remote_jid from vault using contact_hash from outbox_events.
@@ -158,12 +168,21 @@ async def send_response(req: SendResponseRequest) -> dict:
     - Discarded after send
 
     Args:
+        request: FastAPI request object (for auth).
         req: Request with property_id and outbox_event_id.
 
     Returns:
         {"ok": True} on success, {"ok": False, "error": "..."} on failure.
     """
     correlation_id = req.correlation_id or get_correlation_id()
+
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
+        logger.warning(
+            "task auth failed",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Log safe metadata only - NEVER log contact_hash, remote_jid, or text
     log_ctx = safe_log_context(

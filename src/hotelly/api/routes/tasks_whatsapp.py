@@ -14,8 +14,9 @@ from datetime import date
 from typing import Any, TYPE_CHECKING
 
 from psycopg2.extensions import cursor as PgCursor
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.domain.conversations import upsert_conversation
 from hotelly.domain.holds import UnavailableError as HoldUnavailableError
 from hotelly.domain.holds import create_hold
@@ -86,6 +87,14 @@ async def handle_message(request: Request) -> Response:
     - entities: Extracted entities dict (optional)
     """
     correlation_id = get_correlation_id()
+
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
+        logger.warning(
+            "task auth failed",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         payload: dict[str, Any] = await request.json()

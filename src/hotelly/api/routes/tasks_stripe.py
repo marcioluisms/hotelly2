@@ -4,8 +4,9 @@ import os
 from typing import Any
 
 import stripe
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.domain.convert_hold import convert_hold
 from hotelly.infra.db import txn
 from hotelly.infra.repositories.payments_repository import (
@@ -95,6 +96,14 @@ async def handle_event(request: Request) -> Response:
     - correlation_id: Optional correlation ID
     """
     correlation_id = get_correlation_id()
+
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
+        logger.warning(
+            "task auth failed",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         payload: dict[str, Any] = await request.json()

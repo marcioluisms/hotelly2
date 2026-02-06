@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from fastapi import Depends, HTTPException, Query
+from fastapi import Depends, HTTPException, Path, Query
 
 from hotelly.api.auth import CurrentUser, get_current_user
 
@@ -79,6 +79,42 @@ def require_property_role(min_role: str) -> Callable[..., PropertyRoleContext]:
 
     def dependency(
         property_id: str = Query(..., description="Property ID"),
+        user: CurrentUser = Depends(get_current_user),
+    ) -> PropertyRoleContext:
+        role = _get_user_role_for_property(user.id, property_id)
+
+        if role is None:
+            raise HTTPException(status_code=403, detail="No access to property")
+
+        user_level = _role_level(role)
+        if user_level < min_level:
+            raise HTTPException(status_code=403, detail="Insufficient role")
+
+        return PropertyRoleContext(user=user, property_id=property_id, role=role)
+
+    return dependency
+
+
+def require_property_role_path(min_role: str) -> Callable[..., PropertyRoleContext]:
+    """Like require_property_role but reads property_id from path parameter.
+
+    Args:
+        min_role: Minimum required role (viewer, staff, manager, owner).
+
+    Returns:
+        FastAPI dependency function.
+
+    Usage:
+        @router.patch("/{property_id}")
+        def endpoint(ctx: PropertyRoleContext = Depends(require_property_role_path("manager"))):
+            ...
+    """
+    min_level = _role_level(min_role)
+    if min_level < 0:
+        raise ValueError(f"Invalid role: {min_role}")
+
+    def dependency(
+        property_id: str = Path(..., description="Property ID"),
         user: CurrentUser = Depends(get_current_user),
     ) -> PropertyRoleContext:
         role = _get_user_role_for_property(user.id, property_id)
