@@ -163,9 +163,22 @@ async def meta_webhook(
         )
         return Response(status_code=200, content="ok")
 
-    # 2. Verify signature (if META_APP_SECRET configured)
+    # 2. Verify signature (fail-closed: required unless local dev)
     app_secret = os.environ.get("META_APP_SECRET", "")
-    if app_secret:
+    if not app_secret:
+        oidc_audience = os.environ.get("TASKS_OIDC_AUDIENCE", "")
+        if oidc_audience == "hotelly-tasks-local":
+            logger.warning(
+                "META_APP_SECRET not set - skipping signature verification (local dev)",
+                extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+            )
+        else:
+            logger.error(
+                "META_APP_SECRET not configured - rejecting webhook (fail-closed)",
+                extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+            )
+            return Response(status_code=200, content="ok")
+    else:
         try:
             verify_signature(body_bytes, x_hub_signature_256 or "", app_secret)
         except SignatureVerificationError as e:
