@@ -10,11 +10,10 @@ import hashlib
 import json
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from hotelly.api.auth import CurrentUser, get_current_user
-from hotelly.api.rbac import _get_user_role_for_property, _role_level
+from hotelly.api.rbac import PropertyRoleContext, require_property_role_path
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
@@ -71,9 +70,8 @@ class PropertyPatchResponse(BaseModel):
 
 @router.patch("/{property_id}", status_code=202)
 def patch_property(
-    property_id: str = Path(..., description="Property ID to update"),
-    body: PropertyPatchRequest = ...,
-    user: CurrentUser = Depends(get_current_user),
+    body: PropertyPatchRequest,
+    ctx: PropertyRoleContext = Depends(require_property_role_path("manager")),
 ) -> PropertyPatchResponse:
     """Update a property (enqueues task, returns 202).
 
@@ -81,9 +79,8 @@ def patch_property(
     Does NOT write to DB directly; enqueues task to worker.
 
     Args:
-        property_id: Property ID from path.
         body: Fields to update.
-        user: Current authenticated user.
+        ctx: RBAC context with property_id and authenticated user.
 
     Returns:
         202 response with status=enqueued.
@@ -92,17 +89,9 @@ def patch_property(
         HTTPException 403: If user lacks manager/owner role.
         HTTPException 422: If validation fails.
     """
+    property_id = ctx.property_id
+    user = ctx.user
     correlation_id = get_correlation_id()
-
-    # Check RBAC: user must have manager or owner role
-    role = _get_user_role_for_property(user.id, property_id)
-    if role is None:
-        raise HTTPException(status_code=403, detail="No access to property")
-
-    min_level = _role_level("manager")
-    user_level = _role_level(role)
-    if user_level < min_level:
-        raise HTTPException(status_code=403, detail="Insufficient role")
 
     # Extract non-None updates
     updates = body.model_dump(exclude_none=True)

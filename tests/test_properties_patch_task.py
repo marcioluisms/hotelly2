@@ -176,7 +176,7 @@ class TestPatchPropertyNoRole:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property", return_value=None
+            "hotelly.api.rbac._get_user_role_for_property", return_value=None
         ):
             with patch.dict("os.environ", oidc_env):
                 app = create_app(role="public")
@@ -198,7 +198,7 @@ class TestPatchPropertyInsufficientRole:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="viewer",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -217,7 +217,7 @@ class TestPatchPropertyInsufficientRole:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="staff",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -245,7 +245,7 @@ class TestPatchPropertySuccess:
         mock_tasks_client.enqueue_http.return_value = True
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch(
@@ -284,7 +284,7 @@ class TestPatchPropertySuccess:
         mock_tasks_client.enqueue_http.return_value = True
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="owner",
         ):
             with patch(
@@ -313,7 +313,7 @@ class TestPatchPropertySuccess:
         mock_tasks_client.enqueue_http.return_value = True
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="owner",
         ):
             with patch(
@@ -363,7 +363,7 @@ class TestPatchPropertyIdempotency:
         mock_tasks_client.enqueue_http.side_effect = capture_enqueue
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch(
@@ -416,7 +416,7 @@ class TestPatchPropertyIdempotency:
         mock_tasks_client.enqueue_http.side_effect = capture_enqueue
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch(
@@ -453,7 +453,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -471,7 +471,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -491,7 +491,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -509,7 +509,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -527,7 +527,7 @@ class TestPatchPropertyValidation:
         token = _create_token(private_key)
 
         with patch(
-            "hotelly.api.routes.properties_write._get_user_role_for_property",
+            "hotelly.api.rbac._get_user_role_for_property",
             return_value="manager",
         ):
             with patch.dict("os.environ", oidc_env):
@@ -590,7 +590,7 @@ class TestTaskUpdateOIDCAuth:
     def test_invalid_oidc_token_returns_401(self):
         """Request with invalid OIDC token should return 401."""
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=False
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=False
         ):
             app = create_app(role="worker")
             client = TestClient(app)
@@ -611,7 +611,7 @@ class TestTaskUpdateOIDCAuth:
         mock_cursor.rowcount = 1
 
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             with patch("hotelly.api.routes.tasks_properties.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
@@ -640,7 +640,7 @@ class TestTaskUpdateSuccess:
         mock_cursor.rowcount = 1
 
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             with patch("hotelly.api.routes.tasks_properties.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
@@ -673,7 +673,7 @@ class TestTaskUpdateSuccess:
         mock_cursor.rowcount = 1
 
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             with patch("hotelly.api.routes.tasks_properties.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
@@ -697,7 +697,7 @@ class TestTaskUpdateSuccess:
         mock_cursor.rowcount = 1
 
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             with patch("hotelly.api.routes.tasks_properties.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
@@ -730,7 +730,7 @@ class TestTaskUpdateNotFound:
         mock_cursor.rowcount = 0  # No rows updated
 
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             with patch("hotelly.api.routes.tasks_properties.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
@@ -755,7 +755,7 @@ class TestTaskUpdateValidation:
 
     def test_missing_property_id(self):
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             app = create_app(role="worker")
             client = TestClient(app)
@@ -771,7 +771,7 @@ class TestTaskUpdateValidation:
 
     def test_missing_updates(self):
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             app = create_app(role="worker")
             client = TestClient(app)
@@ -787,7 +787,7 @@ class TestTaskUpdateValidation:
 
     def test_invalid_json(self):
         with patch(
-            "hotelly.api.routes.tasks_properties.verify_task_oidc", return_value=True
+            "hotelly.api.routes.tasks_properties.verify_task_auth", return_value=True
         ):
             app = create_app(role="worker")
             client = TestClient(app)
@@ -824,7 +824,7 @@ class TestOIDCVerificationFailClosed:
 
     def test_missing_audience_env_returns_false(self, no_tasks_oidc_env):
         """When TASKS_OIDC_AUDIENCE is not set, should return False (fail closed)."""
-        from hotelly.api.routes.tasks_properties import verify_task_oidc
+        from hotelly.api.task_auth import verify_task_oidc
 
         result = verify_task_oidc("some-token")
         assert result is False

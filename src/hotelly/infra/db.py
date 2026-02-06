@@ -6,10 +6,12 @@ Provides:
 - execute(): Parameterized query execution
 - fetchone/fetchall: Query helpers
 - for_update(): SELECT ... FOR UPDATE helper
+- fetch_room_type_rates_by_date(): PAX pricing lookup
 """
 
 import os
 from contextlib import contextmanager
+from datetime import date
 from typing import Any, Iterator, Sequence
 
 import psycopg2
@@ -156,3 +158,58 @@ def for_update(
     full_query = query.rstrip().rstrip(";") + suffix
     cur.execute(full_query, params)
     return cur.fetchone()
+
+
+_PAX_COLS = (
+    "price_1pax_cents",
+    "price_2pax_cents",
+    "price_3pax_cents",
+    "price_4pax_cents",
+    "price_1chd_cents",
+    "price_2chd_cents",
+    "price_3chd_cents",
+)
+
+
+def fetch_room_type_rates_by_date(
+    cur: PgCursor,
+    *,
+    property_id: str,
+    room_type_id: str,
+    start: date,
+    end: date,
+) -> dict[date, dict[str, int | None]]:
+    """Fetch PAX rates for a room type across a date range.
+
+    Args:
+        cur: Database cursor (within transaction).
+        property_id: Property identifier.
+        room_type_id: Room type identifier.
+        start: Start date (inclusive).
+        end: End date (exclusive).
+
+    Returns:
+        Dict mapping each date to its PAX pricing columns.
+        Dates without a row are absent from the dict.
+    """
+    cur.execute(
+        """
+        SELECT date,
+               price_1pax_cents, price_2pax_cents,
+               price_3pax_cents, price_4pax_cents,
+               price_1chd_cents, price_2chd_cents, price_3chd_cents
+        FROM room_type_rates
+        WHERE property_id = %s
+          AND room_type_id = %s
+          AND date >= %s
+          AND date < %s
+        ORDER BY date
+        """,
+        (property_id, room_type_id, start, end),
+    )
+    rows = cur.fetchall()
+
+    result: dict[date, dict[str, int | None]] = {}
+    for row in rows:
+        result[row[0]] = {col: row[i + 1] for i, col in enumerate(_PAX_COLS)}
+    return result

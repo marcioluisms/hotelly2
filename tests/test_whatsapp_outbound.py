@@ -73,6 +73,15 @@ def mock_evolution_env(monkeypatch):
     monkeypatch.setenv("EVOLUTION_API_KEY", "test-api-key")
 
 
+@pytest.fixture(autouse=True)
+def _mock_task_auth():
+    """Auto-mock task auth for all tests (auth tested separately)."""
+    with patch(
+        "hotelly.api.routes.tasks_whatsapp_send.verify_task_auth", return_value=True
+    ):
+        yield
+
+
 class TestNoPiiLeakage:
     """Tests that verify NO PII (to_ref, text) appears in logs."""
 

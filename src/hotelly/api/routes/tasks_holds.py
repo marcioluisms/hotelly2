@@ -2,9 +2,10 @@
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.domain.expire_hold import InventoryConsistencyError, expire_hold
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
@@ -32,6 +33,14 @@ async def handle_expire(request: Request) -> JSONResponse:
     - correlation_id: Optional correlation ID
     """
     correlation_id = get_correlation_id()
+
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
+        logger.warning(
+            "task auth failed",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         payload: dict[str, Any] = await request.json()

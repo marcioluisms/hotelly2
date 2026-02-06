@@ -17,6 +17,13 @@ from fastapi.testclient import TestClient
 from hotelly.api.factory import create_app
 
 
+@pytest.fixture(autouse=True)
+def _mock_task_auth():
+    """Auto-mock task auth for all tests (auth tested separately)."""
+    with patch("hotelly.api.routes.tasks_stripe.verify_task_auth", return_value=True):
+        yield
+
+
 @pytest.fixture
 def worker_client():
     """Create a test client for the worker app."""

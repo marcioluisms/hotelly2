@@ -4,6 +4,7 @@ S05: Tests orchestration flow (zero PII).
 """
 
 import os
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
@@ -37,6 +38,13 @@ def create_test_app() -> FastAPI:
     app = FastAPI()
     app.include_router(router)
     return app
+
+
+@pytest.fixture(autouse=True)
+def _mock_task_auth():
+    """Auto-mock task auth for all tests (auth tested separately)."""
+    with patch("hotelly.api.routes.tasks_whatsapp.verify_task_auth", return_value=True):
+        yield
 
 
 @pytest.fixture

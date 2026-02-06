@@ -14,8 +14,9 @@ from datetime import date
 from typing import Any, TYPE_CHECKING
 
 from psycopg2.extensions import cursor as PgCursor
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.domain.conversations import upsert_conversation
 from hotelly.domain.holds import UnavailableError as HoldUnavailableError
 from hotelly.domain.holds import create_hold
@@ -57,6 +58,7 @@ def _get_stripe_client() -> StripeClient:
     global _stripe_client
     if _stripe_client is None:
         from hotelly.stripe.client import StripeClient
+
         _stripe_client = StripeClient()
     return _stripe_client
 
@@ -85,6 +87,14 @@ async def handle_message(request: Request) -> Response:
     - entities: Extracted entities dict (optional)
     """
     correlation_id = get_correlation_id()
+
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
+        logger.warning(
+            "task auth failed",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         payload: dict[str, Any] = await request.json()
@@ -126,7 +136,11 @@ async def handle_message(request: Request) -> Response:
             "extra_fields": safe_log_context(
                 correlationId=correlation_id,
                 task_id_prefix=task_id[:16] if len(task_id) >= 16 else task_id,
-                message_id_prefix=message_id[:16] if len(message_id) >= 16 else message_id if message_id else None,
+                message_id_prefix=message_id[:16]
+                if len(message_id) >= 16
+                else message_id
+                if message_id
+                else None,
                 property_id=property_id,
                 intent=intent,
             )
@@ -156,7 +170,9 @@ async def handle_message(request: Request) -> Response:
                     extra={
                         "extra_fields": safe_log_context(
                             correlationId=correlation_id,
-                            task_id_prefix=task_id[:16] if len(task_id) >= 16 else task_id,
+                            task_id_prefix=task_id[:16]
+                            if len(task_id) >= 16
+                            else task_id,
                         )
                     },
                 )
@@ -352,6 +368,7 @@ def _try_quote_hold_checkout(
         room_type_id=room_type_id,
         checkin=checkin,
         checkout=checkout,
+        guest_count=guest_count,
     )
 
     if quote is None:
