@@ -1,7 +1,7 @@
 """Worker routes for property update task handling.
 
 V2-S15: POST /tasks/properties/update - executes property UPDATE in DB.
-Only accepts requests with valid Cloud Tasks OIDC token (Authorization: Bearer).
+Only accepts requests with valid task authentication (OIDC or internal secret).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from hotelly.api.task_auth import extract_bearer_token, verify_task_oidc
+from hotelly.api.task_auth import verify_task_auth
 from hotelly.infra.db import txn
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
@@ -82,18 +82,10 @@ async def update_property_task(request: Request) -> Response:
     """
     correlation_id = get_correlation_id()
 
-    # Verify OIDC task authentication (Authorization: Bearer required)
-    token = extract_bearer_token(request)
-    if token is None:
+    # Verify task authentication (OIDC or internal secret in local dev)
+    if not verify_task_auth(request):
         logger.warning(
-            "missing or malformed Authorization header",
-            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
-        )
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not verify_task_oidc(token):
-        logger.warning(
-            "OIDC token validation failed",
+            "task auth failed",
             extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
         )
         raise HTTPException(status_code=401, detail="Unauthorized")

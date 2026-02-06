@@ -434,7 +434,7 @@ class TestWorkerTaskSuccess:
         mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = (123,)  # outbox_id
 
-        with patch("hotelly.api.routes.tasks_conversations.verify_task_oidc", return_value=True):
+        with patch("hotelly.api.routes.tasks_conversations.verify_task_auth", return_value=True):
             with patch("hotelly.api.routes.tasks_conversations.txn") as mock_txn:
                 mock_txn.return_value.__enter__.return_value = mock_cursor
                 response = client.post(

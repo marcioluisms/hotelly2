@@ -187,6 +187,83 @@ class TestTasksHoldsExpireAuth:
             assert response.status_code == 400
 
 
+class TestTasksPaymentsResendLinkAuth:
+    """Auth tests for POST /tasks/payments/resend-link."""
+
+    def test_no_auth_returns_401(self, worker_client):
+        response = worker_client.post(
+            "/tasks/payments/resend-link",
+            json={
+                "property_id": "p1",
+                "payment_id": "pay1",
+                "user_id": "u1",
+            },
+        )
+        assert response.status_code == 401
+
+    def test_with_valid_auth_succeeds(self, worker_client):
+        with patch(
+            "hotelly.api.routes.tasks_payments.verify_task_auth", return_value=True
+        ):
+            response = worker_client.post(
+                "/tasks/payments/resend-link",
+                json={},  # Missing fields -> 400, but not 401
+            )
+            assert response.status_code == 400
+
+
+class TestTasksConversationsSendMessageAuth:
+    """Auth tests for POST /tasks/conversations/send-message."""
+
+    def test_no_auth_returns_401(self, worker_client):
+        response = worker_client.post(
+            "/tasks/conversations/send-message",
+            json={
+                "property_id": "p1",
+                "conversation_id": "c1",
+                "user_id": "u1",
+            },
+        )
+        assert response.status_code == 401
+
+    def test_with_valid_auth_succeeds(self, worker_client):
+        with patch(
+            "hotelly.api.routes.tasks_conversations.verify_task_auth",
+            return_value=True,
+        ):
+            response = worker_client.post(
+                "/tasks/conversations/send-message",
+                json={},  # Missing fields -> 400, but not 401
+            )
+            assert response.status_code == 400
+
+
+class TestTasksPropertiesUpdateAuth:
+    """Auth tests for POST /tasks/properties/update."""
+
+    def test_no_auth_returns_401(self, worker_client):
+        response = worker_client.post(
+            "/tasks/properties/update",
+            json={
+                "property_id": "p1",
+                "user_id": "u1",
+                "updates": {"name": "New"},
+            },
+        )
+        assert response.status_code == 401
+
+    def test_with_valid_auth_succeeds(self, worker_client):
+        with patch(
+            "hotelly.api.routes.tasks_properties.verify_task_auth",
+            return_value=True,
+        ):
+            response = worker_client.post(
+                "/tasks/properties/update",
+                json={},  # Missing fields -> 400, but not 401
+            )
+            assert response.status_code == 400
+
+
 class TestPatchPropertyRBAC:
     """Tests that PATCH /properties/{id} uses require_property_role_path."""
 
