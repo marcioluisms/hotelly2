@@ -51,6 +51,24 @@ VALID_META_PAYLOAD = {
 }
 
 TEST_PROPERTY_ID = "test-property-meta-webhook"
+_TEST_APP_SECRET = "test-meta-secret"
+
+
+def _signed_post(client, payload, extra_headers=None):
+    """POST /webhooks/whatsapp/meta with valid HMAC signature."""
+    payload_bytes = json.dumps(payload).encode()
+    sig = hmac.new(
+        _TEST_APP_SECRET.encode(), payload_bytes, hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": f"sha256={sig}",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return client.post(
+        "/webhooks/whatsapp/meta", content=payload_bytes, headers=headers
+    )
 
 
 @pytest.fixture
@@ -102,6 +120,8 @@ def mock_secrets(monkeypatch):
     monkeypatch.setenv("CONTACT_REFS_KEY", "0" * 64)
     # Meta verify token
     monkeypatch.setenv("META_VERIFY_TOKEN", "test_verify_token")
+    # Meta app secret for HMAC signature verification (fail-closed)
+    monkeypatch.setenv("META_APP_SECRET", _TEST_APP_SECRET)
 
 
 @pytest.fixture
@@ -177,10 +197,8 @@ class TestMetaWebhookPost:
         self, client, ensure_property, mock_tasks_client, mock_secrets
     ):
         """Test: Valid POST creates receipt and enqueues task."""
-        response = client.post(
-            "/webhooks/whatsapp/meta",
-            json=VALID_META_PAYLOAD,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        response = _signed_post(
+            client, VALID_META_PAYLOAD, {"X-Property-Id": TEST_PROPERTY_ID}
         )
 
         assert response.status_code == 200
@@ -208,10 +226,8 @@ class TestMetaWebhookPost:
     ):
         """Test: Duplicate POST returns 200, no duplicate receipt, no second enqueue."""
         # First request
-        response1 = client.post(
-            "/webhooks/whatsapp/meta",
-            json=VALID_META_PAYLOAD,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        response1 = _signed_post(
+            client, VALID_META_PAYLOAD, {"X-Property-Id": TEST_PROPERTY_ID}
         )
         assert response1.status_code == 200
         assert response1.text == "ok"
@@ -220,10 +236,8 @@ class TestMetaWebhookPost:
         mock_tasks_client.reset_mock()
 
         # Second request with same message_id
-        response2 = client.post(
-            "/webhooks/whatsapp/meta",
-            json=VALID_META_PAYLOAD,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        response2 = _signed_post(
+            client, VALID_META_PAYLOAD, {"X-Property-Id": TEST_PROPERTY_ID}
         )
         assert response2.status_code == 200
         assert response2.text == "duplicate"
@@ -282,10 +296,8 @@ class TestMetaWebhookPost:
                 ],
             }
 
-            response = client.post(
-                "/webhooks/whatsapp/meta",
-                json=payload,
-                headers={"X-Property-Id": TEST_PROPERTY_ID},
+            response = _signed_post(
+                client, payload, {"X-Property-Id": TEST_PROPERTY_ID}
             )
 
             # Meta requires 200 even on failure
@@ -298,11 +310,8 @@ class TestMetaWebhookPost:
         self, client, ensure_property, mock_tasks_client, mock_secrets
     ):
         """Test: Property resolved by phone_number_id lookup (no header)."""
-        response = client.post(
-            "/webhooks/whatsapp/meta",
-            json=VALID_META_PAYLOAD,
-            # No X-Property-Id header - should resolve via phone_number_id
-        )
+        # No X-Property-Id header - should resolve via phone_number_id
+        response = _signed_post(client, VALID_META_PAYLOAD)
 
         assert response.status_code == 200
         assert response.text == "ok"
@@ -332,7 +341,7 @@ class TestMetaWebhookPost:
             ],
         }
 
-        response = client.post("/webhooks/whatsapp/meta", json=payload)
+        response = _signed_post(client, payload)
 
         assert response.status_code == 200
 
@@ -417,10 +426,8 @@ class TestMetaWebhookPiiSafety:
             ],
         }
 
-        response = client.post(
-            "/webhooks/whatsapp/meta",
-            json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        response = _signed_post(
+            client, payload, {"X-Property-Id": TEST_PROPERTY_ID}
         )
 
         assert response.status_code == 200
@@ -469,10 +476,8 @@ class TestMetaWebhookPiiSafety:
             ],
         }
 
-        response = client.post(
-            "/webhooks/whatsapp/meta",
-            json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        response = _signed_post(
+            client, payload, {"X-Property-Id": TEST_PROPERTY_ID}
         )
 
         assert response.status_code == 200
@@ -528,10 +533,8 @@ class TestMetaWebhookPiiSafety:
             ],
         }
 
-        response = client.post(
-            "/webhooks/whatsapp/meta",
-            json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        response = _signed_post(
+            client, payload, {"X-Property-Id": TEST_PROPERTY_ID}
         )
 
         assert response.status_code == 200
