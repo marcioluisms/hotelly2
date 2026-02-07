@@ -127,6 +127,7 @@ class TestHoldEnqueue:
                 currency="BRL",
                 create_idempotency_key="test-enqueue-001",
                 expires_at=expires_at,
+                adult_count=2,
             )
 
             assert result["created"] is True
@@ -199,6 +200,7 @@ class TestHoldEnqueue:
                 total_cents=20000,
                 currency="BRL",
                 create_idempotency_key="test-enqueue-replay-001",
+                adult_count=2,
             )
 
             assert result1["created"] is True
@@ -213,6 +215,7 @@ class TestHoldEnqueue:
                 total_cents=20000,
                 currency="BRL",
                 create_idempotency_key="test-enqueue-replay-001",  # Same key
+                adult_count=2,
             )
 
             assert result2["created"] is False

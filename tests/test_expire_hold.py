@@ -148,6 +148,7 @@ class TestExpireHold:
             currency="BRL",
             create_idempotency_key="test-expire-001",
             expires_at=past_expires,
+            adult_count=2,
         )
 
         hold_id = result["id"]
@@ -254,6 +255,7 @@ class TestExpireHold:
             currency="BRL",
             create_idempotency_key="test-expire-idem-001",
             expires_at=past_expires,
+            adult_count=2,
         )
 
         hold_id = result["id"]
@@ -354,6 +356,7 @@ class TestExpireHold:
             currency="BRL",
             create_idempotency_key="test-expire-future-001",
             expires_at=future_expires,
+            adult_count=2,
         )
 
         hold_id = result["id"]
@@ -476,6 +479,7 @@ class TestExpireHold:
             currency="BRL",
             create_idempotency_key="test-expire-retry-001",
             expires_at=future_expires,
+            adult_count=2,
         )
 
         hold_id = result["id"]
