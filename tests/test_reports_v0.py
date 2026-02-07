@@ -97,14 +97,24 @@ def oidc_env():
 
 @pytest.fixture
 def mock_jwks_fetch(jwks):
-    """Fixture that mocks JWKS fetch."""
-    with patch("hotelly.api.auth._fetch_jwks") as mock:
-        mock.return_value = jwks
-        import hotelly.api.auth as auth_module
-
-        auth_module._jwks_cache = None
-        auth_module._jwks_cache_time = 0
-        yield mock
+    """Fixture that monkey-patches both _get_jwks and _fetch_jwks — fully thread-safe."""
+    import hotelly.api.auth as auth_module
+    import time
+    # Save originals
+    original_get = auth_module._get_jwks
+    original_fetch = auth_module._fetch_jwks
+    # Monkey-patch both at module level (visible to all threads)
+    auth_module._get_jwks = lambda url, force_refresh=False: jwks
+    auth_module._fetch_jwks = lambda url: jwks
+    # Also set cache for any code that reads it directly
+    auth_module._jwks_cache = jwks
+    auth_module._jwks_cache_time = time.time() + 9999
+    yield
+    # Restore
+    auth_module._get_jwks = original_get
+    auth_module._fetch_jwks = original_fetch
+    auth_module._jwks_cache = None
+    auth_module._jwks_cache_time = 0
 
 
 @pytest.fixture

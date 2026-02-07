@@ -96,14 +96,24 @@ def oidc_env():
 
 @pytest.fixture
 def mock_jwks_fetch(jwks):
-    """Fixture that mocks JWKS fetch."""
-    with patch("hotelly.api.auth._fetch_jwks") as mock:
-        mock.return_value = jwks
-        import hotelly.api.auth as auth_module
-
-        auth_module._jwks_cache = None
-        auth_module._jwks_cache_time = 0
-        yield mock
+    """Fixture that monkey-patches both _get_jwks and _fetch_jwks — fully thread-safe."""
+    import hotelly.api.auth as auth_module
+    import time
+    # Save originals
+    original_get = auth_module._get_jwks
+    original_fetch = auth_module._fetch_jwks
+    # Monkey-patch both at module level (visible to all threads)
+    auth_module._get_jwks = lambda url, force_refresh=False: jwks
+    auth_module._fetch_jwks = lambda url: jwks
+    # Also set cache for any code that reads it directly
+    auth_module._jwks_cache = jwks
+    auth_module._jwks_cache_time = time.time() + 9999
+    yield
+    # Restore
+    auth_module._get_jwks = original_get
+    auth_module._fetch_jwks = original_fetch
+    auth_module._jwks_cache = None
+    auth_module._jwks_cache_time = 0
 
 
 @pytest.fixture
@@ -164,7 +174,7 @@ class TestRoomsNoRole:
 class TestRoomsSuccess:
     """Test successful rooms list response."""
 
-    def test_list_rooms_with_viewer_role(self, oidc_env, rsa_keypair, jwks, mock_db_user):
+    def test_list_rooms_with_viewer_role(self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user):
         """Test 200 with viewer role returns rooms list."""
         private_key, _ = rsa_keypair
         token = _create_token(private_key)
@@ -191,32 +201,26 @@ class TestRoomsSuccess:
 
         with patch("hotelly.api.rbac._get_user_role_for_property", return_value="viewer"):
             with patch("hotelly.infra.db.txn", return_value=MockTxnContext()):
-                with patch("hotelly.api.auth._fetch_jwks", return_value=jwks):
-                    with patch.dict("os.environ", oidc_env):
-                        import hotelly.api.auth as auth_module
+                with patch.dict("os.environ", oidc_env):
+                    app = create_app(role="public")
+                    client = TestClient(app)
 
-                        auth_module._jwks_cache = None
-                        auth_module._jwks_cache_time = 0
+                    response = client.get(
+                        "/rooms?property_id=prop-1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
 
-                        app = create_app(role="public")
-                        client = TestClient(app)
+                    assert response.status_code == 200
+                    data = response.json()
 
-                        response = client.get(
-                            "/rooms?property_id=prop-1",
-                            headers={"Authorization": f"Bearer {token}"},
-                        )
+                    assert len(data) == 2
 
-                        assert response.status_code == 200
-                        data = response.json()
+                    assert data[0]["id"] == "101"
+                    assert data[0]["room_type_id"] == "rt_standard"
+                    assert data[0]["name"] == "Quarto 101"
+                    assert data[0]["is_active"] is True
 
-                        assert len(data) == 2
-
-                        assert data[0]["id"] == "101"
-                        assert data[0]["room_type_id"] == "rt_standard"
-                        assert data[0]["name"] == "Quarto 101"
-                        assert data[0]["is_active"] is True
-
-                        assert data[1]["id"] == "201"
-                        assert data[1]["room_type_id"] == "rt_suite"
-                        assert data[1]["name"] == "Suíte 201"
-                        assert data[1]["is_active"] is True
+                    assert data[1]["id"] == "201"
+                    assert data[1]["room_type_id"] == "rt_suite"
+                    assert data[1]["name"] == "Suíte 201"
+                    assert data[1]["is_active"] is True

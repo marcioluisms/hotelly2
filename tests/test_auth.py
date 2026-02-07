@@ -99,15 +99,24 @@ def oidc_env():
 
 @pytest.fixture
 def mock_jwks_fetch(jwks):
-    """Fixture that mocks JWKS fetch."""
-    with patch("hotelly.api.auth._fetch_jwks") as mock:
-        mock.return_value = jwks
-        # Clear cache before each test
-        import hotelly.api.auth as auth_module
-
-        auth_module._jwks_cache = None
-        auth_module._jwks_cache_time = 0
-        yield mock
+    """Fixture that monkey-patches both _get_jwks and _fetch_jwks — fully thread-safe."""
+    import hotelly.api.auth as auth_module
+    import time
+    # Save originals
+    original_get = auth_module._get_jwks
+    original_fetch = auth_module._fetch_jwks
+    # Monkey-patch both at module level (visible to all threads)
+    auth_module._get_jwks = lambda url, force_refresh=False: jwks
+    auth_module._fetch_jwks = lambda url: jwks
+    # Also set cache for any code that reads it directly
+    auth_module._jwks_cache = jwks
+    auth_module._jwks_cache_time = time.time() + 9999
+    yield
+    # Restore
+    auth_module._get_jwks = original_get
+    auth_module._fetch_jwks = original_fetch
+    auth_module._jwks_cache = None
+    auth_module._jwks_cache_time = 0
 
 
 @pytest.fixture
@@ -288,26 +297,29 @@ class TestJWKSCache:
         jwks = _create_jwks(public_key)
         token = _create_token(private_key, sub="user-123")
 
-        with patch("hotelly.api.auth._fetch_jwks", return_value=jwks) as mock_fetch:
-            # Clear cache
-            import hotelly.api.auth as auth_module
+        import hotelly.api.auth as auth_module
 
+        try:
+            with patch("hotelly.api.auth._fetch_jwks", return_value=jwks) as mock_fetch:
+                auth_module._jwks_cache = None
+                auth_module._jwks_cache_time = 0
+
+                with patch.dict("os.environ", oidc_env):
+                    app = create_app(role="public")
+                    client = TestClient(app)
+
+                    # First request
+                    response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
+                    assert response.status_code == 200
+                    assert mock_fetch.call_count == 1
+
+                    # Second request - should use cache
+                    response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
+                    assert response.status_code == 200
+                    assert mock_fetch.call_count == 1  # Still 1, used cache
+        finally:
             auth_module._jwks_cache = None
             auth_module._jwks_cache_time = 0
-
-            with patch.dict("os.environ", oidc_env):
-                app = create_app(role="public")
-                client = TestClient(app)
-
-                # First request
-                response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
-                assert response.status_code == 200
-                assert mock_fetch.call_count == 1
-
-                # Second request - should use cache
-                response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
-                assert response.status_code == 200
-                assert mock_fetch.call_count == 1  # Still 1, used cache
 
     def test_jwks_refresh_on_unknown_kid(self, oidc_env, rsa_keypair, mock_db_user):
         private_key, public_key = rsa_keypair
@@ -326,20 +338,23 @@ class TestJWKSCache:
                 return empty_jwks
             return valid_jwks
 
-        with patch("hotelly.api.auth._fetch_jwks", side_effect=mock_fetch):
-            # Clear cache
-            import hotelly.api.auth as auth_module
+        import hotelly.api.auth as auth_module
 
+        try:
+            with patch("hotelly.api.auth._fetch_jwks", side_effect=mock_fetch):
+                auth_module._jwks_cache = None
+                auth_module._jwks_cache_time = 0
+
+                with patch.dict("os.environ", oidc_env):
+                    app = create_app(role="public")
+                    client = TestClient(app)
+
+                    response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
+                    assert response.status_code == 200
+                    assert call_count == 2  # Fetched twice (initial + refresh)
+        finally:
             auth_module._jwks_cache = None
             auth_module._jwks_cache_time = 0
-
-            with patch.dict("os.environ", oidc_env):
-                app = create_app(role="public")
-                client = TestClient(app)
-
-                response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
-                assert response.status_code == 200
-                assert call_count == 2  # Fetched twice (initial + refresh)
 
 
 class TestJWKSFetchError:
@@ -351,19 +366,22 @@ class TestJWKSFetchError:
         private_key, _ = rsa_keypair
         token = _create_token(private_key, sub="user-123")
 
-        with patch("hotelly.api.auth._fetch_jwks", side_effect=requests.RequestException("Network error")):
-            # Clear cache
-            import hotelly.api.auth as auth_module
+        import hotelly.api.auth as auth_module
 
+        try:
+            with patch("hotelly.api.auth._fetch_jwks", side_effect=requests.RequestException("Network error")):
+                auth_module._jwks_cache = None
+                auth_module._jwks_cache_time = 0
+
+                with patch.dict("os.environ", oidc_env):
+                    app = create_app(role="public")
+                    client = TestClient(app)
+                    response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
+                    assert response.status_code == 503
+                    assert "Auth temporarily unavailable" in response.json()["detail"]
+        finally:
             auth_module._jwks_cache = None
             auth_module._jwks_cache_time = 0
-
-            with patch.dict("os.environ", oidc_env):
-                app = create_app(role="public")
-                client = TestClient(app)
-                response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
-                assert response.status_code == 503
-                assert "Auth temporarily unavailable" in response.json()["detail"]
 
     def test_jwks_fetch_timeout(self, oidc_env, rsa_keypair):
         import requests
@@ -371,19 +389,22 @@ class TestJWKSFetchError:
         private_key, _ = rsa_keypair
         token = _create_token(private_key, sub="user-123")
 
-        with patch("hotelly.api.auth._fetch_jwks", side_effect=requests.Timeout("Timeout")):
-            # Clear cache
-            import hotelly.api.auth as auth_module
+        import hotelly.api.auth as auth_module
 
+        try:
+            with patch("hotelly.api.auth._fetch_jwks", side_effect=requests.Timeout("Timeout")):
+                auth_module._jwks_cache = None
+                auth_module._jwks_cache_time = 0
+
+                with patch.dict("os.environ", oidc_env):
+                    app = create_app(role="public")
+                    client = TestClient(app)
+                    response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
+                    assert response.status_code == 503
+                    assert "Auth temporarily unavailable" in response.json()["detail"]
+        finally:
             auth_module._jwks_cache = None
             auth_module._jwks_cache_time = 0
-
-            with patch.dict("os.environ", oidc_env):
-                app = create_app(role="public")
-                client = TestClient(app)
-                response = client.get("/auth/whoami", headers={"Authorization": f"Bearer {token}"})
-                assert response.status_code == 503
-                assert "Auth temporarily unavailable" in response.json()["detail"]
 
 
 class TestAuthRouteAvailability:

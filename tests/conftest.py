@@ -1,3 +1,6 @@
+import sys
+sys.dont_write_bytecode = True
+
 """Shared pytest fixtures for Hotelly V2 tests."""
 
 import pytest
