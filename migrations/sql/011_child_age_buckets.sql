@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS property_child_age_buckets (
 );
 
 -- Rename child rate columns to bucket-based naming
-DO $
+DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='room_type_rates' AND column_name='price_1chd_cents') THEN
         ALTER TABLE room_type_rates RENAME COLUMN price_1chd_cents TO price_bucket1_chd_cents;
@@ -20,4 +20,4 @@ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='room_type_rates' AND column_name='price_3chd_cents') THEN
         ALTER TABLE room_type_rates RENAME COLUMN price_3chd_cents TO price_bucket3_chd_cents;
     END IF;
-END $;
+END $$;
