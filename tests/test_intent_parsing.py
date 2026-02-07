@@ -23,7 +23,7 @@ class TestParseIntentComplete:
         assert result.checkin == date(2026, 2, 10)
         assert result.checkout == date(2026, 2, 15)
         assert result.room_type_id == "rt_casal"
-        assert result.guest_count == 2
+        assert result.adult_count == 2
         assert result.missing == []
         assert result.is_complete()
 
@@ -36,7 +36,7 @@ class TestParseIntentComplete:
         assert result.checkin == date(2026, 2, 10)
         assert result.checkout == date(2026, 2, 12)
         assert result.room_type_id == "rt_suite"
-        assert result.guest_count == 3
+        assert result.adult_count == 3
         assert result.missing == []
 
     def test_complete_with_dash_separator(self):
@@ -48,15 +48,15 @@ class TestParseIntentComplete:
         assert result.checkin == date(2026, 3, 5)
         assert result.checkout == date(2026, 3, 8)
         assert result.room_type_id == "rt_familia"
-        assert result.guest_count == 2
+        assert result.adult_count == 2
         assert result.missing == []
 
 
 class TestParseIntentPartial:
     """Tests for partial messages missing some fields."""
 
-    def test_missing_guest_count(self):
-        """Message without guest count."""
+    def test_missing_adult_count(self):
+        """Message without adult count."""
         text = "Reserva suite 10/02 a 12/02"
 
         result = parse_intent(text, reference_date=date(2026, 1, 1))
@@ -64,8 +64,8 @@ class TestParseIntentPartial:
         assert result.checkin == date(2026, 2, 10)
         assert result.checkout == date(2026, 2, 12)
         assert result.room_type_id == "rt_suite"
-        assert result.guest_count is None
-        assert result.missing == ["guest_count"]
+        assert result.adult_count is None
+        assert result.missing == ["adult_count"]
         assert not result.is_complete()
 
     def test_missing_room_type(self):
@@ -77,7 +77,7 @@ class TestParseIntentPartial:
         assert result.checkin == date(2026, 2, 10)
         assert result.checkout == date(2026, 2, 15)
         assert result.room_type_id is None
-        assert result.guest_count == 2
+        assert result.adult_count == 2
         assert result.missing == ["room_type"]
 
     def test_missing_checkout_only_one_date(self):
@@ -89,7 +89,7 @@ class TestParseIntentPartial:
         assert result.checkin == date(2026, 2, 10)
         assert result.checkout is None
         assert result.room_type_id == "rt_casal"
-        assert result.guest_count == 2
+        assert result.adult_count == 2
         assert result.missing == ["checkout"]
 
     def test_missing_all_fields(self):
@@ -101,8 +101,8 @@ class TestParseIntentPartial:
         assert result.checkin is None
         assert result.checkout is None
         assert result.room_type_id is None
-        assert result.guest_count is None
-        assert set(result.missing) == {"checkin", "checkout", "room_type", "guest_count"}
+        assert result.adult_count is None
+        assert set(result.missing) == {"checkin", "checkout", "room_type", "adult_count"}
 
 
 class TestParseIntentDates:
@@ -121,7 +121,7 @@ class TestParseIntentDates:
         assert "checkout" in result.missing
         # Other fields still extracted
         assert result.room_type_id == "rt_suite"
-        assert result.guest_count == 2
+        assert result.adult_count == 2
 
     def test_dates_same_day_marks_missing(self):
         """Same day checkin/checkout should mark as missing."""
@@ -162,35 +162,35 @@ class TestParseIntentDates:
         assert result.checkout == date(2026, 2, 15)
 
 
-class TestParseIntentGuestCount:
-    """Tests for guest count parsing."""
+class TestParseIntentAdultCount:
+    """Tests for adult count parsing."""
 
-    def test_guest_count_hospedes(self):
-        """Pattern: N hóspedes."""
+    def test_adult_count_hospedes(self):
+        """Pattern: N hóspedes → adult_count."""
         result = parse_intent("3 hóspedes", reference_date=date(2026, 1, 1))
-        assert result.guest_count == 3
+        assert result.adult_count == 3
 
-    def test_guest_count_pessoas(self):
-        """Pattern: N pessoas."""
+    def test_adult_count_pessoas(self):
+        """Pattern: N pessoas → adult_count."""
         result = parse_intent("4 pessoas", reference_date=date(2026, 1, 1))
-        assert result.guest_count == 4
+        assert result.adult_count == 4
 
-    def test_guest_count_pax(self):
-        """Pattern: N pax."""
+    def test_adult_count_pax(self):
+        """Pattern: N pax → adult_count."""
         result = parse_intent("2 pax", reference_date=date(2026, 1, 1))
-        assert result.guest_count == 2
+        assert result.adult_count == 2
 
-    def test_guest_count_para_n(self):
-        """Pattern: para N."""
+    def test_adult_count_para_n(self):
+        """Pattern: para N pessoas → adult_count."""
         result = parse_intent("para 5 pessoas", reference_date=date(2026, 1, 1))
-        assert result.guest_count == 5
+        assert result.adult_count == 5
 
-    def test_guest_count_adultos(self):
-        """Pattern: N adultos."""
+    def test_adult_count_adultos(self):
+        """Pattern: N adultos → adult_count."""
         result = parse_intent("2 adultos", reference_date=date(2026, 1, 1))
-        assert result.guest_count == 2
+        assert result.adult_count == 2
 
-    def test_room_number_not_guest_count(self):
+    def test_room_number_not_adult_count(self):
         """Room number (e.g., 101) should NOT be parsed as guest count."""
         text = "Quero quarto 101 de 10/02 a 12/02"
         result = parse_intent(text, reference_date=date(2026, 1, 1))
@@ -199,8 +199,8 @@ class TestParseIntentGuestCount:
         assert result.checkin == date(2026, 2, 10)
         assert result.checkout == date(2026, 2, 12)
         # Room number 101 should NOT be guest count
-        assert result.guest_count is None
-        assert "guest_count" in result.missing
+        assert result.adult_count is None
+        assert "adult_count" in result.missing
 
 
 class TestParseIntentRoomType:
@@ -251,7 +251,7 @@ class TestParseIntentHelpers:
             checkin=date(2026, 2, 10),
             checkout=date(2026, 2, 15),
             room_type_id="rt_casal",
-            guest_count=2,
+            adult_count=2,
             missing=[],
         )
         assert intent.is_complete()

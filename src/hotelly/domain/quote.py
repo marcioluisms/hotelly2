@@ -11,10 +11,19 @@ from psycopg2.extensions import cursor as PgCursor
 from hotelly.infra.db import fetch_room_type_rates_by_date
 
 
-class UnavailableError(Exception):
-    """Raised when requested dates are not available."""
+class QuoteUnavailable(Exception):
+    def __init__(self, reason_code: str, meta: dict | None = None):
+        self.reason_code = reason_code
+        self.meta = meta or {}
+        super().__init__(f"Quote unavailable: {reason_code}")
 
-    pass
+
+def _bucket_for_age(age: int, buckets: list[dict]) -> int | None:
+    """Return the bucket number (1..3) that covers *age*, or None."""
+    for b in buckets:
+        if b["min_age"] <= age <= b["max_age"]:
+            return b["bucket"]
+    return None
 
 
 def quote_minimum(
@@ -24,53 +33,60 @@ def quote_minimum(
     room_type_id: str,
     checkin: date,
     checkout: date,
-    guest_count: int = 2,
-    child_count: int = 0,
+    adult_count: int,
+    children_ages: list[int] | None = None,
 ) -> dict | None:
-    """Calculate minimum quote from ARI data with PAX pricing.
+    """Calculate minimum quote from ARI data with PAX + child-bucket pricing.
 
-    Uses room_type_rates PAX pricing when available for the given
-    guest_count/child_count. Falls back to ari_days.base_rate_cents
-    when no PAX rate exists for a night.
-
-    Checks availability for each night (checkin inclusive, checkout exclusive).
-
-    Args:
-        cur: Database cursor (within transaction).
-        property_id: Property identifier.
-        room_type_id: Room type identifier.
-        checkin: Check-in date (inclusive).
-        checkout: Check-out date (exclusive).
-        guest_count: Number of adult guests (1-4, default 2).
-        child_count: Number of children (0-3, default 0).
-
-    Returns:
-        Dict with quote data if available:
-        {
-            "property_id": str,
-            "room_type_id": str,
-            "checkin": date,
-            "checkout": date,
-            "total_cents": int,
-            "currency": "BRL",
-            "nights": int,
-        }
-        Returns None if any night is unavailable.
-
-    Raises:
-        ValueError: If checkin >= checkout, guest_count out of 1-4,
-                    or child_count out of 0-3.
+    Returns dict with quote data or raises QuoteUnavailable.
     """
+    if children_ages is None:
+        children_ages = []
+
+    # --- Fail-fast validations ---
     if checkin >= checkout:
-        raise ValueError("checkin must be before checkout")
-    if guest_count < 1 or guest_count > 4:
-        raise ValueError("guest_count must be between 1 and 4")
-    if child_count < 0 or child_count > 3:
-        raise ValueError("child_count must be between 0 and 3")
+        raise QuoteUnavailable("invalid_dates")
+    if adult_count < 1 or adult_count > 4:
+        raise QuoteUnavailable("invalid_adult_count")
+    for age in children_ages:
+        if age < 0 or age > 17:
+            raise QuoteUnavailable("invalid_child_age")
 
     nights = (checkout - checkin).days
 
-    # Fetch ARI for all nights in range
+    # --- Child policy (if children present) ---
+    buckets: list[dict] = []
+    if children_ages:
+        cur.execute(
+            "SELECT bucket, min_age, max_age "
+            "FROM property_child_age_buckets "
+            "WHERE property_id = %s ORDER BY bucket",
+            (property_id,),
+        )
+        bucket_rows = cur.fetchall()
+        if not bucket_rows:
+            raise QuoteUnavailable("child_policy_missing")
+
+        buckets = [
+            {"bucket": r[0], "min_age": r[1], "max_age": r[2]} for r in bucket_rows
+        ]
+
+        # Validate coverage: exactly 3 buckets covering 0..17 without gaps
+        if len(buckets) != 3:
+            raise QuoteUnavailable("child_policy_incomplete")
+        sorted_buckets = sorted(buckets, key=lambda b: b["min_age"])
+        if sorted_buckets[0]["min_age"] != 0 or sorted_buckets[-1]["max_age"] != 17:
+            raise QuoteUnavailable("child_policy_incomplete")
+        for i in range(1, len(sorted_buckets)):
+            if sorted_buckets[i]["min_age"] != sorted_buckets[i - 1]["max_age"] + 1:
+                raise QuoteUnavailable("child_policy_incomplete")
+
+        # Map each child age to a bucket
+        for age in children_ages:
+            if _bucket_for_age(age, buckets) is None:
+                raise QuoteUnavailable("child_policy_incomplete")
+
+    # --- ARI check ---
     cur.execute(
         """
         SELECT date, inv_total, inv_booked, inv_held, base_rate_cents, currency
@@ -84,15 +100,11 @@ def quote_minimum(
         (property_id, room_type_id, checkin, checkout),
     )
     rows = cur.fetchall()
-
-    # Build date -> row map
     ari_by_date: dict[date, tuple] = {}
     for row in rows:
         ari_by_date[row[0]] = row
 
-    # Fetch PAX rates for the date range
-    pax_col = f"price_{guest_count}pax_cents"
-    chd_col = f"price_{child_count}chd_cents" if child_count > 0 else None
+    # --- Fetch PAX rates ---
     rates_by_date = fetch_room_type_rates_by_date(
         cur,
         property_id=property_id,
@@ -101,42 +113,49 @@ def quote_minimum(
         end=checkout,
     )
 
+    # --- Pricing per night ---
+    pax_col = f"price_{adult_count}pax_cents"
     total_cents = 0
     current = checkin
 
     while current < checkout:
+        # ARI validation
         ari = ari_by_date.get(current)
-
         if ari is None:
-            # No ARI record for this date
-            return None
+            raise QuoteUnavailable("no_ari_record", {"date": str(current)})
 
-        _, inv_total, inv_booked, inv_held, rate_cents, currency = ari
+        _, inv_total, inv_booked, inv_held, _rate_cents, currency = ari
 
-        # Validate currency (MVP: BRL only)
         if currency != "BRL":
-            return None
+            raise QuoteUnavailable("wrong_currency")
 
-        # Validate availability
         available = inv_total - inv_booked - inv_held
         if available < 1:
-            return None
+            raise QuoteUnavailable("no_inventory", {"date": str(current)})
 
-        # Resolve nightly price: PAX rate with fallback to base_rate_cents
-        pax_rate = rates_by_date.get(current)
-        pax_price = pax_rate.get(pax_col) if pax_rate else None
+        # Rate lookup
+        rate = rates_by_date.get(current)
+        if rate is None:
+            raise QuoteUnavailable("rate_missing", {"date": str(current)})
 
-        if pax_price is not None:
-            child_add = 0
-            if chd_col and pax_rate:
-                child_add = pax_rate.get(chd_col) or 0
-            nightly = pax_price + child_add
-        else:
-            # Fallback to ari_days.base_rate_cents
-            if rate_cents is None:
-                return None
-            nightly = rate_cents
+        adult_base = rate.get(pax_col)
+        if adult_base is None:
+            raise QuoteUnavailable("pax_rate_missing", {"date": str(current)})
 
+        # Child pricing
+        child_total = 0
+        for age in children_ages:
+            bucket_num = _bucket_for_age(age, buckets)
+            chd_col = f"price_bucket{bucket_num}_chd_cents"
+            chd_price = rate.get(chd_col)
+            if chd_price is None:
+                raise QuoteUnavailable(
+                    "child_rate_missing",
+                    {"date": str(current), "bucket": bucket_num},
+                )
+            child_total += chd_price
+
+        nightly = adult_base + child_total
         total_cents += nightly
         current += timedelta(days=1)
 

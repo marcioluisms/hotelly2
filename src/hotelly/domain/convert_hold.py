@@ -60,7 +60,7 @@ def convert_hold(
         # Step 1: Lock hold for update
         cur.execute(
             """
-            SELECT id, status, checkin, checkout, total_cents, currency, conversation_id
+            SELECT id, status, checkin, checkout, total_cents, currency, conversation_id, adult_count, children_ages
             FROM holds
             WHERE id = %s AND property_id = %s
             FOR UPDATE
@@ -73,7 +73,7 @@ def convert_hold(
             # Hold not found - no dedupe (allow retry)
             return {"status": "noop"}
 
-        hold_uuid, status, checkin, checkout, total_cents, currency, conversation_id = (
+        hold_uuid, status, checkin, checkout, total_cents, currency, conversation_id, adult_count, children_ages = (
             row
         )
 
@@ -148,6 +148,8 @@ def convert_hold(
             total_cents=total_cents,
             currency=currency,
             room_type_id=room_type_id,
+            adult_count=adult_count,
+            children_ages=children_ages if isinstance(children_ages, list) else [],
         )
 
         if reservation_id is None:

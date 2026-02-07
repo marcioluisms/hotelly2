@@ -18,7 +18,8 @@ class ParsedIntent:
     checkin: date | None = None
     checkout: date | None = None
     room_type_id: str | None = None
-    guest_count: int | None = None
+    adult_count: int | None = None
+    children_ages: list[int] | None = None
     missing: list[str] = field(default_factory=list)
 
     def is_complete(self) -> bool:

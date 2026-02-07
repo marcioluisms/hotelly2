@@ -155,9 +155,10 @@ def create_hold_directly(
             """
             INSERT INTO holds (
                 id, property_id, checkin, checkout, expires_at,
-                total_cents, currency, status, create_idempotency_key
+                total_cents, currency, status, create_idempotency_key,
+                adult_count
             )
-            VALUES (%s, %s, %s, %s, %s, 20000, 'BRL', 'active', %s)
+            VALUES (%s, %s, %s, %s, %s, 20000, 'BRL', 'active', %s, 2)
             """,
             (hold_id, property_id, checkin, checkout, expires_at, f"test-{hold_id}"),
         )
@@ -478,6 +479,7 @@ class TestG5aConcurrentCreateHold:
                     total_cents=20000,
                     currency="BRL",
                     create_idempotency_key=f"barrier-{thread_id}-{uuid.uuid4().hex[:8]}",
+                    adult_count=2,
                 )
                 with results_lock:
                     if result["created"]:

@@ -97,14 +97,24 @@ def oidc_env():
 
 @pytest.fixture
 def mock_jwks_fetch(jwks):
-    """Fixture that mocks JWKS fetch."""
-    with patch("hotelly.api.auth._fetch_jwks") as mock:
-        mock.return_value = jwks
-        import hotelly.api.auth as auth_module
-
-        auth_module._jwks_cache = None
-        auth_module._jwks_cache_time = 0
-        yield mock
+    """Fixture that monkey-patches both _get_jwks and _fetch_jwks — fully thread-safe."""
+    import hotelly.api.auth as auth_module
+    import time
+    # Save originals
+    original_get = auth_module._get_jwks
+    original_fetch = auth_module._fetch_jwks
+    # Monkey-patch both at module level (visible to all threads)
+    auth_module._get_jwks = lambda url, force_refresh=False: jwks
+    auth_module._fetch_jwks = lambda url: jwks
+    # Also set cache for any code that reads it directly
+    auth_module._jwks_cache = jwks
+    auth_module._jwks_cache_time = time.time() + 9999
+    yield
+    # Restore
+    auth_module._get_jwks = original_get
+    auth_module._fetch_jwks = original_fetch
+    auth_module._jwks_cache = None
+    auth_module._jwks_cache_time = 0
 
 
 @pytest.fixture
@@ -230,7 +240,7 @@ class TestAssignRoomEnqueue:
                     assert response.status_code == 404
                     assert "Reservation not found" in response.json()["detail"]
 
-    def test_assign_room_room_not_found(self, oidc_env, rsa_keypair, jwks, mock_db_user):
+    def test_assign_room_room_not_found(self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user):
         private_key, _ = rsa_keypair
         token = _create_token(private_key)
         res_id = str(uuid4())
@@ -246,25 +256,19 @@ class TestAssignRoomEnqueue:
             "created_at": "2025-05-20T10:00:00+00:00",
         }
 
-        import hotelly.api.auth as auth_module
-
-        auth_module._jwks_cache = None
-        auth_module._jwks_cache_time = 0
-
-        with patch("hotelly.api.auth._fetch_jwks", return_value=jwks):
-            with patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"):
-                with patch("hotelly.api.routes.reservations._get_reservation", return_value=mock_reservation):
-                    with patch("hotelly.api.routes.reservations._room_exists_and_active", return_value=False):
-                        with patch.dict("os.environ", oidc_env):
-                            app = create_app(role="public")
-                            client = TestClient(app)
-                            response = client.post(
-                                f"/reservations/{res_id}/actions/assign-room?property_id=prop-1",
-                                json={"room_id": "999"},
-                                headers={"Authorization": f"Bearer {token}"},
-                            )
-                            assert response.status_code == 404
-                            assert "Room not found or inactive" in response.json()["detail"]
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"):
+            with patch("hotelly.api.routes.reservations._get_reservation", return_value=mock_reservation):
+                with patch("hotelly.api.routes.reservations._room_exists_and_active", return_value=False):
+                    with patch.dict("os.environ", oidc_env):
+                        app = create_app(role="public")
+                        client = TestClient(app)
+                        response = client.post(
+                            f"/reservations/{res_id}/actions/assign-room?property_id=prop-1",
+                            json={"room_id": "999"},
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        assert response.status_code == 404
+                        assert "Room not found or inactive" in response.json()["detail"]
 
 
 class TestWorkerAssignRoomNoAuth:

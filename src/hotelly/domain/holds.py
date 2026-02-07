@@ -60,7 +60,8 @@ def create_hold(
     expires_at: datetime | None = None,
     conversation_id: str | None = None,
     quote_option_id: str | None = None,
-    guest_count: int | None = None,
+    adult_count: int,
+    children_ages: list[int] | None = None,
     correlation_id: str | None = None,
     cur: PgCursor | None = None,
 ) -> dict:
@@ -88,7 +89,8 @@ def create_hold(
         expires_at: Hold expiration (default: 15 minutes from now).
         conversation_id: Optional conversation UUID.
         quote_option_id: Optional quote option UUID.
-        guest_count: Optional guest count.
+        adult_count: Number of adults.
+        children_ages: List of children ages (default []).
         correlation_id: Optional correlation ID for tracing.
 
     Returns:
@@ -132,7 +134,8 @@ def create_hold(
             create_idempotency_key=create_idempotency_key,
             conversation_id=conversation_id,
             quote_option_id=quote_option_id,
-            guest_count=guest_count,
+            adult_count=adult_count,
+            children_ages=children_ages,
         )
 
         if hold_id is None:

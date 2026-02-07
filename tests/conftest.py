@@ -1,6 +1,8 @@
 """Shared pytest fixtures for Hotelly V2 tests."""
+import sys
+sys.dont_write_bytecode = True
 
-import pytest
+import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

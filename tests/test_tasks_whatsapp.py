@@ -430,7 +430,7 @@ class TestS05PiiSafety:
                     """,
                     (TEST_PROPERTY_ID, "rt_standard", "Standard"),
                 )
-                # ARI for test dates (using db_today to stay consistent)
+                # ARI + rates for test dates (using db_today to stay consistent)
                 for day_offset in range(3):
                     d = db_today + timedelta(days=day_offset)
                     cur.execute(
@@ -444,6 +444,18 @@ class TestS05PiiSafety:
                         ON CONFLICT (property_id, room_type_id, date) DO UPDATE
                         SET inv_total = 5, inv_booked = 0, inv_held = 0,
                             base_rate_cents = 25000, currency = 'BRL'
+                        """,
+                        (TEST_PROPERTY_ID, "rt_standard", d),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO room_type_rates (
+                            property_id, room_type_id, date,
+                            price_2pax_cents
+                        )
+                        VALUES (%s, %s, %s, 25000)
+                        ON CONFLICT (property_id, room_type_id, date) DO UPDATE
+                        SET price_2pax_cents = 25000
                         """,
                         (TEST_PROPERTY_ID, "rt_standard", d),
                     )
@@ -464,7 +476,7 @@ class TestS05PiiSafety:
                 "checkin": checkin.isoformat(),
                 "checkout": checkout.isoformat(),
                 "room_type_id": "rt_standard",
-                "guest_count": 2,
+                "adult_count": 2,
             },
         }
 
@@ -498,7 +510,7 @@ class TestS05PiiSafety:
 
             # Validate allowed params only (no PII)
             params = payload_data["params"]
-            allowed_params = {"nights", "checkin", "checkout", "guest_count", "total_brl", "checkout_url"}
+            allowed_params = {"nights", "checkin", "checkout", "adult_count", "total_brl", "checkout_url"}
             assert set(params.keys()) <= allowed_params, f"Unexpected params: {set(params.keys()) - allowed_params}"
             assert "checkout_url" in params
             assert "http" in params["checkout_url"].lower(), (
@@ -523,6 +535,10 @@ class TestS05PiiSafety:
                 )
                 cur.execute(
                     "DELETE FROM ari_days WHERE property_id = %s",
+                    (TEST_PROPERTY_ID,),
+                )
+                cur.execute(
+                    "DELETE FROM room_type_rates WHERE property_id = %s",
                     (TEST_PROPERTY_ID,),
                 )
                 cur.execute(

@@ -3,6 +3,7 @@
 Uses raw SQL with psycopg2 (no ORM).
 """
 
+import json
 from datetime import date
 
 from psycopg2.extensions import cursor as PgCursor
@@ -19,6 +20,8 @@ def insert_reservation(
     total_cents: int,
     currency: str,
     room_type_id: str | None = None,
+    adult_count: int = 2,
+    children_ages: list[int] | None = None,
 ) -> tuple[str | None, bool]:
     """Insert a reservation with idempotency via UNIQUE(property_id, hold_id).
 
@@ -34,6 +37,8 @@ def insert_reservation(
         total_cents: Total price in cents.
         currency: Currency code.
         room_type_id: Optional room type identifier.
+        adult_count: Number of adults (default 2).
+        children_ages: List of children ages (default []).
 
     Returns:
         Tuple of (reservation_id, created).
@@ -44,9 +49,10 @@ def insert_reservation(
         """
         INSERT INTO reservations (
             property_id, hold_id, conversation_id,
-            checkin, checkout, total_cents, currency, room_type_id
+            checkin, checkout, total_cents, currency,
+            room_type_id, adult_count, children_ages
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (property_id, hold_id) DO NOTHING
         RETURNING id
         """,
@@ -59,6 +65,8 @@ def insert_reservation(
             total_cents,
             currency,
             room_type_id,
+            adult_count,
+            json.dumps(children_ages or []),
         ),
     )
     row = cur.fetchone()

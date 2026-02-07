@@ -4,6 +4,7 @@ Uses raw SQL with psycopg2 (no ORM).
 Implements safe inventory reservation with guards.
 """
 
+import json
 from datetime import date, datetime
 
 from psycopg2.extensions import cursor as PgCursor
@@ -22,7 +23,8 @@ def insert_hold(
     create_idempotency_key: str,
     conversation_id: str | None = None,
     quote_option_id: str | None = None,
-    guest_count: int | None = None,
+    adult_count: int = 2,
+    children_ages: list[int] | None = None,
 ) -> tuple[str | None, bool]:
     """Insert a hold with idempotency.
 
@@ -40,7 +42,8 @@ def insert_hold(
         create_idempotency_key: Idempotency key for creation.
         conversation_id: Optional conversation UUID.
         quote_option_id: Optional quote option UUID.
-        guest_count: Optional guest count.
+        adult_count: Number of adults (default 2).
+        children_ages: List of children ages (default []).
 
     Returns:
         Tuple of (hold_id, created).
@@ -53,9 +56,9 @@ def insert_hold(
         INSERT INTO holds (
             property_id, checkin, checkout, expires_at,
             total_cents, currency, create_idempotency_key,
-            conversation_id, quote_option_id, guest_count
+            conversation_id, quote_option_id, adult_count, children_ages
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (property_id, create_idempotency_key)
         WHERE create_idempotency_key IS NOT NULL
         DO NOTHING
@@ -71,7 +74,8 @@ def insert_hold(
             create_idempotency_key,
             conversation_id,
             quote_option_id,
-            guest_count,
+            adult_count,
+            json.dumps(children_ages or []),
         ),
     )
     row = cur.fetchone()

@@ -155,9 +155,9 @@ def create_test_hold(property_id: str, total_cents: int, currency: str) -> str:
             """
             INSERT INTO holds (
                 property_id, checkin, checkout, expires_at,
-                total_cents, currency, status
+                total_cents, currency, status, adult_count
             )
-            VALUES (%s, %s, %s, %s, %s, %s, 'active')
+            VALUES (%s, %s, %s, %s, %s, %s, 'active', 2)
             RETURNING id
             """,
             (property_id, checkin, checkout, expires_at, total_cents, currency),
@@ -317,9 +317,9 @@ class TestCheckoutSessionErrors:
                 """
                 INSERT INTO holds (
                     property_id, checkin, checkout, expires_at,
-                    total_cents, currency, status
+                    total_cents, currency, status, adult_count
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'expired')
+                VALUES (%s, %s, %s, %s, %s, %s, 'expired', 2)
                 RETURNING id
                 """,
                 (TEST_PROPERTY_ID, checkin, checkout, expires_at, 10000, "BRL"),

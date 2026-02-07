@@ -140,6 +140,7 @@ class TestCreateHold:
             total_cents=20000,
             currency="BRL",
             create_idempotency_key="test-hold-001",
+            adult_count=2,
         )
 
         assert result is not None
@@ -212,6 +213,7 @@ class TestCreateHold:
                 total_cents=20000,
                 currency="BRL",
                 create_idempotency_key="test-hold-unavail",
+                adult_count=2,
             )
 
 
@@ -243,6 +245,7 @@ class TestIdempotency:
             total_cents=20000,
             currency="BRL",
             create_idempotency_key="test-idem-001",
+            adult_count=2,
         )
 
         assert result1["created"] is True
@@ -268,6 +271,7 @@ class TestIdempotency:
             total_cents=20000,
             currency="BRL",
             create_idempotency_key="test-idem-001",
+            adult_count=2,
         )
 
         assert result2["created"] is False
@@ -344,6 +348,7 @@ class TestConcurrency:
                     total_cents=20000,
                     currency="BRL",
                     create_idempotency_key=f"concurrent-{thread_id}",
+                    adult_count=2,
                 )
                 with results_lock:
                     results["success"] += 1
@@ -457,6 +462,7 @@ class TestARIInvariants:
                 total_cents=30000,
                 currency="BRL",
                 create_idempotency_key=f"ari-test-{i}",
+                adult_count=2,
             )
 
         # Query for invariant violations

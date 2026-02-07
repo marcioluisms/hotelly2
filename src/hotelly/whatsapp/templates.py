@@ -15,8 +15,16 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "text": "Qual tipo de quarto prefere? Temos Standard e Suíte disponíveis.",
         "allowed_params": [],
     },
-    "prompt_guest_count": {
-        "text": "Quantos hóspedes serão?",
+    "prompt_adult_count": {
+        "text": "Quantos adultos serão?",
+        "allowed_params": [],
+    },
+    "prompt_child_count": {
+        "text": "Quantas crianças estarão na hospedagem?",
+        "allowed_params": [],
+    },
+    "prompt_children_ages": {
+        "text": "Quais as idades das crianças? (ex.: 3 e 7)",
         "allowed_params": [],
     },
     "quote_unavailable": {
@@ -37,7 +45,7 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "text": (
             "Ótimo! Encontrei disponibilidade:\n"
             "- {nights} noite(s) de {checkin} a {checkout}\n"
-            "- {guest_count} hóspede(s)\n"
+            "- {adult_count} adulto(s)\n"
             "- Total: R$ {total_brl}\n\n"
             "Reserva válida por 15 minutos.\n"
             "Pague aqui: {checkout_url}"
@@ -46,7 +54,7 @@ TEMPLATES: dict[str, dict[str, Any]] = {
             "nights",
             "checkin",
             "checkout",
-            "guest_count",
+            "adult_count",
             "total_brl",
             "checkout_url",
         ],
@@ -55,7 +63,7 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "text": (
             "Ótimo! Encontrei disponibilidade:\n"
             "- {nights} noite(s) de {checkin} a {checkout}\n"
-            "- {guest_count} hóspede(s)\n"
+            "- {adult_count} adulto(s)\n"
             "- Total: R$ {total_brl}\n\n"
             "Reserva válida por 15 minutos. Deseja confirmar?"
         ),
@@ -63,7 +71,7 @@ TEMPLATES: dict[str, dict[str, Any]] = {
             "nights",
             "checkin",
             "checkout",
-            "guest_count",
+            "adult_count",
             "total_brl",
         ],
     },

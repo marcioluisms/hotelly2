@@ -165,9 +165,9 @@ _PAX_COLS = (
     "price_2pax_cents",
     "price_3pax_cents",
     "price_4pax_cents",
-    "price_1chd_cents",
-    "price_2chd_cents",
-    "price_3chd_cents",
+    "price_bucket1_chd_cents",
+    "price_bucket2_chd_cents",
+    "price_bucket3_chd_cents",
 )
 
 
@@ -197,7 +197,7 @@ def fetch_room_type_rates_by_date(
         SELECT date,
                price_1pax_cents, price_2pax_cents,
                price_3pax_cents, price_4pax_cents,
-               price_1chd_cents, price_2chd_cents, price_3chd_cents
+               price_bucket1_chd_cents, price_bucket2_chd_cents, price_bucket3_chd_cents
         FROM room_type_rates
         WHERE property_id = %s
           AND room_type_id = %s
