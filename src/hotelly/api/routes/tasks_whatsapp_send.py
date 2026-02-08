@@ -304,11 +304,12 @@ async def send_response(request: Request, req: SendResponseRequest):
     logger.info("send-response task received", extra={"extra_fields": log_ctx})
 
     # ------------------------------------------------------------------
-    # 1. Load outbox_event and validate
+    # 1. Load outbox_event, canonicalize property_id
     # ------------------------------------------------------------------
     with txn() as cur:
         cur.execute(
-            "SELECT event_type, aggregate_id, payload FROM outbox_events WHERE id = %s",
+            "SELECT property_id, event_type, aggregate_id, payload"
+            " FROM outbox_events WHERE id = %s",
             (req.outbox_event_id,),
         )
         row = cur.fetchone()
@@ -320,7 +321,7 @@ async def send_response(request: Request, req: SendResponseRequest):
         )
         return {"ok": False, "error": "outbox_event_not_found"}
 
-    event_type, contact_hash, payload_json = row
+    event_property_id, event_type, contact_hash, payload_json = row
 
     if event_type != "whatsapp.send_message":
         logger.warning(
@@ -329,14 +330,33 @@ async def send_response(request: Request, req: SendResponseRequest):
         )
         return {"ok": False, "error": "outbox_event_wrong_type"}
 
+    # Canonical property_id from outbox_events (req.property_id is untrusted)
+    property_id = event_property_id
+    if req.property_id != property_id:
+        logger.warning(
+            "send-response property_id mismatch, using canonical",
+            extra={"extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                req_property_id=req.property_id,
+                canonical_property_id=property_id,
+                outbox_event_id=req.outbox_event_id,
+            )},
+        )
+        # Rebuild log_ctx with canonical property_id
+        log_ctx = safe_log_context(
+            correlationId=correlation_id,
+            property_id=property_id,
+            outbox_event_id=req.outbox_event_id,
+        )
+
     # ------------------------------------------------------------------
     # 2. Acquire delivery lease (atomic: upsert + lock + check + update)
     # ------------------------------------------------------------------
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(_ENSURE_DELIVERY_SQL, (req.property_id, req.outbox_event_id))
-            cur.execute(_LOCK_DELIVERY_SQL, (req.property_id, req.outbox_event_id))
+            cur.execute(_ENSURE_DELIVERY_SQL, (property_id, req.outbox_event_id))
+            cur.execute(_LOCK_DELIVERY_SQL, (property_id, req.outbox_event_id))
             delivery_row = cur.fetchone()
 
             delivery_id, delivery_status, attempt_count, updated_at = delivery_row
@@ -390,7 +410,7 @@ async def send_response(request: Request, req: SendResponseRequest):
     with txn() as cur:
         remote_jid = get_remote_jid(
             cur,
-            property_id=req.property_id,
+            property_id=property_id,
             channel="whatsapp",
             contact_hash=contact_hash,
         )
@@ -425,7 +445,7 @@ async def send_response(request: Request, req: SendResponseRequest):
     # ------------------------------------------------------------------
     try:
         _send_via_provider(
-            property_id=req.property_id,
+            property_id=property_id,
             remote_jid=remote_jid,
             text=text,
             correlation_id=correlation_id,

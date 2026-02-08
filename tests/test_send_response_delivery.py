@@ -79,7 +79,7 @@ class FakeDeliveryStore:
 def _build_mocks(
     store: FakeDeliveryStore,
     *,
-    outbox_row=("whatsapp.send_message", "hash_abc", json.dumps({"template_key": "prompt_dates", "params": {}})),
+    outbox_row=("prop-test", "whatsapp.send_message", "hash_abc", json.dumps({"template_key": "prompt_dates", "params": {}})),
     remote_jid="jid@s.whatsapp.net",
     provider_side_effect=None,
 ):
@@ -483,7 +483,7 @@ class TestOutboxEventValidation:
         store = FakeDeliveryStore()
         patches, _ = _build_mocks(
             store,
-            outbox_row=("some.other.event", "hash_abc", "{}"),
+            outbox_row=("prop-test", "some.other.event", "hash_abc", "{}"),
         )
 
         resp = _post_send_response(client, patches)
@@ -492,6 +492,65 @@ class TestOutboxEventValidation:
         body = resp.json()
         assert body["ok"] is False
         assert body["error"] == "outbox_event_wrong_type"
+
+
+class TestPropertyIdCanonicalization:
+    """req.property_id is untrusted; canonical property_id comes from outbox_events."""
+
+    def test_mismatch_uses_canonical_for_provider(self, client):
+        """When req says 'prop-B' but outbox_event belongs to 'prop-A',
+        provider is called with 'prop-A'."""
+        store = FakeDeliveryStore()
+        canonical_pid = "prop-A"
+        outbox_row = (
+            canonical_pid,
+            "whatsapp.send_message",
+            "hash_abc",
+            json.dumps({"template_key": "prompt_dates", "params": {}}),
+        )
+        patches, provider_mock = _build_mocks(store, outbox_row=outbox_row)
+
+        # Request uses "prop-B"
+        resp = _post_send_response(client, patches, property_id="prop-B")
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        provider_mock.assert_called_once()
+        call_kwargs = provider_mock.call_args[1]
+        assert call_kwargs["property_id"] == canonical_pid
+
+    def test_mismatch_uses_canonical_for_delivery_key(self, client):
+        """Delivery row is keyed by (canonical property_id, outbox_event_id)."""
+        store = FakeDeliveryStore()
+        canonical_pid = "prop-A"
+        outbox_row = (
+            canonical_pid,
+            "whatsapp.send_message",
+            "hash_abc",
+            json.dumps({"template_key": "prompt_dates", "params": {}}),
+        )
+        patches, _ = _build_mocks(store, outbox_row=outbox_row)
+
+        resp = _post_send_response(client, patches, property_id="prop-B")
+
+        assert resp.status_code == 200
+        # Delivery row stored under canonical property_id, not req property_id
+        assert (canonical_pid, 42) in store.rows
+        assert ("prop-B", 42) not in store.rows
+
+    def test_matching_property_id_works_normally(self, client):
+        """No mismatch — everything uses the same property_id."""
+        store = FakeDeliveryStore()
+        patches, provider_mock = _build_mocks(store)  # default outbox_row has "prop-test"
+
+        resp = _post_send_response(client, patches, property_id="prop-test")
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        provider_mock.assert_called_once()
+        call_kwargs = provider_mock.call_args[1]
+        assert call_kwargs["property_id"] == "prop-test"
+        assert ("prop-test", 42) in store.rows
 
 
 # ---------------------------------------------------------------------------
