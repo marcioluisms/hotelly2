@@ -14,10 +14,10 @@ else
   echo "[verify] ruff not installed; skipping"
 fi
 
-echo "[verify] (optional) alembic upgrade head"
+echo "[verify] (optional) alembic upgrade heads"
 if uv run python -c "import alembic" >/dev/null 2>&1; then
   if [ -n "${DATABASE_URL:-}" ]; then
-    uv run alembic upgrade head
+    uv run alembic upgrade heads
   else
     echo "[verify] DATABASE_URL not set; skipping migrations"
   fi

@@ -30,3 +30,8 @@ INSERT INTO rooms (property_id, id, room_type_id, name) VALUES
     ('prop-dev-001', '201', 'rt_suite', 'Suíte 201'),
     ('prop-dev-001', '202', 'rt_suite', 'Suíte 202')
 ON CONFLICT (property_id, id) DO NOTHING;
+
+INSERT INTO property_cancellation_policy
+    (property_id, policy_type, free_until_days_before_checkin, penalty_percent, notes)
+VALUES ('prop-dev-001', 'flexible', 7, 100, NULL)
+ON CONFLICT (property_id) DO NOTHING;
