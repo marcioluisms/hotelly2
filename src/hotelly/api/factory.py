@@ -15,6 +15,7 @@ from hotelly.observability.correlation import (
 from .routers import public, worker
 from .routes import (
     auth,
+    cancellation_policy,
     child_policies,
     conversations,
     frontdesk,
@@ -99,6 +100,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(occupancy.router)
         app.include_router(rooms.router)
         app.include_router(rates.router)
+        app.include_router(cancellation_policy.router)
         app.include_router(child_policies.router)
 
     # Mount worker routes only for worker role
