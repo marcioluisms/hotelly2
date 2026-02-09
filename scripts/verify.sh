@@ -14,7 +14,7 @@ else
   echo "[verify] ruff not installed; skipping"
 fi
 
-echo "[verify] (optional) alembic upgrade heads"
+echo "[verify] (optional) alembic upgrade head"
 if uv run python -c "import alembic" >/dev/null 2>&1; then
   HEADS_OUTPUT=$(uv run alembic heads 2>&1)
   HEAD_COUNT=$(echo "$HEADS_OUTPUT" | grep -E '^[0-9a-f]+.*\((head)\)' -c)
@@ -25,7 +25,7 @@ if uv run python -c "import alembic" >/dev/null 2>&1; then
     exit 1
   fi
   if [ -n "${DATABASE_URL:-}" ]; then
-    uv run alembic upgrade heads
+    uv run alembic upgrade head
   else
     echo "[verify] DATABASE_URL not set; skipping migrations"
   fi
