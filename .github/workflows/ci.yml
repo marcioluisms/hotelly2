@@ -44,7 +44,7 @@ jobs:
         run: uv sync --all-extras
 
       - name: Run migrations
-        run: uv run alembic upgrade heads
+        run: uv run alembic upgrade head
 
       - name: Verify
         run: ./scripts/verify.sh
