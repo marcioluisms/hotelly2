@@ -5,6 +5,7 @@ and exception classification — all without a real database.
 """
 
 import json
+import os
 import urllib.error
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -67,6 +68,7 @@ class FakeDeliveryStore:
                 "status": "sending",
                 "attempt_count": 0,
                 "last_error": None,
+                "sent_at": None,
                 "updated_at": self.db_now,
             }
             self._next_id += 1
@@ -111,6 +113,7 @@ def _build_mocks(
                         if row["id"] == did:
                             row["status"] = "sent"
                             row["last_error"] = None
+                            row["sent_at"] = store.db_now
                             row["updated_at"] = store.db_now
                 elif "status = 'failed_permanent'" in sql_stripped:
                     error_msg = params[0]
@@ -119,6 +122,15 @@ def _build_mocks(
                             row["status"] = "failed_permanent"
                             row["last_error"] = error_msg
                             row["updated_at"] = store.db_now
+                elif "status = 'sending'" in sql_stripped and "attempt_count + 1" in sql_stripped and "interval" in sql_stripped:
+                    # _DIAG_FORCE_TRANSIENT_SQL: increment + stale updated_at
+                    error_msg = params[0]
+                    for row in store.rows.values():
+                        if row["id"] == did:
+                            row["status"] = "sending"
+                            row["attempt_count"] += 1
+                            row["last_error"] = error_msg
+                            row["updated_at"] = store.db_now - timedelta(seconds=600)
                 elif "status = 'sending'" in sql_stripped and "attempt_count + 1" in sql_stripped:
                     for row in store.rows.values():
                         if row["id"] == did:
@@ -181,7 +193,7 @@ def _build_mocks(
     return patches, provider_mock
 
 
-def _post_send_response(client, patches, **overrides):
+def _post_send_response(client, patches, headers=None, **overrides):
     payload = {
         "property_id": "prop-test",
         "outbox_event_id": 42,
@@ -196,7 +208,11 @@ def _post_send_response(client, patches, **overrides):
         ctx_stack.append(p)
 
     try:
-        return client.post("/tasks/whatsapp/send-response", json=payload)
+        return client.post(
+            "/tasks/whatsapp/send-response",
+            json=payload,
+            headers=headers or {},
+        )
     finally:
         for p in ctx_stack:
             p.stop()
@@ -620,3 +636,120 @@ class TestSanitizeError:
 
     def test_unknown_exception(self):
         assert _sanitize_error(ValueError("x")) == "ValueError"
+
+
+# ---------------------------------------------------------------------------
+# Staging diagnostic hook tests
+# ---------------------------------------------------------------------------
+
+class TestStagingDiagHook:
+    """Staging diagnostic hook for forcing transient failures (gated)."""
+
+    _STAGING_ENV = {"APP_ENV": "staging", "STAGING_DIAG_ENABLE": "true"}
+    _DIAG_HEADER = {"x-diag-force-transient": "1"}
+    _STAGING_OUTBOX = (
+        "pousada-staging",
+        "whatsapp.send_message",
+        "hash_abc",
+        json.dumps({"template_key": "prompt_dates", "params": {}}),
+    )
+
+    def test_hook_inactive_when_staging_diag_enable_missing(self, client):
+        """Without STAGING_DIAG_ENABLE, hook does not fire — normal send succeeds."""
+        store = FakeDeliveryStore()
+        patches, provider_mock = _build_mocks(store, outbox_row=self._STAGING_OUTBOX)
+
+        env = {"APP_ENV": "staging"}
+        with patch.dict(os.environ, env, clear=False):
+            os.environ.pop("STAGING_DIAG_ENABLE", None)
+            resp = _post_send_response(
+                client, patches,
+                headers=self._DIAG_HEADER,
+                property_id="pousada-staging",
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        provider_mock.assert_called_once()
+
+    def test_hook_inactive_when_staging_diag_enable_false(self, client):
+        """STAGING_DIAG_ENABLE=false does not activate hook."""
+        store = FakeDeliveryStore()
+        patches, provider_mock = _build_mocks(store, outbox_row=self._STAGING_OUTBOX)
+
+        env = {"APP_ENV": "staging", "STAGING_DIAG_ENABLE": "false"}
+        with patch.dict(os.environ, env, clear=False):
+            resp = _post_send_response(
+                client, patches,
+                headers=self._DIAG_HEADER,
+                property_id="pousada-staging",
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        provider_mock.assert_called_once()
+
+    def test_hook_fires_when_all_gates_satisfied(self, client):
+        """All gates met => HTTP 500 with error=forced_transient, provider NOT called."""
+        store = FakeDeliveryStore()
+        patches, provider_mock = _build_mocks(store, outbox_row=self._STAGING_OUTBOX)
+
+        with patch.dict(os.environ, self._STAGING_ENV, clear=False):
+            resp = _post_send_response(
+                client, patches,
+                headers=self._DIAG_HEADER,
+                property_id="pousada-staging",
+            )
+
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body == {"ok": False, "error": "forced_transient"}
+        provider_mock.assert_not_called()
+
+    def test_hook_increments_attempt_on_every_call(self, client):
+        """Each retry increments attempt_count and returns forced_transient (never lease_held)."""
+        store = FakeDeliveryStore()
+        patches, provider_mock = _build_mocks(store, outbox_row=self._STAGING_OUTBOX)
+
+        with patch.dict(os.environ, self._STAGING_ENV, clear=False):
+            resp1 = _post_send_response(
+                client, patches,
+                headers=self._DIAG_HEADER,
+                property_id="pousada-staging",
+            )
+            resp2 = _post_send_response(
+                client, patches,
+                headers=self._DIAG_HEADER,
+                property_id="pousada-staging",
+            )
+
+        assert resp1.status_code == 500
+        assert resp1.json()["error"] == "forced_transient"
+        assert resp2.status_code == 500
+        assert resp2.json()["error"] == "forced_transient"
+
+        row = store.rows[("pousada-staging", 42)]
+        assert row["attempt_count"] == 2
+        assert row["last_error"] == "forced_transient"
+        assert row["status"] == "sending"
+        assert row["sent_at"] is None
+        provider_mock.assert_not_called()
+
+    def test_lease_held_distinct_from_hook(self, client):
+        """Without diag gates, lease_held still works normally."""
+        store = FakeDeliveryStore()
+        patches, provider_mock = _build_mocks(store)  # default outbox (prop-test)
+
+        # Pre-populate fresh lease
+        store.ensure("prop-test", 42)
+        row = store.rows[("prop-test", 42)]
+        row["status"] = "sending"
+        row["attempt_count"] = 1
+        row["updated_at"] = store.db_now  # fresh
+
+        resp = _post_send_response(client, patches)
+
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body["error"] == "lease_held"
+        provider_mock.assert_not_called()

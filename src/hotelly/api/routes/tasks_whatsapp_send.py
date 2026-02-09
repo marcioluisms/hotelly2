@@ -1,6 +1,7 @@
 """Worker route for sending WhatsApp messages."""
 
 import json
+import os
 import urllib.error
 
 from pydantic import BaseModel
@@ -121,6 +122,15 @@ WHERE id = %s
 _MARK_TRANSIENT_ERROR_SQL = """
 UPDATE outbox_deliveries
 SET last_error = %s, updated_at = now()
+WHERE id = %s
+"""
+
+_DIAG_FORCE_TRANSIENT_SQL = """
+UPDATE outbox_deliveries
+SET status = 'sending',
+    attempt_count = attempt_count + 1,
+    last_error = %s,
+    updated_at = now() - interval '600 seconds'
 WHERE id = %s
 """
 
@@ -254,6 +264,24 @@ async def send_message(request: Request, req: SendMessageRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Staging diagnostic hook (gated: staging + env flag + header + property_id)
+# ---------------------------------------------------------------------------
+
+def _staging_diag_force_transient(request: Request, property_id: str) -> bool:
+    """Return True when ALL staging diagnostic gates are satisfied.
+
+    Only activates in staging with explicit opt-in via env var and request header,
+    for a single known test property.
+    """
+    return (
+        os.environ.get("APP_ENV") == "staging"
+        and os.environ.get("STAGING_DIAG_ENABLE") == "true"
+        and request.headers.get("x-diag-force-transient") == "1"
+        and property_id == "pousada-staging"
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks/whatsapp/send-response  (with delivery guard + retry semantics)
 # ---------------------------------------------------------------------------
 
@@ -285,6 +313,19 @@ async def send_response(request: Request, req: SendResponseRequest):
     - remote_jid resolved in memory only, never logged, discarded after send.
     """
     correlation_id = req.correlation_id or get_correlation_id()
+
+    # Diagnostic: entry log with raw header values
+    logger.info(
+        "send-response entry",
+        extra={"extra_fields": {
+            "route": "/tasks/whatsapp/send-response",
+            "outbox_event_id": req.outbox_event_id,
+            "property_id": req.property_id,
+            "x_correlation_id": request.headers.get(
+                "x-correlation-id", "missing"
+            ),
+        }},
+    )
 
     # Verify task authentication (OIDC or internal secret in local dev)
     if not verify_task_auth(request):
@@ -350,10 +391,78 @@ async def send_response(request: Request, req: SendResponseRequest):
         )
 
     # ------------------------------------------------------------------
-    # 2. Acquire delivery lease (atomic: upsert + lock + check + update)
+    # 2. Staging diagnostic: force transient failure (gated, before lease)
+    # ------------------------------------------------------------------
+    if _staging_diag_force_transient(request, property_id):
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_ENSURE_DELIVERY_SQL, (property_id, req.outbox_event_id))
+                cur.execute(_LOCK_DELIVERY_SQL, (property_id, req.outbox_event_id))
+                delivery_row = cur.fetchone()
+                delivery_id, _, attempt_count, _ = delivery_row
+                cur.execute(
+                    _DIAG_FORCE_TRANSIENT_SQL,
+                    ("forced_transient", delivery_id),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        logger.info(
+            "send-response forced_transient",
+            extra={"extra_fields": {
+                "correlationId": correlation_id,
+                "property_id": property_id,
+                "outbox_event_id": req.outbox_event_id,
+                "delivery_id": delivery_id,
+                "attempt_count": attempt_count + 1,
+                "forced_transient": True,
+            }},
+        )
+        return Response(
+            status_code=500,
+            content=json.dumps({"ok": False, "error": "forced_transient"}),
+            media_type="application/json",
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Acquire delivery lease (atomic: upsert + lock + check + update)
     # ------------------------------------------------------------------
     conn = get_conn()
     try:
+        # Diagnostic: DB fingerprint (no secrets)
+        try:
+            with conn.cursor() as _diag:
+                _diag.execute(
+                    "SELECT current_database(),"
+                    " inet_server_addr(),"
+                    " inet_server_port()"
+                )
+                _db_name, _db_addr, _db_port = _diag.fetchone()
+                _diag.execute("SELECT version_num FROM alembic_version")
+                _alembic_row = _diag.fetchone()
+            logger.info(
+                "send-response db fingerprint",
+                extra={"extra_fields": {
+                    **log_ctx,
+                    "db_name": _db_name,
+                    "db_addr": str(_db_addr) if _db_addr else None,
+                    "db_port": _db_port,
+                    "alembic_version": (
+                        _alembic_row[0] if _alembic_row else "none"
+                    ),
+                }},
+            )
+        except Exception:
+            logger.info(
+                "send-response db fingerprint unavailable",
+                extra={"extra_fields": log_ctx},
+            )
+
         with conn.cursor() as cur:
             cur.execute(_ENSURE_DELIVERY_SQL, (property_id, req.outbox_event_id))
             cur.execute(_LOCK_DELIVERY_SQL, (property_id, req.outbox_event_id))
@@ -397,7 +506,18 @@ async def send_response(request: Request, req: SendResponseRequest):
 
             # Acquire lease: mark sending + bump attempt
             cur.execute(_ACQUIRE_LEASE_SQL, (delivery_id,))
+
         conn.commit()
+
+        # Diagnostic: delivery guard completed
+        logger.info(
+            "send-response delivery guard ok",
+            extra={"extra_fields": {
+                **log_ctx,
+                "ensure": "ok",
+                "delivery_status": delivery_status,
+            }},
+        )
     except Exception:
         conn.rollback()
         raise
@@ -425,6 +545,16 @@ async def send_response(request: Request, req: SendResponseRequest):
                 _MARK_FAILED_PERMANENT_SQL,
                 ("contact_ref_not_found", delivery_id),
             )
+        # Diagnostic: permanent failure before return
+        logger.info(
+            "send-response contact_ref_not_found final",
+            extra={"extra_fields": {
+                "result": "failed_permanent",
+                "error": "contact_ref_not_found",
+                "outbox_event_id": req.outbox_event_id,
+                "property_id": property_id,
+            }},
+        )
         return {"ok": False, "terminal": True, "error": "contact_ref_not_found"}
 
     try:
