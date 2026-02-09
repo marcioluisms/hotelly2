@@ -16,8 +16,11 @@ fi
 
 echo "[verify] (optional) alembic upgrade heads"
 if uv run python -c "import alembic" >/dev/null 2>&1; then
-  HEAD_COUNT=$(uv run alembic heads 2>/dev/null | grep -E '^[0-9a-f]+' -c)
+  HEADS_OUTPUT=$(uv run alembic heads 2>&1)
+  HEAD_COUNT=$(echo "$HEADS_OUTPUT" | grep -E '^[0-9a-f]+.*\((head)\)' -c)
   if [ "$HEAD_COUNT" -ne 1 ]; then
+    echo "[verify] Alembic heads output:"
+    echo "$HEADS_OUTPUT"
     echo "[verify] Multiple Alembic heads detected. Create a merge revision (uv run alembic merge -m \"merge heads\" <A> <B> ...)."
     exit 1
   fi
