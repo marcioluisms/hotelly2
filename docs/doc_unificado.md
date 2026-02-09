@@ -1985,10 +1985,23 @@ where property_id = 'pousada-staging'
 
 ## Próximo Passo
 
-### ⏳ FASE 18: Edição em Lote de Rates
+### ✅ FASE 18: Edição em Lote de Rates
 - Bulk edit: selecionar múltiplas datas
 - Copiar rates de um período para outro
 - Aplicar ajuste percentual
+---
+
+Correção crítica no save do RatesGrid: payload de PUT /rates agora faz merge com o RateDay “base” vindo do GET (não reconstrói com defaults), evitando zerar min_nights/flags/buckets quando o usuário edita só preço.
+
+Room types com nome via GET /occupancy (janela 1 dia) para montar {room_type_id,name} (não via /rooms).
+
+Seleção multi-data no header (toggle + shift-range), com highlight em todas as tabelas e filtragem da seleção para datas visíveis.
+
+Modal de bulk edit: set value (R$) por pax; ajuste percentual com regra “vazio permanece vazio” e toggle “criar quando vazio” (vazio→0).
+
+Copiar período: limita a ≤366 dias, copia somente dias existentes do source e persiste com PUT; faz refresh após concluir.
+
+Se você registrar também a nota de infra (fora do escopo da S18): CI do backend foi ajustado para alembic upgrade heads por “multiple heads” e isso vira follow-up de merge revision.
 
 ---
 
