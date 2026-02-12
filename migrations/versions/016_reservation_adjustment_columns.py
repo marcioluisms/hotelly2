@@ -3,7 +3,7 @@
 Adds original_total_cents, adjustment_cents, adjustment_reason to support
 the change-dates feature with price adjustment tracking.
 
-Revision ID: 016_reservation_adjustment_columns
+Revision ID: 016_reservation_adj_cols
 Revises: 015_drop_ari_legacy_columns
 Create Date: 2026-02-12
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 from alembic import op
 
-revision = "016_reservation_adjustment_columns"
+revision = "016_reservation_adj_cols"
 down_revision = "015_drop_ari_legacy_columns"
 branch_labels = None
 depends_on = None
