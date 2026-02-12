@@ -1,8 +1,8 @@
-"""Tests for rates endpoint legacy/bucket field compatibility.
+"""Tests for rates endpoint field compatibility.
 
 Tests for:
-- GET /rates returns both new (price_bucket*_chd_cents) and legacy (price_*chd_cents) fields
-- PUT /rates accepts legacy fields, new fields, and rejects conflicts
+- GET /rates returns only canonical (price_bucket*_chd_cents) fields (S22.2)
+- PUT /rates accepts only canonical fields; legacy keys are rejected (S22.3)
 """
 
 from __future__ import annotations
@@ -134,11 +134,11 @@ class MockTxnContext:
 RATE_DATE = "2025-07-01"
 
 
-class TestGetRatesReturnsNewAndLegacyFields:
-    def test_get_rates_returns_new_and_legacy_fields(
+class TestGetRatesReturnsCanonicalFieldsOnly:
+    def test_get_rates_returns_canonical_fields_only(
         self, client, mock_db_user, auth_header
     ):
-        """GET /rates returns both price_bucket*_chd_cents and price_*chd_cents with same values."""
+        """GET /rates returns only price_bucket*_chd_cents (legacy aliases removed in S22.2)."""
         mock_row = (
             "rt_standard",      # room_type_id
             date(2025, 7, 1),   # date
@@ -172,69 +172,25 @@ class TestGetRatesReturnsNewAndLegacyFields:
 
             row = data[0]
 
-            # New fields present
+            # Canonical bucket fields present
             assert row["price_bucket1_chd_cents"] == 3000
             assert row["price_bucket2_chd_cents"] == 5000
             assert row["price_bucket3_chd_cents"] == 7000
 
-            # Legacy fields present with same values
-            assert row["price_1chd_cents"] == 3000
-            assert row["price_2chd_cents"] == 5000
-            assert row["price_3chd_cents"] == 7000
+            # Legacy aliases no longer emitted (S22.2)
+            assert "price_1chd_cents" not in row
+            assert "price_2chd_cents" not in row
+            assert "price_3chd_cents" not in row
 
 
-# ── PUT compat tests ─────────────────────────────────────
+# ── PUT tests ────────────────────────────────────────────
 
 
-class TestPutRatesAcceptsLegacyFields:
-    def test_put_rates_accepts_legacy_fields(
+class TestPutRatesAcceptsCanonicalFields:
+    def test_put_rates_accepts_canonical_fields(
         self, client, mock_db_user, auth_header
     ):
-        """PUT /rates with legacy price_*chd_cents fields persists into bucket columns."""
-        mock_cur = MockCursor()
-
-        with (
-            patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"),
-            patch("hotelly.api.routes.rates.txn", return_value=MockTxnContext(mock_cur)),
-        ):
-            response = client.put(
-                "/rates?property_id=prop-1",
-                json={
-                    "rates": [
-                        {
-                            "room_type_id": "rt_standard",
-                            "date": RATE_DATE,
-                            "price_2pax_cents": 15000,
-                            "price_1chd_cents": 3000,
-                            "price_2chd_cents": 5000,
-                            "price_3chd_cents": 7000,
-                        }
-                    ]
-                },
-                headers=auth_header,
-            )
-
-            assert response.status_code == 200
-            assert response.json() == {"upserted": 1}
-
-            # Verify the INSERT was called with bucket values populated from legacy
-            assert len(mock_cur.executed) == 1
-            _query, params = mock_cur.executed[0]
-            # params layout: property_id, room_type_id, date,
-            #   price_1pax, price_2pax, price_3pax, price_4pax,
-            #   price_bucket1_chd, price_bucket2_chd, price_bucket3_chd,
-            #   min_nights, max_nights,
-            #   closed_checkin, closed_checkout, is_blocked
-            assert params[7] == 3000   # price_bucket1_chd_cents
-            assert params[8] == 5000   # price_bucket2_chd_cents
-            assert params[9] == 7000   # price_bucket3_chd_cents
-
-
-class TestPutRatesAcceptsNewFields:
-    def test_put_rates_accepts_new_fields(
-        self, client, mock_db_user, auth_header
-    ):
-        """PUT /rates with new price_bucket*_chd_cents fields works."""
+        """PUT /rates with price_bucket*_chd_cents fields works."""
         mock_cur = MockCursor()
 
         with (
@@ -269,14 +225,21 @@ class TestPutRatesAcceptsNewFields:
             assert params[9] == 7000   # price_bucket3_chd_cents
 
 
-class TestPutRatesRejectsConflictingFields:
-    def test_put_rates_rejects_conflicting_fields(
-        self, client, mock_db_user, auth_header
+class TestPutRatesRejectsLegacyFields:
+    """Legacy child keys are no longer accepted (S22.3).
+
+    RateDay uses extra='forbid', so unknown fields produce a 422.
+    """
+
+    @pytest.mark.parametrize(
+        "legacy_key",
+        ["price_1chd_cents", "price_2chd_cents", "price_3chd_cents"],
+    )
+    def test_put_rates_rejects_legacy_child_key(
+        self, client, mock_db_user, auth_header, legacy_key
     ):
-        """PUT /rates with conflicting bucket and legacy values returns 400."""
         with (
             patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"),
-            patch("hotelly.api.routes.rates.txn", return_value=MockTxnContext(MockCursor())),
         ):
             response = client.put(
                 "/rates?property_id=prop-1",
@@ -286,13 +249,17 @@ class TestPutRatesRejectsConflictingFields:
                             "room_type_id": "rt_standard",
                             "date": RATE_DATE,
                             "price_2pax_cents": 15000,
-                            "price_bucket1_chd_cents": 3000,
-                            "price_1chd_cents": 5000,  # conflicts with bucket1
+                            legacy_key: 3000,
                         }
                     ]
                 },
                 headers=auth_header,
             )
 
-            assert response.status_code == 400
-            assert "conflict" in response.json()["detail"].lower()
+            assert response.status_code == 422
+            body = response.json()
+            # Pydantic extra=forbid → "Extra inputs are not permitted"
+            assert any(
+                "extra" in (e.get("msg", "") or "").lower()
+                for e in body.get("detail", [])
+            )

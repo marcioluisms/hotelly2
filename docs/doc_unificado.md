@@ -767,7 +767,7 @@ gcloud logging read "resource.type=cloud_run_revision AND resource.labels.servic
 
 # Evolution API
 curl -X POST "https://edge.roda.ia.br/chat/findMessages/pousada-ia-v2" \
-  -H "apikey: FC4A3BCF9071-4357-852C-94ABA41DA0B5" \
+  -H "apikey: <EVOLUTION_API_KEY>" \
   -d '{"limit": 3}'
 
 # Cloud SQL Proxy (para migrations manuais)

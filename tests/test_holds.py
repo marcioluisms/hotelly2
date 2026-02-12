@@ -78,7 +78,6 @@ def seed_ari(
     inv_total: int = 1,
     inv_booked: int = 0,
     inv_held: int = 0,
-    base_rate_cents: int = 10000,
     currency: str = "BRL",
 ):
     """Seed ARI data for testing."""
@@ -88,14 +87,13 @@ def seed_ari(
             INSERT INTO ari_days (
                 property_id, room_type_id, date,
                 inv_total, inv_booked, inv_held,
-                base_rate_cents, currency
+                currency
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (property_id, room_type_id, date) DO UPDATE
             SET inv_total = EXCLUDED.inv_total,
                 inv_booked = EXCLUDED.inv_booked,
                 inv_held = EXCLUDED.inv_held,
-                base_rate_cents = EXCLUDED.base_rate_cents,
                 currency = EXCLUDED.currency
             """,
             (
@@ -105,7 +103,6 @@ def seed_ari(
                 inv_total,
                 inv_booked,
                 inv_held,
-                base_rate_cents,
                 currency,
             ),
         )
