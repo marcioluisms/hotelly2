@@ -128,9 +128,9 @@ def seed_ari(
             INSERT INTO ari_days (
                 property_id, room_type_id, date,
                 inv_total, inv_booked, inv_held,
-                base_rate_cents, currency
+                currency
             )
-            VALUES (%s, %s, %s, %s, %s, %s, 10000, 'BRL')
+            VALUES (%s, %s, %s, %s, %s, %s, 'BRL')
             ON CONFLICT (property_id, room_type_id, date) DO UPDATE
             SET inv_total = EXCLUDED.inv_total,
                 inv_booked = EXCLUDED.inv_booked,

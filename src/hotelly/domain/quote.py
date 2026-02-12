@@ -89,7 +89,7 @@ def quote_minimum(
     # --- ARI check ---
     cur.execute(
         """
-        SELECT date, inv_total, inv_booked, inv_held, base_rate_cents, currency
+        SELECT date, inv_total, inv_booked, inv_held, currency
         FROM ari_days
         WHERE property_id = %s
           AND room_type_id = %s
@@ -124,7 +124,7 @@ def quote_minimum(
         if ari is None:
             raise QuoteUnavailable("no_ari_record", {"date": str(current)})
 
-        _, inv_total, inv_booked, inv_held, _rate_cents, currency = ari
+        _, inv_total, inv_booked, inv_held, currency = ari
 
         if currency != "BRL":
             raise QuoteUnavailable("wrong_currency")

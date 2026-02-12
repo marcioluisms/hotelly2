@@ -82,9 +82,9 @@ def ensure_property():
                     INSERT INTO ari_days (
                         property_id, room_type_id, date,
                         inv_total, inv_booked, inv_held,
-                        base_rate_cents, currency
+                        currency
                     )
-                    VALUES (%s, %s, %s, 5, 0, 0, 25000, 'BRL')
+                    VALUES (%s, %s, %s, 5, 0, 0, 'BRL')
                     ON CONFLICT (property_id, room_type_id, date) DO UPDATE
                     SET inv_total = 5, inv_booked = 0, inv_held = 0
                     """,
