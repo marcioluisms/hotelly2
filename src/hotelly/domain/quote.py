@@ -168,3 +168,104 @@ def quote_minimum(
         "currency": "BRL",
         "nights": nights,
     }
+
+
+def calculate_total_cents(
+    cur: PgCursor,
+    *,
+    property_id: str,
+    room_type_id: str,
+    checkin: date,
+    checkout: date,
+    adult_count: int,
+    children_ages: list[int] | None = None,
+) -> int:
+    """Calculate total price in cents WITHOUT ARI availability check.
+
+    Same pricing logic as quote_minimum (PAX + child-bucket pricing) but
+    skips inventory availability validation.  Used for date-change repricing
+    where the existing reservation already occupies inventory on overlapping
+    dates.
+
+    Returns:
+        Total price in cents.
+
+    Raises:
+        QuoteUnavailable on invalid_dates, rate_missing, pax_rate_missing,
+        child_policy_missing, child_policy_incomplete, child_rate_missing.
+    """
+    if children_ages is None:
+        children_ages = []
+
+    if checkin >= checkout:
+        raise QuoteUnavailable("invalid_dates")
+
+    # --- Child policy (if children present) ---
+    buckets: list[dict] = []
+    if children_ages:
+        cur.execute(
+            "SELECT bucket, min_age, max_age "
+            "FROM property_child_age_buckets "
+            "WHERE property_id = %s ORDER BY bucket",
+            (property_id,),
+        )
+        bucket_rows = cur.fetchall()
+        if not bucket_rows:
+            raise QuoteUnavailable("child_policy_missing")
+
+        buckets = [
+            {"bucket": r[0], "min_age": r[1], "max_age": r[2]} for r in bucket_rows
+        ]
+
+        if len(buckets) != 3:
+            raise QuoteUnavailable("child_policy_incomplete")
+        sorted_buckets = sorted(buckets, key=lambda b: b["min_age"])
+        if sorted_buckets[0]["min_age"] != 0 or sorted_buckets[-1]["max_age"] != 17:
+            raise QuoteUnavailable("child_policy_incomplete")
+        for i in range(1, len(sorted_buckets)):
+            if sorted_buckets[i]["min_age"] != sorted_buckets[i - 1]["max_age"] + 1:
+                raise QuoteUnavailable("child_policy_incomplete")
+
+        for age in children_ages:
+            if _bucket_for_age(age, buckets) is None:
+                raise QuoteUnavailable("child_policy_incomplete")
+
+    # --- Fetch PAX rates (no ARI check) ---
+    rates_by_date = fetch_room_type_rates_by_date(
+        cur,
+        property_id=property_id,
+        room_type_id=room_type_id,
+        start=checkin,
+        end=checkout,
+    )
+
+    # --- Pricing per night ---
+    pax_col = f"price_{adult_count}pax_cents"
+    total_cents = 0
+    current = checkin
+
+    while current < checkout:
+        rate = rates_by_date.get(current)
+        if rate is None:
+            raise QuoteUnavailable("rate_missing", {"date": str(current)})
+
+        adult_base = rate.get(pax_col)
+        if adult_base is None:
+            raise QuoteUnavailable("pax_rate_missing", {"date": str(current)})
+
+        child_total = 0
+        for age in children_ages:
+            bucket_num = _bucket_for_age(age, buckets)
+            chd_col = f"price_bucket{bucket_num}_chd_cents"
+            chd_price = rate.get(chd_col)
+            if chd_price is None:
+                raise QuoteUnavailable(
+                    "child_rate_missing",
+                    {"date": str(current), "bucket": bucket_num},
+                )
+            child_total += chd_price
+
+        total_cents += adult_base + child_total
+        current += timedelta(days=1)
+
+    return total_cents

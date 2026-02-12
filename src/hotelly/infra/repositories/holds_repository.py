@@ -165,6 +165,67 @@ def increment_inv_held(
     return row is not None
 
 
+def increment_inv_booked(
+    cur: PgCursor,
+    *,
+    property_id: str,
+    room_type_id: str,
+    night_date: date,
+) -> bool:
+    """Increment inv_booked for a night with availability guard.
+
+    Uses UPDATE with WHERE guard to prevent overbooking:
+    inv_total >= inv_booked + inv_held + 1
+
+    Returns:
+        True if successfully incremented, False if unavailable.
+    """
+    cur.execute(
+        """
+        UPDATE ari_days
+        SET inv_booked = inv_booked + 1, updated_at = now()
+        WHERE property_id = %s
+          AND room_type_id = %s
+          AND date = %s
+          AND inv_total >= inv_booked + inv_held + 1
+        RETURNING inv_booked
+        """,
+        (property_id, room_type_id, night_date),
+    )
+    row = cur.fetchone()
+    return row is not None
+
+
+def decrement_inv_booked(
+    cur: PgCursor,
+    *,
+    property_id: str,
+    room_type_id: str,
+    night_date: date,
+) -> bool:
+    """Decrement inv_booked for a night with guard.
+
+    Guard: inv_booked >= 1 (cannot go negative).
+
+    Returns:
+        True if successfully decremented, False if guard failed.
+    """
+    cur.execute(
+        """
+        UPDATE ari_days
+        SET inv_booked = inv_booked - 1, updated_at = now()
+        WHERE property_id = %s
+          AND room_type_id = %s
+          AND date = %s
+          AND inv_booked >= 1
+        RETURNING inv_booked
+        """,
+        (property_id, room_type_id, night_date),
+    )
+    row = cur.fetchone()
+    return row is not None
+
+
 def get_hold(cur: PgCursor, hold_id: str) -> dict | None:
     """Retrieve a hold by ID.
 
