@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+from migrations.env_helpers import _get_database_url
 
 
 # Alembic Config object, provides access to values in alembic.ini.
@@ -16,13 +17,6 @@ if config.config_file_name is not None:
 
 # NOTE: we are using SQL-only migrations (no SQLAlchemy metadata autogenerate).
 target_metadata = None
-
-
-def _get_database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is required to run migrations")
-    return url
 
 
 def run_migrations_offline() -> None:
