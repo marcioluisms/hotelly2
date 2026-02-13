@@ -1,16 +1,76 @@
-"""Tests for database layer (requires Postgres)."""
+"""Tests for database layer."""
 
 import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Skip all tests in this module if DATABASE_URL is not set
-pytestmark = pytest.mark.skipif(
+
+class TestGetConnPasswordFallback:
+    """Tests for DB_PASSWORD fallback in get_conn() — no real DB needed."""
+
+    def test_db_password_fallback_dsn_without_password(self):
+        from hotelly.infra.db import get_conn
+
+        env = {"DATABASE_URL": "dbname=db user=u host=h port=5432", "DB_PASSWORD": "from-env"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("hotelly.infra.db.psycopg2.connect", return_value=MagicMock()) as mock_connect:
+            get_conn()
+            mock_connect.assert_called_once_with(
+                "dbname=db user=u host=h port=5432",
+                password="from-env",
+            )
+
+    def test_db_password_not_used_when_dsn_has_password(self):
+        from hotelly.infra.db import get_conn
+
+        env = {"DATABASE_URL": "dbname=db user=u password=from-dsn host=h", "DB_PASSWORD": "from-env"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("hotelly.infra.db.psycopg2.connect", return_value=MagicMock()) as mock_connect:
+            get_conn()
+            mock_connect.assert_called_once_with(
+                "dbname=db user=u password=from-dsn host=h",
+            )
+
+    def test_db_password_fallback_url_without_password(self):
+        from hotelly.infra.db import get_conn
+
+        env = {"DATABASE_URL": "postgres://u@h/db", "DB_PASSWORD": "from-env"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("hotelly.infra.db.psycopg2.connect", return_value=MagicMock()) as mock_connect:
+            get_conn()
+            mock_connect.assert_called_once_with(
+                "postgres://u@h/db",
+                password="from-env",
+            )
+
+    def test_db_password_not_used_when_url_has_password(self):
+        from hotelly.infra.db import get_conn
+
+        env = {"DATABASE_URL": "postgres://u:p@h/db", "DB_PASSWORD": "from-env"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("hotelly.infra.db.psycopg2.connect", return_value=MagicMock()) as mock_connect:
+            get_conn()
+            mock_connect.assert_called_once_with("postgres://u:p@h/db")
+
+    def test_no_db_password_env(self):
+        from hotelly.infra.db import get_conn
+
+        env = {"DATABASE_URL": "dbname=db user=u host=h"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("hotelly.infra.db.psycopg2.connect", return_value=MagicMock()) as mock_connect:
+            get_conn()
+            mock_connect.assert_called_once_with("dbname=db user=u host=h")
+
+
+# Skip integration tests if DATABASE_URL is not set
+_skip_no_db = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
-    reason="DATABASE_URL not set - skipping DB tests",
+    reason="DATABASE_URL not set - skipping DB integration tests",
 )
 
 
+@_skip_no_db
 class TestGetConn:
     """Tests for get_conn()."""
 
@@ -32,6 +92,7 @@ class TestGetConn:
             get_conn()
 
 
+@_skip_no_db
 class TestTxn:
     """Tests for txn() context manager."""
 
@@ -95,6 +156,7 @@ class TestTxn:
             assert row[0] == 1
 
 
+@_skip_no_db
 class TestHelpers:
     """Tests for execute, fetchone, fetchall helpers."""
 
@@ -153,6 +215,7 @@ class TestHelpers:
             conn.close()
 
 
+@_skip_no_db
 class TestForUpdate:
     """Tests for for_update() helper."""
 

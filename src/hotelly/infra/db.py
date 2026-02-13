@@ -10,16 +10,28 @@ Provides:
 """
 
 import os
+import re
 from contextlib import contextmanager
 from datetime import date
 from typing import Any, Iterator, Sequence
+from urllib.parse import urlparse
 
 import psycopg2
 from psycopg2.extensions import connection as PgConnection, cursor as PgCursor
 
 
+def _dsn_has_password(dsn: str) -> bool:
+    """Check if a connection string already contains a password."""
+    if "://" in dsn:
+        return bool(urlparse(dsn).password)
+    return bool(re.search(r"\bpassword=\S", dsn))
+
+
 def get_conn() -> PgConnection:
     """Get a new database connection from DATABASE_URL.
+
+    Falls back to DB_PASSWORD env var when the connection string
+    does not contain a password.
 
     Returns:
         psycopg2 connection object.
@@ -31,7 +43,13 @@ def get_conn() -> PgConnection:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         raise RuntimeError("DATABASE_URL environment variable not set")
-    return psycopg2.connect(dsn)
+
+    kwargs: dict[str, str] = {}
+    db_password = os.environ.get("DB_PASSWORD", "")
+    if db_password and not _dsn_has_password(dsn):
+        kwargs["password"] = db_password
+
+    return psycopg2.connect(dsn, **kwargs)
 
 
 @contextmanager
