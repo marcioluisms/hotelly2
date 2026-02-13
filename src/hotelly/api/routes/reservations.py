@@ -54,6 +54,7 @@ class ModifyApplyRequest(BaseModel):
     new_checkin: date
     new_checkout: date
 
+
 router = APIRouter(prefix="/reservations", tags=["reservations"])
 
 logger = get_logger(__name__)
