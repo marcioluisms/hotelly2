@@ -28,7 +28,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/hotelly_test
       CI: true
-      EVOLUTION_WEBHOOK_SECRET: test_secret
+      TASKS_OIDC_AUDIENCE: hotelly-tasks-local
 
     steps:
       - uses: actions/checkout@v4
