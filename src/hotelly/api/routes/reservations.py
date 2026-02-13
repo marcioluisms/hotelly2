@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from pydantic import BaseModel
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
@@ -18,6 +18,12 @@ from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
 from hotelly.tasks.client import TasksClient
+
+
+class CancelReservationRequest(BaseModel):
+    """Request body for cancel action."""
+
+    reason: str
 
 
 class AssignRoomRequest(BaseModel):
@@ -37,6 +43,16 @@ class ChangeDatesRequest(BaseModel):
     checkout: date
     adjustment_cents: int = 0
     adjustment_reason: str | None = None
+
+
+class ModifyPreviewRequest(BaseModel):
+    new_checkin: date
+    new_checkout: date
+
+
+class ModifyApplyRequest(BaseModel):
+    new_checkin: date
+    new_checkout: date
 
 router = APIRouter(prefix="/reservations", tags=["reservations"])
 
@@ -514,6 +530,452 @@ def preview_change_dates(
     }
 
 
+@router.post("/{reservation_id}/actions/modify-preview")
+def modify_preview(
+    body: ModifyPreviewRequest,
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> dict:
+    """Preview a reservation modification: room conflict + ARI + pricing.
+
+    Read-only — no mutations. Returns feasibility and pricing delta.
+    Includes ADR-008 room conflict check when the reservation has a room assigned.
+    Requires staff role or higher.
+    """
+    from hotelly.domain.quote import QuoteUnavailable, calculate_total_cents
+    from hotelly.domain.room_conflict import check_room_conflict
+    from hotelly.infra.db import txn
+
+    if body.new_checkin >= body.new_checkout:
+        return {
+            "is_possible": False,
+            "reason_code": "invalid_dates",
+            "current_total_cents": 0,
+            "new_total_cents": 0,
+            "delta_amount_cents": 0,
+            "conflict_reservation_id": None,
+        }
+
+    reservation = _get_reservation_full(ctx.property_id, reservation_id)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    current_total_cents = reservation["total_cents"]
+
+    # Step 1: Room conflict check (ADR-008)
+    conflict_reservation_id = None
+    if reservation.get("room_id"):
+        with txn() as cur:
+            conflict_reservation_id = check_room_conflict(
+                cur,
+                room_id=reservation["room_id"],
+                check_in=body.new_checkin,
+                check_out=body.new_checkout,
+                exclude_reservation_id=reservation_id,
+                property_id=ctx.property_id,
+            )
+
+    if conflict_reservation_id is not None:
+        logger.info(
+            "modify-preview blocked by room conflict",
+            extra={
+                "extra_fields": safe_log_context(
+                    property_id=ctx.property_id,
+                    reservation_id=reservation_id,
+                    room_id=reservation.get("room_id"),
+                    conflict_reservation_id=conflict_reservation_id,
+                )
+            },
+        )
+        return {
+            "is_possible": False,
+            "reason_code": "room_conflict",
+            "current_total_cents": current_total_cents,
+            "new_total_cents": 0,
+            "delta_amount_cents": 0,
+            "conflict_reservation_id": conflict_reservation_id,
+        }
+
+    # Step 2: Resolve room_type_id for ARI + pricing
+    effective_room_type_id = _resolve_room_type_id(ctx.property_id, reservation)
+    if not effective_room_type_id:
+        raise HTTPException(status_code=422, detail="Cannot resolve room_type_id")
+
+    # Step 3: ARI availability check (with overlap adjustment)
+    old_nights: set[date] = set()
+    current = reservation["checkin"]
+    while current < reservation["checkout"]:
+        old_nights.add(current)
+        current += timedelta(days=1)
+
+    new_nights: set[date] = set()
+    current = body.new_checkin
+    while current < body.new_checkout:
+        new_nights.add(current)
+        current += timedelta(days=1)
+
+    overlap_dates = old_nights & new_nights
+
+    available, reason_code = _check_ari_availability(
+        ctx.property_id,
+        effective_room_type_id,
+        body.new_checkin,
+        body.new_checkout,
+        overlap_dates=overlap_dates,
+    )
+
+    if not available:
+        return {
+            "is_possible": False,
+            "reason_code": reason_code,
+            "current_total_cents": current_total_cents,
+            "new_total_cents": 0,
+            "delta_amount_cents": 0,
+            "conflict_reservation_id": None,
+        }
+
+    # Step 4: Calculate new pricing
+    try:
+        with txn() as cur:
+            new_total_cents = calculate_total_cents(
+                cur,
+                property_id=ctx.property_id,
+                room_type_id=effective_room_type_id,
+                checkin=body.new_checkin,
+                checkout=body.new_checkout,
+                adult_count=reservation["adult_count"],
+                children_ages=reservation["children_ages"],
+            )
+    except QuoteUnavailable as exc:
+        return {
+            "is_possible": False,
+            "reason_code": exc.reason_code,
+            "current_total_cents": current_total_cents,
+            "new_total_cents": 0,
+            "delta_amount_cents": 0,
+            "conflict_reservation_id": None,
+        }
+
+    delta_amount_cents = new_total_cents - current_total_cents
+
+    return {
+        "is_possible": True,
+        "current_total_cents": current_total_cents,
+        "new_total_cents": new_total_cents,
+        "delta_amount_cents": delta_amount_cents,
+        "conflict_reservation_id": None,
+    }
+
+
+@router.post("/{reservation_id}/actions/modify-apply")
+def modify_apply(
+    body: ModifyApplyRequest,
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+) -> dict:
+    """Apply a reservation date modification within a single transaction.
+
+    Transactional flow:
+    1. Check idempotency (skip if already applied).
+    2. Lock reservation FOR UPDATE.
+    3. Room conflict check (ADR-008) with FOR UPDATE lock.
+    4. ARI availability re-verification.
+    5. Reprice via calculate_total_cents.
+    6. Adjust inventory (decrement old nights, increment new nights).
+    7. Update reservation row.
+    8. Emit outbox event (reservation.dates_modified).
+    9. Record idempotency key.
+
+    Requires staff role or higher.
+    """
+    import json
+
+    from hotelly.domain.quote import QuoteUnavailable, calculate_total_cents
+    from hotelly.domain.room_conflict import check_room_conflict
+    from hotelly.infra.db import txn
+    from hotelly.infra.repositories.holds_repository import (
+        decrement_inv_booked,
+        increment_inv_booked,
+    )
+
+    correlation_id = get_correlation_id()
+
+    if body.new_checkin >= body.new_checkout:
+        raise HTTPException(status_code=400, detail="invalid_dates")
+
+    with txn() as cur:
+        # 1. Idempotency check
+        if idempotency_key:
+            cur.execute(
+                """
+                SELECT response_code, response_body
+                FROM idempotency_keys
+                WHERE idempotency_key = %s AND endpoint = %s
+                """,
+                (idempotency_key, f"modify-apply:{reservation_id}"),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                import json as _json
+
+                logger.info(
+                    "idempotent replay",
+                    extra={
+                        "extra_fields": safe_log_context(
+                            correlationId=correlation_id,
+                            property_id=ctx.property_id,
+                            reservation_id=reservation_id,
+                            idempotency_key=idempotency_key,
+                        )
+                    },
+                )
+                return _json.loads(existing[1])
+
+        # 2. Lock reservation
+        cur.execute(
+            """
+            SELECT id, status, checkin, checkout, total_cents, currency,
+                   room_id, room_type_id, adult_count, children_ages
+            FROM reservations
+            WHERE property_id = %s AND id = %s
+            FOR UPDATE
+            """,
+            (ctx.property_id, reservation_id),
+        )
+        res_row = cur.fetchone()
+        if res_row is None:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+
+        (
+            _, status, old_checkin, old_checkout, old_total_cents, currency,
+            room_id, res_room_type_id, adult_count, children_ages_raw,
+        ) = res_row
+
+        if status not in ("confirmed", "in_house"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Reservation status '{status}' does not allow modification",
+            )
+
+        # Parse children_ages
+        if isinstance(children_ages_raw, str):
+            children_ages = json.loads(children_ages_raw)
+        elif children_ages_raw is None:
+            children_ages = []
+        else:
+            children_ages = list(children_ages_raw)
+
+        # 3. Room conflict check (ADR-008)
+        if room_id:
+            conflict_id = check_room_conflict(
+                cur,
+                room_id=room_id,
+                check_in=body.new_checkin,
+                check_out=body.new_checkout,
+                exclude_reservation_id=reservation_id,
+                property_id=ctx.property_id,
+                lock=True,
+            )
+            if conflict_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Room conflict with reservation {conflict_id}",
+                )
+
+        # 4. Resolve effective room_type_id
+        effective_room_type_id = res_room_type_id
+        if effective_room_type_id is None and room_id:
+            cur.execute(
+                "SELECT room_type_id FROM rooms WHERE property_id = %s AND id = %s",
+                (ctx.property_id, room_id),
+            )
+            room_row = cur.fetchone()
+            if room_row:
+                effective_room_type_id = room_row[0]
+
+        if not effective_room_type_id:
+            raise HTTPException(status_code=422, detail="Cannot resolve room_type_id")
+
+        # 5. Compute night diffs
+        old_nights: set[date] = set()
+        d = old_checkin
+        while d < old_checkout:
+            old_nights.add(d)
+            d += timedelta(days=1)
+
+        new_nights: set[date] = set()
+        d = body.new_checkin
+        while d < body.new_checkout:
+            new_nights.add(d)
+            d += timedelta(days=1)
+
+        nights_to_remove = sorted(old_nights - new_nights)
+        nights_to_add = sorted(new_nights - old_nights)
+
+        # 6. Lock ARI rows for new nights to re-verify availability
+        if nights_to_add:
+            cur.execute(
+                """
+                SELECT date, inv_total, inv_booked, inv_held
+                FROM ari_days
+                WHERE property_id = %s AND room_type_id = %s
+                  AND date = ANY(%s)
+                ORDER BY date
+                FOR UPDATE
+                """,
+                (ctx.property_id, effective_room_type_id, nights_to_add),
+            )
+            ari_rows = cur.fetchall()
+            ari_by_date = {row[0]: row for row in ari_rows}
+
+            for night in nights_to_add:
+                ari = ari_by_date.get(night)
+                if ari is None:
+                    raise HTTPException(status_code=409, detail="no_ari_record")
+                _, inv_total, inv_booked, inv_held = ari
+                if inv_total - inv_booked - inv_held < 1:
+                    raise HTTPException(status_code=409, detail="no_inventory")
+
+        # 7. Reprice
+        try:
+            calculated_total_cents = calculate_total_cents(
+                cur,
+                property_id=ctx.property_id,
+                room_type_id=effective_room_type_id,
+                checkin=body.new_checkin,
+                checkout=body.new_checkout,
+                adult_count=adult_count or 2,
+                children_ages=children_ages,
+            )
+        except QuoteUnavailable as exc:
+            raise HTTPException(status_code=409, detail=exc.reason_code)
+
+        # 8. Adjust inventory
+        for night in nights_to_remove:
+            ok = decrement_inv_booked(
+                cur,
+                property_id=ctx.property_id,
+                room_type_id=effective_room_type_id,
+                night_date=night,
+            )
+            if not ok:
+                raise HTTPException(
+                    status_code=409, detail="inventory guard failed on decrement",
+                )
+
+        for night in nights_to_add:
+            ok = increment_inv_booked(
+                cur,
+                property_id=ctx.property_id,
+                room_type_id=effective_room_type_id,
+                night_date=night,
+            )
+            if not ok:
+                raise HTTPException(status_code=409, detail="no_inventory")
+
+        # 9. Update reservation
+        cur.execute(
+            """
+            UPDATE reservations
+            SET checkin = %s,
+                checkout = %s,
+                total_cents = %s,
+                original_total_cents = COALESCE(original_total_cents, %s),
+                room_type_id = COALESCE(room_type_id, %s),
+                updated_at = now()
+            WHERE property_id = %s AND id = %s
+            """,
+            (
+                body.new_checkin,
+                body.new_checkout,
+                calculated_total_cents,
+                old_total_cents,
+                effective_room_type_id,
+                ctx.property_id,
+                reservation_id,
+            ),
+        )
+
+        # 10. Emit outbox event
+        outbox_payload = json.dumps({
+            "reservation_id": reservation_id,
+            "property_id": ctx.property_id,
+            "old_checkin": old_checkin.isoformat(),
+            "old_checkout": old_checkout.isoformat(),
+            "new_checkin": body.new_checkin.isoformat(),
+            "new_checkout": body.new_checkout.isoformat(),
+            "old_total_cents": old_total_cents,
+            "new_total_cents": calculated_total_cents,
+            "delta_amount_cents": calculated_total_cents - old_total_cents,
+            "changed_by": ctx.user.id,
+        })
+        cur.execute(
+            """
+            INSERT INTO outbox_events
+                (property_id, event_type, aggregate_type, aggregate_id,
+                 correlation_id, message_type, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                ctx.property_id,
+                "reservation.dates_modified",
+                "reservation",
+                reservation_id,
+                correlation_id,
+                None,
+                outbox_payload,
+            ),
+        )
+
+        # 11. Record idempotency key
+        response_body = {
+            "id": reservation_id,
+            "checkin": body.new_checkin.isoformat(),
+            "checkout": body.new_checkout.isoformat(),
+            "status": status,
+            "total_cents": calculated_total_cents,
+            "currency": currency,
+            "room_id": room_id,
+            "room_type_id": effective_room_type_id,
+            "old_total_cents": old_total_cents,
+            "delta_amount_cents": calculated_total_cents - old_total_cents,
+        }
+
+        if idempotency_key:
+            cur.execute(
+                """
+                INSERT INTO idempotency_keys
+                    (idempotency_key, endpoint, response_code, response_body)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (idempotency_key, endpoint) DO NOTHING
+                """,
+                (
+                    idempotency_key,
+                    f"modify-apply:{reservation_id}",
+                    200,
+                    json.dumps(response_body),
+                ),
+            )
+
+    logger.info(
+        "modify-apply completed",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                new_checkin=body.new_checkin.isoformat(),
+                new_checkout=body.new_checkout.isoformat(),
+                new_total_cents=calculated_total_cents,
+            )
+        },
+    )
+
+    return response_body
+
+
 @router.post("/{reservation_id}/actions/change-dates", status_code=202)
 def change_dates(
     body: ChangeDatesRequest,
@@ -570,3 +1032,108 @@ def change_dates(
     )
 
     return {"status": "enqueued"}
+
+
+@router.post("/{reservation_id}/actions/cancel")
+def cancel_reservation_action(
+    body: CancelReservationRequest,
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+) -> dict:
+    """Cancel a confirmed reservation.
+
+    Transactional flow:
+    1. Check idempotency (skip if already processed).
+    2. Call cancel_reservation domain logic.
+    3. Record idempotency key with response.
+
+    Requires staff role or higher.
+    Requires Idempotency-Key header.
+    """
+    import json
+
+    from hotelly.domain.cancellation import (
+        ReservationNotCancellableError,
+        ReservationNotFoundError,
+        cancel_reservation,
+    )
+    from hotelly.infra.db import txn
+
+    correlation_id = get_correlation_id()
+
+    # 1. Idempotency check
+    with txn() as cur:
+        cur.execute(
+            """
+            SELECT response_code, response_body
+            FROM idempotency_keys
+            WHERE idempotency_key = %s AND endpoint = %s
+            """,
+            (idempotency_key, f"cancel:{reservation_id}"),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            logger.info(
+                "idempotent replay for cancel",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=correlation_id,
+                        property_id=ctx.property_id,
+                        reservation_id=reservation_id,
+                        idempotency_key=idempotency_key,
+                    )
+                },
+            )
+            return json.loads(existing[1])
+
+    # 2. Call domain logic
+    try:
+        result = cancel_reservation(
+            reservation_id,
+            reason=body.reason,
+            cancelled_by=ctx.user.id,
+            correlation_id=correlation_id,
+        )
+    except ReservationNotFoundError:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    except ReservationNotCancellableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # 3. Record idempotency key
+    response_body = {
+        "status": result["status"],
+        "reservation_id": result.get("reservation_id", reservation_id),
+        "refund_amount_cents": result.get("refund_amount_cents"),
+        "pending_refund_id": result.get("pending_refund_id"),
+    }
+
+    with txn() as cur:
+        cur.execute(
+            """
+            INSERT INTO idempotency_keys
+                (idempotency_key, endpoint, response_code, response_body)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (idempotency_key, endpoint) DO NOTHING
+            """,
+            (
+                idempotency_key,
+                f"cancel:{reservation_id}",
+                200,
+                json.dumps(response_body),
+            ),
+        )
+
+    logger.info(
+        "cancel reservation completed",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                refund_amount_cents=result.get("refund_amount_cents"),
+            )
+        },
+    )
+
+    return response_body

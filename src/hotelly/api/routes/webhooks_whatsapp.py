@@ -8,6 +8,8 @@ Security (ADR-006):
 - Logs contain NO PII
 """
 
+import hmac
+import os
 from typing import Any
 
 from fastapi import APIRouter, Header, Request, Response
@@ -54,6 +56,7 @@ def _classify_intent(parsed: Any) -> str:
 async def evolution_webhook(
     request: Request,
     x_property_id: str = Header(..., alias="X-Property-Id"),
+    x_webhook_secret: str | None = Header(None, alias="X-Webhook-Secret"),
 ) -> Response:
     """Receive Evolution API webhook.
 
@@ -72,13 +75,37 @@ async def evolution_webhook(
     Args:
         request: FastAPI request object.
         x_property_id: Property ID from header (required).
+        x_webhook_secret: Webhook secret for request validation (optional header).
 
     Returns:
         200 OK if processed or duplicate.
         400 Bad Request if payload invalid.
+        401 Unauthorized if secret validation fails.
         500 Internal Server Error if processing fails.
     """
     correlation_id = get_correlation_id()
+
+    # Webhook secret validation (fail-closed)
+    expected_secret = os.environ.get("EVOLUTION_WEBHOOK_SECRET", "")
+    if not expected_secret:
+        oidc_audience = os.environ.get("TASKS_OIDC_AUDIENCE", "")
+        if oidc_audience == "hotelly-tasks-local":
+            logger.warning(
+                "EVOLUTION_WEBHOOK_SECRET not set - skipping validation (local dev)",
+                extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+            )
+        else:
+            logger.error(
+                "EVOLUTION_WEBHOOK_SECRET not configured - rejecting webhook (fail-closed)",
+                extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+            )
+            return Response(status_code=401, content="unauthorized")
+    elif not x_webhook_secret or not hmac.compare_digest(x_webhook_secret, expected_secret):
+        logger.warning(
+            "evolution webhook secret mismatch",
+            extra={"extra_fields": safe_log_context(correlationId=correlation_id)},
+        )
+        return Response(status_code=401, content="unauthorized")
 
     # 1. Parse JSON
     try:

@@ -77,6 +77,12 @@ def mock_secrets(monkeypatch):
 
 
 @pytest.fixture
+def mock_evolution_secret(monkeypatch):
+    """Set EVOLUTION_WEBHOOK_SECRET for testing."""
+    monkeypatch.setenv("EVOLUTION_WEBHOOK_SECRET", "test-evolution-secret")
+
+
+@pytest.fixture
 def client():
     """Create test client."""
     app = create_app(role="public")
@@ -103,13 +109,13 @@ class TestWebhookEvolution:
     """Tests for POST /webhooks/whatsapp/evolution."""
 
     def test_valid_post_creates_receipt_and_enqueues(
-        self, client, ensure_property, mock_tasks_client, mock_secrets
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
     ):
         """Test 1: Valid POST creates receipt and enqueues task."""
         response = client.post(
             "/webhooks/whatsapp/evolution",
             json=VALID_PAYLOAD,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
         )
 
         assert response.status_code == 200
@@ -133,14 +139,15 @@ class TestWebhookEvolution:
         assert call_args[1]["task_id"] == "whatsapp:MSG123456789"
 
     def test_duplicate_post_returns_200_no_double_enqueue(
-        self, client, ensure_property, mock_tasks_client, mock_secrets
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
     ):
         """Test 2: Duplicate POST returns 200, no duplicate receipt, no second enqueue."""
+        headers = {"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"}
         # First request
         response1 = client.post(
             "/webhooks/whatsapp/evolution",
             json=VALID_PAYLOAD,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers=headers,
         )
         assert response1.status_code == 200
         assert response1.text == "ok"
@@ -152,7 +159,7 @@ class TestWebhookEvolution:
         response2 = client.post(
             "/webhooks/whatsapp/evolution",
             json=VALID_PAYLOAD,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers=headers,
         )
         assert response2.status_code == 200
         assert response2.text == "duplicate"
@@ -173,7 +180,7 @@ class TestWebhookEvolution:
         mock_tasks_client.enqueue_http.assert_not_called()
 
     def test_enqueue_failure_returns_500_no_receipt(
-        self, client, ensure_property, mock_secrets
+        self, client, ensure_property, mock_secrets, mock_evolution_secret
     ):
         """Test 3: Enqueue failure returns 500 and receipt is NOT saved (rollback)."""
         import hotelly.api.routes.webhooks_whatsapp as webhook_module
@@ -199,7 +206,7 @@ class TestWebhookEvolution:
             response = client.post(
                 "/webhooks/whatsapp/evolution",
                 json=payload,
-                headers={"X-Property-Id": TEST_PROPERTY_ID},
+                headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
             )
 
             # Must NOT be 2xx
@@ -220,20 +227,21 @@ class TestWebhookEvolution:
         finally:
             webhook_module._get_tasks_client = original_getter
 
-    def test_invalid_payload_returns_400(self, client, ensure_property, mock_secrets):
+    def test_invalid_payload_returns_400(self, client, ensure_property, mock_secrets, mock_evolution_secret):
         """Invalid payload shape returns 400."""
         response = client.post(
             "/webhooks/whatsapp/evolution",
             json={"invalid": "payload"},
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
         )
         assert response.status_code == 400
 
-    def test_missing_property_id_header_returns_422(self, client, mock_secrets):
+    def test_missing_property_id_header_returns_422(self, client, mock_secrets, mock_evolution_secret):
         """Missing X-Property-Id header returns 422."""
         response = client.post(
             "/webhooks/whatsapp/evolution",
             json=VALID_PAYLOAD,
+            headers={"X-Webhook-Secret": "test-evolution-secret"},
         )
         assert response.status_code == 422
 
@@ -278,7 +286,7 @@ class TestS04WebhookPiiSafety:
     TEST_TEXT = "Quero reservar quarto casal 15/03 a 18/03 para 2 pessoas"
 
     def test_contact_ref_stored_encrypted(
-        self, client, ensure_property, mock_tasks_client, mock_secrets
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
     ):
         """S04: contact_refs stores encrypted remote_jid, not plaintext."""
         payload = {
@@ -297,7 +305,7 @@ class TestS04WebhookPiiSafety:
         response = client.post(
             "/webhooks/whatsapp/evolution",
             json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
         )
 
         assert response.status_code == 200
@@ -320,7 +328,7 @@ class TestS04WebhookPiiSafety:
             assert "jid_s04" not in encrypted, "partial jid leaked!"
 
     def test_task_payload_no_pii(
-        self, client, ensure_property, mock_tasks_client, mock_secrets
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
     ):
         """S04: Enqueued task payload contains NO PII (no remote_jid, no text)."""
         payload = {
@@ -339,7 +347,7 @@ class TestS04WebhookPiiSafety:
         response = client.post(
             "/webhooks/whatsapp/evolution",
             json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
         )
 
         assert response.status_code == 200
@@ -366,7 +374,7 @@ class TestS04WebhookPiiSafety:
         assert "jid_s04" not in task_payload["contact_hash"]
 
     def test_duplicate_returns_duplicate_no_double_processing(
-        self, client, ensure_property, mock_tasks_client, mock_secrets
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
     ):
         """S04: Duplicate message_id returns 'duplicate', no double effects."""
         payload = {
@@ -382,11 +390,12 @@ class TestS04WebhookPiiSafety:
             },
         }
 
+        headers = {"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"}
         # First call
         response1 = client.post(
             "/webhooks/whatsapp/evolution",
             json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers=headers,
         )
         assert response1.status_code == 200
         assert response1.text == "ok"
@@ -410,7 +419,7 @@ class TestS04WebhookPiiSafety:
         response2 = client.post(
             "/webhooks/whatsapp/evolution",
             json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers=headers,
         )
         assert response2.status_code == 200
         assert response2.text == "duplicate"
@@ -431,7 +440,7 @@ class TestS04WebhookPiiSafety:
             assert count_after_second == 1, "Should still have only 1 receipt"
 
     def test_intent_and_entities_parsed(
-        self, client, ensure_property, mock_tasks_client, mock_secrets
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
     ):
         """S04: Intent and entities are parsed from text."""
         payload = {
@@ -450,7 +459,7 @@ class TestS04WebhookPiiSafety:
         response = client.post(
             "/webhooks/whatsapp/evolution",
             json=payload,
-            headers={"X-Property-Id": TEST_PROPERTY_ID},
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
         )
 
         assert response.status_code == 200
@@ -467,3 +476,73 @@ class TestS04WebhookPiiSafety:
         assert entities["checkout"] is not None  # 12/02
         assert entities["room_type_id"] == "rt_suite"
         assert entities["adult_count"] == 2
+
+
+class TestEvolutionWebhookSecret:
+    """Tests for Evolution webhook secret validation."""
+
+    def test_valid_secret_accepted(
+        self, client, ensure_property, mock_tasks_client, mock_secrets, mock_evolution_secret
+    ):
+        """Valid X-Webhook-Secret header allows request through."""
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "test-evolution-secret"},
+        )
+        assert response.status_code == 200
+        assert response.text == "ok"
+
+    def test_missing_secret_header_returns_401(
+        self, client, mock_secrets, mock_evolution_secret
+    ):
+        """Missing X-Webhook-Secret header returns 401."""
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+        assert response.status_code == 401
+        assert response.text == "unauthorized"
+
+    def test_wrong_secret_returns_401(
+        self, client, mock_secrets, mock_evolution_secret
+    ):
+        """Wrong X-Webhook-Secret header returns 401."""
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID, "X-Webhook-Secret": "wrong-secret"},
+        )
+        assert response.status_code == 401
+        assert response.text == "unauthorized"
+
+    def test_no_env_var_local_dev_allows_through(
+        self, client, ensure_property, mock_tasks_client, mock_secrets, monkeypatch
+    ):
+        """No EVOLUTION_WEBHOOK_SECRET + local dev audience → allowed through (warning)."""
+        monkeypatch.delenv("EVOLUTION_WEBHOOK_SECRET", raising=False)
+        monkeypatch.setenv("TASKS_OIDC_AUDIENCE", "hotelly-tasks-local")
+
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+        assert response.status_code == 200
+        assert response.text == "ok"
+
+    def test_no_env_var_production_returns_401(
+        self, client, mock_secrets, monkeypatch
+    ):
+        """No EVOLUTION_WEBHOOK_SECRET + production → 401 (fail-closed)."""
+        monkeypatch.delenv("EVOLUTION_WEBHOOK_SECRET", raising=False)
+        monkeypatch.setenv("TASKS_OIDC_AUDIENCE", "hotelly-tasks-prod")
+
+        response = client.post(
+            "/webhooks/whatsapp/evolution",
+            json=VALID_PAYLOAD,
+            headers={"X-Property-Id": TEST_PROPERTY_ID},
+        )
+        assert response.status_code == 401
+        assert response.text == "unauthorized"

@@ -2,7 +2,7 @@ import os
 from datetime import date, datetime, timedelta
 from datetime import timezone as tz
 
-import psycopg2
+from hotelly.infra.db import get_conn
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -13,14 +13,13 @@ def env(name: str, default: str | None = None) -> str:
 
 
 def main() -> int:
-    dsn = env("DATABASE_URL")  # DSN no formato key=value (psycopg2)
     external_subject = env("SEED_EXTERNAL_SUBJECT")
     property_id = env("SEED_PROPERTY_ID", "pousada-staging")
     property_name = env("SEED_PROPERTY_NAME", "Pousada Staging")
     timezone = env("SEED_PROPERTY_TIMEZONE", "America/Sao_Paulo")
     role = env("SEED_ROLE", "owner")
 
-    with psycopg2.connect(dsn) as conn:
+    with get_conn() as conn:
         with conn.cursor() as cur:
             # 1) Property (idempotente)
             cur.execute(
