@@ -193,24 +193,27 @@ class TestFrontdeskSuccess:
             with patch(
                 "hotelly.api.routes.frontdesk._get_frontdesk_summary", return_value=mock_summary
             ) as mock_fn:
-                with patch.dict("os.environ", oidc_env):
-                    app = create_app(role="public")
-                    client = TestClient(app)
-                    response = client.get(
-                        "/frontdesk/summary?property_id=prop-1",
-                        headers={"Authorization": f"Bearer {token}"},
-                    )
-                    assert response.status_code == 200
-                    data = response.json()
-                    assert data["arrivals_count"] == 5
-                    assert data["departures_count"] == 3
-                    assert data["in_house_count"] == 12
-                    assert data["payment_pending_count"] == 2
-                    assert data["recent_errors"] == []
-                    # Verify function was called with correct property_id
-                    mock_fn.assert_called_once()
-                    call_args = mock_fn.call_args[0]
-                    assert call_args[0] == "prop-1"
+                with patch(
+                    "hotelly.api.routes.frontdesk._property_today", return_value=date.today()
+                ):
+                    with patch.dict("os.environ", oidc_env):
+                        app = create_app(role="public")
+                        client = TestClient(app)
+                        response = client.get(
+                            "/frontdesk/summary?property_id=prop-1",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        assert response.status_code == 200
+                        data = response.json()
+                        assert data["arrivals_count"] == 5
+                        assert data["departures_count"] == 3
+                        assert data["in_house_count"] == 12
+                        assert data["payment_pending_count"] == 2
+                        assert data["recent_errors"] == []
+                        # Verify function was called with correct property_id
+                        mock_fn.assert_called_once()
+                        call_args = mock_fn.call_args[0]
+                        assert call_args[0] == "prop-1"
 
     def test_accepts_date_parameter(
         self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user, user_id
@@ -261,14 +264,17 @@ class TestFrontdeskSuccess:
             with patch(
                 "hotelly.api.routes.frontdesk._get_frontdesk_summary", return_value=mock_summary
             ):
-                with patch.dict("os.environ", oidc_env):
-                    app = create_app(role="public")
-                    client = TestClient(app)
-                    response = client.get(
-                        "/frontdesk/summary?property_id=prop-1",
-                        headers={"Authorization": f"Bearer {token}"},
-                    )
-                    assert response.status_code == 200
+                with patch(
+                    "hotelly.api.routes.frontdesk._property_today", return_value=date.today()
+                ):
+                    with patch.dict("os.environ", oidc_env):
+                        app = create_app(role="public")
+                        client = TestClient(app)
+                        response = client.get(
+                            "/frontdesk/summary?property_id=prop-1",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        assert response.status_code == 200
 
     def test_owner_can_access(
         self, oidc_env, rsa_keypair, mock_jwks_fetch, mock_db_user, user_id
@@ -288,14 +294,17 @@ class TestFrontdeskSuccess:
             with patch(
                 "hotelly.api.routes.frontdesk._get_frontdesk_summary", return_value=mock_summary
             ):
-                with patch.dict("os.environ", oidc_env):
-                    app = create_app(role="public")
-                    client = TestClient(app)
-                    response = client.get(
-                        "/frontdesk/summary?property_id=prop-1",
-                        headers={"Authorization": f"Bearer {token}"},
-                    )
-                    assert response.status_code == 200
+                with patch(
+                    "hotelly.api.routes.frontdesk._property_today", return_value=date.today()
+                ):
+                    with patch.dict("os.environ", oidc_env):
+                        app = create_app(role="public")
+                        client = TestClient(app)
+                        response = client.get(
+                            "/frontdesk/summary?property_id=prop-1",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        assert response.status_code == 200
 
 
 class TestFrontdeskRouteAvailability:

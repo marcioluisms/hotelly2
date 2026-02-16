@@ -470,6 +470,17 @@ async def change_dates_task(request: Request) -> Response:
 
         # 2. Validate status
         if status != "confirmed":
+            logger.info(
+                "change-dates 409: reservation not confirmed",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=req_correlation_id,
+                        property_id=property_id,
+                        reservation_id=reservation_id,
+                        current_status=status,
+                    )
+                },
+            )
             return Response(status_code=409, content="reservation not confirmed")
 
         # 3. Derive effective room_type_id
@@ -500,7 +511,7 @@ async def change_dates_task(request: Request) -> Response:
         nights_to_remove = sorted(old_nights - new_nights)
         nights_to_add = sorted(new_nights - old_nights)
 
-        # 5. Decrement inv_booked for removed nights
+        # 5. Decrement inv_booked for removed nights (idempotent release)
         for night in nights_to_remove:
             ok = decrement_inv_booked(
                 cur,
@@ -509,7 +520,26 @@ async def change_dates_task(request: Request) -> Response:
                 night_date=night,
             )
             if not ok:
-                return Response(status_code=409, content="inventory guard failed on decrement")
+                # Idempotent release: inventory already at zero is not fatal.
+                # This can happen on Cloud Tasks retry after a partial commit,
+                # or if inventory was already freed by another operation.
+                logger.warning(
+                    "Inconsistency: Inventory already free for date %s",
+                    night,
+                    extra={
+                        "extra_fields": safe_log_context(
+                            correlationId=req_correlation_id,
+                            property_id=property_id,
+                            reservation_id=reservation_id,
+                            room_type_id=effective_room_type_id,
+                            failed_night=str(night),
+                            old_checkin=str(old_checkin),
+                            old_checkout=str(old_checkout),
+                            new_checkin=str(new_checkin),
+                            new_checkout=str(new_checkout),
+                        )
+                    },
+                )
 
         # 6. Increment inv_booked for added nights
         for night in nights_to_add:
@@ -520,6 +550,39 @@ async def change_dates_task(request: Request) -> Response:
                 night_date=night,
             )
             if not ok:
+                # Query current ARI state for this night to diagnose
+                cur.execute(
+                    """
+                    SELECT inv_total, inv_booked, inv_held
+                    FROM ari_days
+                    WHERE property_id = %s AND room_type_id = %s AND date = %s
+                    """,
+                    (property_id, effective_room_type_id, night),
+                )
+                ari_row = cur.fetchone()
+                ari_info = (
+                    f"inv_total={ari_row[0]}, inv_booked={ari_row[1]}, inv_held={ari_row[2]}"
+                    if ari_row
+                    else "NO_ARI_ROW"
+                )
+                logger.info(
+                    "change-dates 409: no inventory on increment",
+                    extra={
+                        "extra_fields": safe_log_context(
+                            correlationId=req_correlation_id,
+                            property_id=property_id,
+                            reservation_id=reservation_id,
+                            room_type_id=effective_room_type_id,
+                            failed_night=str(night),
+                            ari_state=ari_info,
+                            old_checkin=str(old_checkin),
+                            old_checkout=str(old_checkout),
+                            new_checkin=str(new_checkin),
+                            new_checkout=str(new_checkout),
+                            nights_to_add=[str(n) for n in nights_to_add],
+                        )
+                    },
+                )
                 return Response(status_code=409, content="no_inventory")
 
         # 7. Reprice
