@@ -1505,6 +1505,7 @@ def check_out_action(
 # ---------------------------------------------------------------------------
 
 
+@router.post("/{reservation_id}/extras")
 @router.post("/{reservation_id}/actions/add-extra")
 def add_extra(
     body: AddExtraRequest,
@@ -1555,7 +1556,7 @@ def add_extra(
             adult_count, children_ages_raw,
         ) = res_row
 
-        if status not in ("confirmed", "in_house"):
+        if status not in ("confirmed", "in_house", "checked_in"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Reservation status '{status}' does not allow adding extras",

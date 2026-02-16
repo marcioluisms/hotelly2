@@ -1,0 +1,103 @@
+steps:
+  # 1. Build the Docker image
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - gcr.io/hotelly--ia/hotelly-v2:staging
+      - .
+
+  # 2. Push the image to Artifact Registry
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/hotelly--ia/hotelly-v2:staging
+    waitFor:
+      - build
+
+  # 3. Download Cloud SQL Auth Proxy
+  - id: download-proxy
+    name: gcr.io/cloud-builders/curl
+    args:
+      - -o
+      - /workspace/cloud-sql-proxy
+      - -L
+      - https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.3/cloud-sql-proxy.linux.amd64
+    waitFor:
+      - "-"
+
+  - id: chmod-proxy
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: chmod
+    args:
+      - +x
+      - /workspace/cloud-sql-proxy
+    waitFor:
+      - download-proxy
+
+  # 4. Run database migrations with Cloud SQL Auth Proxy
+  - id: migrate
+    name: gcr.io/hotelly--ia/hotelly-v2:staging
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        /workspace/cloud-sql-proxy ${_CLOUD_SQL_INSTANCE} --port 5432 &
+        PROXY_PID=$$!
+        for i in 1 2 3 4 5; do sleep 1; echo "Waiting for proxy..."; done
+        DB_NAME=$$(echo "$$DATABASE_URL" | cut -d'?' -f1 | rev | cut -d'/' -f1 | rev)
+        DB_AUTH=$$(echo "$$DATABASE_URL" | cut -d'@' -f1)
+        export DATABASE_URL="$${DB_AUTH}@127.0.0.1:5432/$${DB_NAME}"
+        echo "DATABASE_URL host overridden to 127.0.0.1:5432"
+        uv run alembic upgrade head
+        EXIT_CODE=$$?
+        kill $$PROXY_PID || true
+        exit $$EXIT_CODE
+    secretEnv:
+      - DATABASE_URL
+    waitFor:
+      - push
+      - chmod-proxy
+
+  # 5. Deploy Cloud Run services (parallel)
+  - id: deploy-public
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - hotelly-public-staging
+      - --image=gcr.io/hotelly--ia/hotelly-v2:staging
+      - --region=us-central1
+      - --project=hotelly--ia
+    waitFor:
+      - migrate
+
+  - id: deploy-worker
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - hotelly-worker-staging
+      - --image=gcr.io/hotelly--ia/hotelly-v2:staging
+      - --region=us-central1
+      - --project=hotelly--ia
+    waitFor:
+      - migrate
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/hotelly--ia/secrets/hotelly-staging-database-url/versions/latest
+      env: DATABASE_URL
+
+substitutions:
+  _CLOUD_SQL_INSTANCE: ""
+
+images:
+  - gcr.io/hotelly--ia/hotelly-v2:staging
+
+options:
+  logging: CLOUD_LOGGING_ONLY
