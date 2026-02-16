@@ -8,7 +8,8 @@ V2-S23: change-dates preview + enqueue.
 from __future__ import annotations
 
 import hashlib
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from pydantic import BaseModel
@@ -173,6 +174,20 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
         "room_type_id": row[8],
         "created_at": row[9].isoformat(),
     }
+
+
+def _get_property_tz(cur, property_id: str) -> ZoneInfo:  # type: ignore[type-arg]
+    """Fetch property timezone from DB (within an existing cursor/txn).
+
+    Falls back to America/Sao_Paulo on missing or invalid timezone.
+    """
+    cur.execute("SELECT timezone FROM properties WHERE id = %s", (property_id,))
+    row = cur.fetchone()
+    tz_name = row[0] if row and row[0] else "America/Sao_Paulo"
+    try:
+        return ZoneInfo(tz_name)
+    except (KeyError, Exception):
+        return ZoneInfo("America/Sao_Paulo")
 
 
 def _room_exists_and_active(property_id: str, room_id: str) -> bool:
@@ -1133,6 +1148,344 @@ def cancel_reservation_action(
                 property_id=ctx.property_id,
                 reservation_id=reservation_id,
                 refund_amount_cents=result.get("refund_amount_cents"),
+            )
+        },
+    )
+
+    return response_body
+
+
+# ---------------------------------------------------------------------------
+# Check-in action
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{reservation_id}/actions/check-in")
+def check_in_action(
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+) -> dict:
+    """Check in a reservation.
+
+    Transactional flow:
+    1. Check idempotency (skip if already processed).
+    2. Lock reservation row (SELECT ... FOR UPDATE).
+    3. Validate status in (confirmed, in_house), checkin == today, room assigned.
+    4. ADR-008: check room conflict with lock.
+    5. Update status to checked_in.
+    6. Emit outbox event.
+    7. Record idempotency key.
+
+    Requires staff role or higher.
+    Requires Idempotency-Key header.
+    """
+    import json
+
+    from hotelly.domain.room_conflict import check_room_conflict
+    from hotelly.infra.db import txn
+
+    correlation_id = get_correlation_id()
+
+    # 1. Idempotency check
+    with txn() as cur:
+        cur.execute(
+            """
+            SELECT response_code, response_body
+            FROM idempotency_keys
+            WHERE idempotency_key = %s AND endpoint = %s
+            """,
+            (idempotency_key, f"check-in:{reservation_id}"),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            logger.info(
+                "idempotent replay for check-in",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=correlation_id,
+                        property_id=ctx.property_id,
+                        reservation_id=reservation_id,
+                        idempotency_key=idempotency_key,
+                    )
+                },
+            )
+            return json.loads(existing[1])
+
+    # 2-7. Transactional check-in
+    with txn() as cur:
+        # 2. Lock reservation
+        cur.execute(
+            """
+            SELECT status, checkin, checkout, room_id, property_id
+            FROM reservations
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (reservation_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+
+        status, checkin, checkout, room_id, property_id = row
+
+        # 3a. Validate status
+        if status not in ("confirmed", "in_house"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Reservation status is '{status}', expected 'confirmed' or 'in_house'",
+            )
+
+        # 3b. Validate checkin date vs property-local today
+        property_tz = _get_property_tz(cur, property_id)
+        today_local = datetime.now(timezone.utc).astimezone(property_tz).date()
+        if today_local < checkin:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Check-in date is {checkin.isoformat()}, today is {today_local.isoformat()} (too early)",
+            )
+
+        # 3c. Validate room assigned
+        if room_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Room must be assigned before check-in",
+            )
+
+        # 4. ADR-008: room conflict check with lock
+        conflicting_id = check_room_conflict(
+            cur,
+            room_id=room_id,
+            check_in=checkin,
+            check_out=checkout,
+            exclude_reservation_id=reservation_id,
+            property_id=property_id,
+            lock=True,
+        )
+        if conflicting_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Room conflict with reservation {conflicting_id}",
+            )
+
+        # 5. Update status
+        cur.execute(
+            """
+            UPDATE reservations
+            SET status = 'checked_in'::reservation_status, updated_at = now()
+            WHERE id = %s
+            """,
+            (reservation_id,),
+        )
+
+        # 6. Emit outbox event
+        outbox_payload = json.dumps({
+            "reservation_id": reservation_id,
+            "property_id": property_id,
+            "room_id": room_id,
+            "checkin": checkin.isoformat(),
+            "checkout": checkout.isoformat(),
+            "checked_in_by": ctx.user.id,
+        })
+        cur.execute(
+            """
+            INSERT INTO outbox_events
+                (property_id, event_type, aggregate_type, aggregate_id,
+                 correlation_id, message_type, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                property_id,
+                "reservation.checked_in",
+                "reservation",
+                reservation_id,
+                correlation_id,
+                None,
+                outbox_payload,
+            ),
+        )
+
+        # 7. Record idempotency key
+        response_body = {
+            "status": "checked_in",
+            "reservation_id": reservation_id,
+        }
+
+        cur.execute(
+            """
+            INSERT INTO idempotency_keys
+                (idempotency_key, endpoint, response_code, response_body)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (idempotency_key, endpoint) DO NOTHING
+            """,
+            (
+                idempotency_key,
+                f"check-in:{reservation_id}",
+                200,
+                json.dumps(response_body),
+            ),
+        )
+
+    logger.info(
+        "check-in completed",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                room_id=room_id,
+            )
+        },
+    )
+
+    return response_body
+
+
+# ---------------------------------------------------------------------------
+# Check-out action
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{reservation_id}/actions/check-out")
+def check_out_action(
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+) -> dict:
+    """Check out a checked-in or in-house reservation.
+
+    Transactional flow:
+    1. Check idempotency (skip if already processed).
+    2. Lock reservation row (SELECT ... FOR UPDATE).
+    3. Validate status in (checked_in, in_house).
+    4. Update status to checked_out.
+    5. Emit outbox event.
+    6. Record idempotency key.
+
+    Requires staff role or higher.
+    Requires Idempotency-Key header.
+    """
+    import json
+
+    from hotelly.infra.db import txn
+
+    correlation_id = get_correlation_id()
+
+    # 1. Idempotency check
+    with txn() as cur:
+        cur.execute(
+            """
+            SELECT response_code, response_body
+            FROM idempotency_keys
+            WHERE idempotency_key = %s AND endpoint = %s
+            """,
+            (idempotency_key, f"check-out:{reservation_id}"),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            logger.info(
+                "idempotent replay for check-out",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=correlation_id,
+                        property_id=ctx.property_id,
+                        reservation_id=reservation_id,
+                        idempotency_key=idempotency_key,
+                    )
+                },
+            )
+            return json.loads(existing[1])
+
+    # 2-6. Transactional check-out
+    with txn() as cur:
+        # 2. Lock reservation
+        cur.execute(
+            """
+            SELECT status, property_id
+            FROM reservations
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (reservation_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+
+        status, property_id = row
+
+        # 3. Validate status
+        if status not in ("checked_in", "in_house"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Reservation status is '{status}', expected 'checked_in' or 'in_house'",
+            )
+
+        # 4. Update status
+        cur.execute(
+            """
+            UPDATE reservations
+            SET status = 'checked_out'::reservation_status, updated_at = now()
+            WHERE id = %s
+            """,
+            (reservation_id,),
+        )
+
+        # 5. Emit outbox event
+        outbox_payload = json.dumps({
+            "reservation_id": reservation_id,
+            "property_id": property_id,
+            "checked_out_by": ctx.user.id,
+        })
+        cur.execute(
+            """
+            INSERT INTO outbox_events
+                (property_id, event_type, aggregate_type, aggregate_id,
+                 correlation_id, message_type, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                property_id,
+                "reservation.checked_out",
+                "reservation",
+                reservation_id,
+                correlation_id,
+                None,
+                outbox_payload,
+            ),
+        )
+
+        # 6. Record idempotency key
+        response_body = {
+            "status": "checked_out",
+            "reservation_id": reservation_id,
+        }
+
+        cur.execute(
+            """
+            INSERT INTO idempotency_keys
+                (idempotency_key, endpoint, response_code, response_body)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (idempotency_key, endpoint) DO NOTHING
+            """,
+            (
+                idempotency_key,
+                f"check-out:{reservation_id}",
+                200,
+                json.dumps(response_body),
+            ),
+        )
+
+    logger.info(
+        "check-out completed",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
             )
         },
     )

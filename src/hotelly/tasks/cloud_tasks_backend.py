@@ -88,6 +88,19 @@ def enqueue_cloud_task(
         timestamp.FromDatetime(schedule_time)
         task["schedule_time"] = timestamp
 
+    logger.info(
+        "cloud task create request",
+        extra={
+            "extra_fields": {
+                "task_id": task_id,
+                "parent": parent,
+                "target_url": url,
+                "oidc_audience": oidc_audience,
+                "correlationId": correlation_id,
+            }
+        },
+    )
+
     try:
         response = client.create_task(parent=parent, task=task)
         logger.info(
@@ -95,6 +108,8 @@ def enqueue_cloud_task(
             extra={
                 "extra_fields": {
                     "task_name": response.name,
+                    "target_url": url,
+                    "parent": parent,
                     "url_path": url_path,
                     "correlationId": correlation_id,
                 }
