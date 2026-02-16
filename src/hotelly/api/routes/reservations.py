@@ -21,6 +21,13 @@ from hotelly.observability.redaction import safe_log_context
 from hotelly.tasks.client import TasksClient
 
 
+class AddExtraRequest(BaseModel):
+    """Request body for add-extra action."""
+
+    extra_id: str
+    quantity: int = 1
+
+
 class CancelReservationRequest(BaseModel):
     """Request body for cancel action."""
 
@@ -1491,3 +1498,176 @@ def check_out_action(
     )
 
     return response_body
+
+
+# ---------------------------------------------------------------------------
+# Add extra to reservation
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{reservation_id}/actions/add-extra")
+def add_extra(
+    body: AddExtraRequest,
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> dict:
+    """Add an extra (auxiliary revenue item) to a reservation.
+
+    Transactional flow:
+    1. Lock reservation FOR UPDATE, validate status.
+    2. Fetch extra from catalog (property-scoped).
+    3. Calculate total via domain logic (snapshot pricing).
+    4. Insert reservation_extra with snapshotted price/mode.
+    5. Update reservation.total_cents.
+    6. Emit reservation.updated outbox event.
+
+    Requires staff role or higher.
+    """
+    import json
+
+    from hotelly.domain.extras import calculate_extra_total
+    from hotelly.infra.db import txn
+    from hotelly.infra.repositories.outbox_repository import emit_event
+
+    correlation_id = get_correlation_id()
+
+    if body.quantity < 1:
+        raise HTTPException(status_code=400, detail="quantity must be >= 1")
+
+    with txn() as cur:
+        # 1. Lock reservation
+        cur.execute(
+            """
+            SELECT id, status, checkin, checkout, total_cents, currency,
+                   adult_count, children_ages
+            FROM reservations
+            WHERE property_id = %s AND id = %s
+            FOR UPDATE
+            """,
+            (ctx.property_id, reservation_id),
+        )
+        res_row = cur.fetchone()
+        if res_row is None:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+
+        (
+            _, status, checkin, checkout, current_total_cents, currency,
+            adult_count, children_ages_raw,
+        ) = res_row
+
+        if status not in ("confirmed", "in_house"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Reservation status '{status}' does not allow adding extras",
+            )
+
+        # Parse children_ages
+        if isinstance(children_ages_raw, str):
+            children_ages = json.loads(children_ages_raw)
+        elif children_ages_raw is None:
+            children_ages = []
+        else:
+            children_ages = list(children_ages_raw)
+
+        nights = (checkout - checkin).days
+        total_guests = (adult_count or 2) + len(children_ages)
+
+        # 2. Fetch extra from catalog (property-scoped)
+        cur.execute(
+            """
+            SELECT id, pricing_mode, default_price_cents
+            FROM extras
+            WHERE property_id = %s AND id = %s
+            """,
+            (ctx.property_id, body.extra_id),
+        )
+        extra_row = cur.fetchone()
+        if extra_row is None:
+            raise HTTPException(status_code=404, detail="Extra not found")
+
+        _, pricing_mode, default_price_cents = extra_row
+
+        # 3. Calculate total (domain logic)
+        extra_total_cents = calculate_extra_total(
+            pricing_mode=pricing_mode,
+            unit_price_cents=default_price_cents,
+            quantity=body.quantity,
+            nights=nights,
+            total_guests=total_guests,
+        )
+
+        # 4. Insert reservation_extra (snapshot)
+        cur.execute(
+            """
+            INSERT INTO reservation_extras
+                (reservation_id, extra_id,
+                 unit_price_cents_at_booking, pricing_mode_at_booking,
+                 quantity, total_price_cents)
+            VALUES (%s, %s, %s, %s::extra_pricing_mode, %s, %s)
+            RETURNING id
+            """,
+            (
+                reservation_id,
+                body.extra_id,
+                default_price_cents,
+                pricing_mode,
+                body.quantity,
+                extra_total_cents,
+            ),
+        )
+        reservation_extra_id = str(cur.fetchone()[0])
+
+        # 5. Update reservation total
+        new_total_cents = current_total_cents + extra_total_cents
+        cur.execute(
+            """
+            UPDATE reservations
+            SET total_cents = %s, updated_at = now()
+            WHERE property_id = %s AND id = %s
+            """,
+            (new_total_cents, ctx.property_id, reservation_id),
+        )
+
+        # 6. Emit outbox event
+        emit_event(
+            cur,
+            property_id=ctx.property_id,
+            event_type="reservation.updated",
+            aggregate_type="reservation",
+            aggregate_id=reservation_id,
+            payload={
+                "reservation_id": reservation_id,
+                "action": "add_extra",
+                "reservation_extra_id": reservation_extra_id,
+                "extra_id": body.extra_id,
+                "extra_total_cents": extra_total_cents,
+                "old_total_cents": current_total_cents,
+                "new_total_cents": new_total_cents,
+                "changed_by": ctx.user.id,
+            },
+            correlation_id=correlation_id,
+        )
+
+    logger.info(
+        "add-extra completed",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                extra_id=body.extra_id,
+                extra_total_cents=extra_total_cents,
+                new_total_cents=new_total_cents,
+            )
+        },
+    )
+
+    return {
+        "reservation_extra_id": reservation_extra_id,
+        "extra_id": body.extra_id,
+        "quantity": body.quantity,
+        "unit_price_cents": default_price_cents,
+        "pricing_mode": pricing_mode,
+        "extra_total_cents": extra_total_cents,
+        "reservation_total_cents": new_total_cents,
+    }
