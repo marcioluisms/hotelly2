@@ -5,7 +5,7 @@ steps:
     args:
       - build
       - -t
-      - gcr.io/hotelly--ia/hotelly-v2:staging
+      - gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
       - .
 
   # 2. Push the image to Artifact Registry
@@ -13,7 +13,7 @@ steps:
     name: gcr.io/cloud-builders/docker
     args:
       - push
-      - gcr.io/hotelly--ia/hotelly-v2:staging
+      - gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
     waitFor:
       - build
 
@@ -39,7 +39,7 @@ steps:
 
   # 4. Run database migrations with Cloud SQL Auth Proxy
   - id: migrate
-    name: gcr.io/hotelly--ia/hotelly-v2:staging
+    name: gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
     entrypoint: sh
     args:
       - -c
@@ -68,8 +68,8 @@ steps:
     args:
       - run
       - deploy
-      - hotelly-public-staging
-      - --image=gcr.io/hotelly--ia/hotelly-v2:staging
+      - ${_SERVICE_NAME_PUBLIC}
+      - --image=gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
       - --region=us-central1
       - --project=hotelly--ia
     waitFor:
@@ -81,8 +81,8 @@ steps:
     args:
       - run
       - deploy
-      - hotelly-worker-staging
-      - --image=gcr.io/hotelly--ia/hotelly-v2:staging
+      - ${_SERVICE_NAME_WORKER}
+      - --image=gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
       - --region=us-central1
       - --project=hotelly--ia
     waitFor:
@@ -90,14 +90,18 @@ steps:
 
 availableSecrets:
   secretManager:
-    - versionName: projects/hotelly--ia/secrets/hotelly-staging-database-url/versions/latest
+    - versionName: projects/hotelly--ia/secrets/${_DB_SECRET_NAME}/versions/latest
       env: DATABASE_URL
 
 substitutions:
+  _IMAGE_TAG: "staging"
+  _SERVICE_NAME_PUBLIC: "hotelly-public-staging"
+  _SERVICE_NAME_WORKER: "hotelly-worker-staging"
   _CLOUD_SQL_INSTANCE: ""
+  _DB_SECRET_NAME: "hotelly-staging-database-url"
 
 images:
-  - gcr.io/hotelly--ia/hotelly-v2:staging
+  - gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
 
 options:
   logging: CLOUD_LOGGING_ONLY
