@@ -1,545 +1,314 @@
-# Hotelly — Documento Unificado (Spec + Runbook + Roadmap)
+# Hotelly — Base Técnica Unificada
 
-> Fonte única de referência para execução do projeto Hotelly.
->
-> **Atualização:** 2026-02-05  
-> **Escopo:** Admin (Next.js) + Infra/Deploy + Roadmap
+**Objetivo:** concentrar *tudo* que é relevante para operação e manutenção do sistema (infra, contratos, banco, pipelines, endpoints, runbooks).  
+**Regra de ouro:** evitar perda de informação técnica e evitar “atalhos” fora dos contratos aqui descritos.
+
+**Precedência em conflitos:** regras deste arquivo (Doc Unificado) > ADRs e docs auxiliares. *ADRs são histórico; podem estar supersedidas.*
+
+
+- Incluída segurança do webhook Evolution (secret + header).
+- Incluídos: contrato de saída da IA (`IntentOutput`), retenção/limpeza, limites do piloto + capacidade de suporte.
+- Incluídos: quality gates (G0/G1/G3–G5) + critérios de incidente SEV0 (stop-ship).
+- Incluídas recomendações de naming por ambiente (secrets/filas) e nota de persistência de mensagens (MVP/Piloto).
 
 ---
 
-## Atualizações — decisões e URLs (2026-02-05)
+## Governança e Fonte da Verdade
 
-- **Admin Staging:** `dash.hotelly.ia.br` → `hotelly-admin-staging` (Cloud Run)
-- **Admin Prod:** `adm.hotelly.ia.br` → `hotelly-admin` (Cloud Run)
-- **Public App:** `app.hotelly.ia.br` (Cloud Run)
+- **Este arquivo é normativo** para regras de negócio, contratos, invariantes e operação.
+- **Schema do banco:** migrations em `migrations/` (Alembic) são a verdade executável; este doc define *invariantes* e *constraints* que devem existir. Divergência = bug.
+- **/docs/adr/**: histórico de decisões (ADR). Não edite para “atualizar regra”; registre nova decisão e ajuste este doc.
+- **/docs/operations/sql/**: scripts operacionais (consulta/limpeza). Podem ser mantidos fora deste arquivo.
+- **Segredos:** aqui só entram **nomes de secrets/env vars** e regras de uso. Nunca versionar valores.
+
+## 0) URLs e decisões atuais
+
+### 0.1 Domínios / serviços
+
+- **Admin Staging:** `https://dash.hotelly.ia.br` → `hotelly-admin-staging` (Cloud Run)
+- **Admin Prod:** `https://adm.hotelly.ia.br` → `hotelly-admin` (Cloud Run)
+- **Public App/API:** `https://app.hotelly.ia.br` (Cloud Run)
 - **Domínio técnico raiz:** `hotelly.ia.br` → redirect 308 para `hotelly.com.br`
 
-> Nota: o Roadmap original referenciava `dashboard.hotelly.ia.br` para o Admin. A URL atual é `dash.hotelly.ia.br`.
+---
 
-## Decisões operacionais
+### 0.2 Limites do piloto e capacidade de suporte
+- Piloto: até **10 pousadas**, sem HA; usuários cientes de falhas; foco em observabilidade e aprendizado.
+- Estimativa de suporte (1 pessoa): **15–20** clientes confortável; **25** no limite.
 
-- **Padrão único de tenancy/RBAC (property-scoped):** endpoints de dashboard recebem `property_id` **obrigatoriamente via `?property_id=`**, validado por `require_property_role(min_role)`; **não aceitar `property_id` no body**.
+## 1) Visão geral da arquitetura
 
+### 1.1 Stack
+- **GCP + Cloud Run + FastAPI + Cloud SQL Postgres + Cloud Tasks + Secret Manager**
+- Integrações: **Stripe** (pagamento) e **WhatsApp via Evolution API** (MVP).
+
+### 1.2 Split obrigatório em 2 serviços (Cloud Run)
+
+**1) `hotelly-public`**
+- Expõe APIs/webhooks públicos.
+- Faz apenas:
+  1) validação de auth/assinaturas
+  2) *receipt/dedupe* durável quando aplicável
+  3) enqueue (Cloud Tasks)
+  4) responde **2xx**
+- Não executa lógica pesada nem transação crítica.
+
+**2) `hotelly-worker`**
+- Privado (ingress interno).
+- Consome tasks e executa transações críticas no Postgres.
+- Emite **outbox** (PII-safe).
+
+### 1.3 Princípios de design (não-negociáveis)
+- Core transacional é **determinístico**: IA não decide estado crítico.
+- Ações críticas precisam garantir: **0 overbooking**, **idempotência real**, **concorrência correta**.
+- `*_at` é **TIMESTAMPTZ UTC**; `date` é **DATE** (sem hora).
+- Valores monetários: sempre `*_cents` (INT). Moeda: `currency` ISO-4217 (ex.: `BRL`).
+
+
+#### 1.3.1 Nomenclatura canônica (schema + contratos)
+
+Convenções obrigatórias para nomes de campos no schema e documentação:
+
+| Padrão | Tipo | Descrição | Exemplo |
+|--------|------|-----------|---------|
+| `*_cents` | INT | Valores monetários em centavos | `amount_cents`, `total_cents` |
+| `total_cents` | INT | Valor total em holds/reservations | `holds.total_cents` |
+| `amount_cents` | INT | Valor em payments | `payments.amount_cents` |
+| `base_rate_cents` | INT | Diária base em ARI | `ari_days.base_rate_cents` |
+| `currency` | TEXT | Código ISO 4217 | `BRL`, `USD` |
+| `*_at` | TIMESTAMPTZ | Timestamps (sempre UTC) | `created_at`, `expires_at` |
+| `*_id` | TEXT ou UUID | Identificadores | `property_id`, `hold_id` |
+| `date` | DATE | Datas de calendário (sem hora) | `ari_days.date`, `holds.checkin` |
+
+**Regra:** nunca usar `total_amount_cents`, `day`, ou variações não listadas acima.
 
 ---
 
-## 1. Spec Pack Técnico
+# ÍNDICE DEFINITIVO — DOCUMENTAÇÃO HOTELLY V2
 
-# Spec Pack Técnico — Consolidado (v1 + v2 + v3)
+### Legenda de maturidade
 
-> Documento consolidado atualizado em **05/02/2026** com a Fase 13 (Calendário de Preços PAX).
+- **Status** (qualidade do texto): 🟢 PRONTO | 🟡 PARCIAL | 🔴 A COMPLETAR
+- **Maturidade** (o que dá para executar hoje): ✅ EXECUTÁVEL NO REPO | ⚠️ CONCEITUAL/DEPENDE DE ARTEFATOS | 🎯 TARGET (pós-MVP)
 
----
+#### 1.3.2 IA — contrato de saída (`IntentOutput` v1.0)
+- IA no MVP é **apenas roteamento/extração**; core segue determinístico.
+- Entrada para IA deve ser **redigida**; nunca enviar payload bruto de webhook, tokens, segredos, ou PII não essencial.
+- Saída da IA é **JSON estrito** (schema versionado). Se JSON inválido/enum desconhecido/slots incoerentes ⇒ fallback determinístico.
 
-## 1) spec-pack-tecnico (v1)
+**Schema (resumo):**
+- required: `schema_version` = "1.0"
+- required: `intent` ∈ {`quote_request`, `checkout_request`, `cancel_request`, `human_handoff`, `unknown`}
+- required: `confidence` ∈ [0,1]
+- optional: `entities` { `checkin`(date), `checkout`(date), `guest_count`(1..20), `room_type_id`(string) }
+- optional: `reason` (<= 200 chars)
 
-# Hotelly V2 — Spec Pack técnico (consolidado da documentação)
-
-- [GLOBAL] Core transacional é determinístico; IA não decide estado crítico.
-- [GLOBAL] Transações críticas devem garantir: 0 overbooking, idempotência real e concorrência correta.
-- [GLOBAL] Timestamps `*_at` são TIMESTAMPTZ e sempre UTC; `date` é DATE (sem hora).
-- [GLOBAL] Nomenclatura canônica de schema/campos:
-  - `*_cents` INT (valores em centavos); não usar `total_amount_cents` nem `day` nem variações fora da tabela canônica.
-  - `currency` TEXT ISO-4217 (ex.: BRL).
-  - `*_id` TEXT ou UUID.
-- [STACK] Infra base: GCP + Cloud Run + FastAPI + Cloud SQL Postgres + Cloud Tasks + Secret Manager + Stripe + WhatsApp (Evolution primeiro; Meta sob demanda).
-- [REGION] Região padrão: `us-central1` (Iowa) para Cloud Run/Cloud SQL/Cloud Tasks/Secret Manager; piloto sem HA.
-- [SERVICES] Split obrigatório em 2 serviços Cloud Run:
-  - `public-api`: expõe webhooks/APIs mínimas; valida assinatura/auth; faz dedupe/idempotência quando aplicável; enqueue; responde 2xx.
-  - `worker`: privado (sem endpoint público / ingress interno); executa tasks/rotinas; aplica transações críticas no Postgres; emite outbox (sem PII).
-- [PUBLIC ENDPOINT RULE] Endpoint público faz somente: (1) validação assinatura/auth, (2) receipt/dedupe durável quando aplicável, (3) enqueue, (4) responde 2xx; sem lógica pesada/transacional no público.
-- [TASK AUTH] Cloud Tasks chamando worker devem usar OIDC (service account invoker).
-- [CLOUD TASKS DEDUPE] `create_task` pode retornar 409 AlreadyExists (dedupe por nome). Isso deve ser tratado como **sucesso idempotente** (não 500).
-- [DB SOURCE OF TRUTH] Fonte da verdade do schema são as migrations em `/migrations`; arquivos `docs/data/*.sql` são referência humana (não "aplicar na mão").
-- [DB CONSTRAINTS] Guardrails por constraints/UNIQUE (derivados dos ADRs):
-  - Dedupe eventos: `processed_events(source, external_id)` UNIQUE (manter consistente com migrations).
-  - 1 reserva por hold: `reservations(property_id, hold_id)` UNIQUE.
-  - Payment canonical: `payments(property_id, provider, provider_object_id)` UNIQUE (ex.: Stripe checkout.session.id).
-  - Idempotency keys persistidas: `idempotency_keys(property_id, scope, key)` UNIQUE/PK.
-- [DB LOCKING] Em operações que competem no mesmo hold (expire/cancel/convert): `SELECT ... FOR UPDATE` no hold.
-- [DB DEADLOCK AVOIDANCE] Ao tocar várias noites, iterar sempre em ordem fixa: **(room_type_id, date ASC)**; updates de ARI devem seguir essa ordem.
-- [ARI INVARIANTS] Inventário nunca negativo e nunca excedido:
-  - `inv_total >= inv_booked + inv_held` para todas as noites.
-  - Guardas no `WHERE` dos updates (ex.: só incrementa hold se houver saldo; só decrementa se `inv_held >= 1`).
-  - Validar "1 linha por noite"; se alguma noite afetar 0 linhas => rollback (sem hold parcial / sem ajuste parcial).
-- [IDEMPOTENCY] Idempotência ponta a ponta é composta por:
-  - `processed_events` para eventos externos/tasks,
-  - `task_id` determinístico em Cloud Tasks,
-  - UNIQUEs no banco (última linha de defesa),
-  - `idempotency_keys` para endpoints que aceitam Idempotency-Key (escopo + key).
-- [OUTBOX] `outbox_events` é append-only, payload mínimo e sem PII.
-- [OUTBOX WRITE RULE] Toda ação crítica que altera estado (hold/payment/reservation) deve escrever outbox **na mesma transação**.
-- [OUTBOX PAYLOAD] Proibido no payload: telefone/email/nome/endereço/documento/texto de chat; proibido payload bruto de Stripe/WhatsApp.
-- [MESSAGE PERSISTENCE] MVP/Piloto: **não persistir mensagens** (inbound/outbound) no Postgres.
-  - Persistido: `processed_events`, entidades transacionais (holds/payments/reservations), `outbox_events` (mínimo, sem PII).
-- [AI ROLE] IA no MVP só para roteamento/extração; sempre substituível; core continua determinístico.
-- [AI INPUT] Entrada para IA deve ser redigida; nunca enviar payload bruto de webhook, tokens, segredos, ou dados sensíveis não essenciais.
-- [AI OUTPUT CONTRACT] Saída da IA é JSON estrito (schema versionado); se JSON inválido/enum desconhecido/slots incoerentes => fallback determinístico.
-- [AI SCHEMA v1.0] `IntentOutput` (json-schema):
-  - required: `schema_version` = "1.0", `intent` ∈ {quote_request, checkout_request, cancel_request, human_handoff, unknown}, `confidence` ∈ [0,1]
-  - opcionais: `entities` {checkin(date), checkout(date), guest_count(1..20), room_type_id(string)}, `reason` (<=200).
-- [AI PROMPT RULE] Prompt retorna **apenas JSON**; sem PII; se incerto => `intent="unknown"` + `reason`.
-- [PII DEFINITION] PII inclui: telefone (qualquer formato), conteúdo de mensagem, email, documento, endereço completo, nome (quando ligado ao contato), identificadores "sendable" (ex.: remote_jid/wa_id).
-- [PII GOLD RULE] Proibido logar payload bruto/request body/mensagens/telefone/nome/remote_jid; isso é incidente.
-- [CONTACT HASH] Identidade de contato no pipeline deve ser via `contact_hash` (hash com secret; não reversível sem secret).
-- [CONTACT VAULT] Resolver destinatário outbound via "contact_refs vault":
-  - Mapeamento: (property_id, channel, contact_hash) → remote_jid (criptografado).
-  - Criptografia obrigatória: AES-256-GCM (ou equivalente) com key simétrica `CONTACT_REFS_KEY` (Secret Manager/env).
-  - TTL curto: expira em no máximo 1 hora (padrão 1h, configurável).
-  - Acesso restrito: somente handlers internos de envio (sender) leem o vault; `handle-message` não lê e o worker não escreve no vault.
-  - Nunca logar remote_jid descriptografado.
-- [VAULT WRITE] Endpoint público (inbound) grava no vault ao receber mensagem; worker não escreve no vault.
-- [OUTBOUND FLOW] Worker grava outbox PII-free (com contact_hash); sender consulta vault (contact_hash→remote_jid) e envia; se vault não tiver entrada => não enviar e registrar erro (comportamento intencional).
-- [WHATSAPP PIPELINE] Pipeline único obrigatório:
-  - inbound (public) → normalize → receipt/dedupe → enqueue (task) → worker processa → outbox → sender (task) envia.
-  - Proibido qualquer "caminho alternativo rápido" fora do pipeline (exceto debug/legado; ver `POST /tasks/whatsapp/send-message`).
-- [WHATSAPP PROVIDERS] Fase 1: Evolution como adapter único; Fase 2: Meta Cloud API como segundo adapter mantendo mesmo contrato/pipeline.
-- [EVOLUTION OUTBOUND ENV] Outbound via Evolution usa env vars (nomes reais do código): `EVOLUTION_BASE_URL`, `EVOLUTION_INSTANCE`, `EVOLUTION_API_KEY` (secret). `EVOLUTION_SEND_PATH` é opcional (default `/message/sendText/{instance}`).
-- [WHATSAPP TASK HTTP SEMANTICS] Tasks internas (Cloud Tasks) devem retornar: **5xx** em falha transitória (timeout/rede/5xx/429) para habilitar retry; **2xx** em falha permanente (ex.: `contact_ref_not_found`, 401/403, template inválido, config/env/secret faltando) para parar retry.
-- [OUTBOX DELIVERY GUARD] Envio outbound é at-least-once (retry). Para evitar duplicação, usar guard durável por `outbox_event_id` (ex.: `outbox_deliveries` com UNIQUE) e marcar `sent`/`failed_permanent` + `attempt_count` + `last_error` (PII-safe).
-- [WORKER PII-FREE] Worker `handle-message` é PII-free: não recebe/persiste `text`, `phone/sender_id`, `remote_jid/wa_id`, `payload/raw`, `name`.
-- [INBOUND CONTRACT] Payload canônico para worker (`InboundMessage`, PII-free):
-  - `provider`: "evolution"
-  - `message_id`: string (dedupe key)
-  - `property_id`: string
-  - `correlation_id`: string (gerado no public)
-  - `contact_hash`: string (base64url sem padding, 32 chars)
-  - `kind`: text|interactive|media|unknown
-  - `received_at`: ISO8601 UTC
-- [WHATSAPP TIMEOUT] Worker/task timeout recomendado: 30–60s.
-- [STRIPE PRINCIPLES] Webhook Stripe (public) faz: verificar assinatura + receipt durável (dedupe por `event.id`) + enqueue; conversão HOLD→RESERVATION só no worker em transação crítica; nunca logar payload bruto Stripe.
-- [STRIPE LOG ALLOWLIST] Permitido logar: `event.id`, `event.type`, `checkout_session_id`, `payment_id`, `hold_id`, `property_id`, `correlation_id`, status, duration_ms, attempts.
-- [LOGGING FORMAT] Logs sempre estruturados (JSON por linha) com campos mínimos: severity, timestamp, service, env, correlation_id, event_name.
-- [CORRELATION] Correlation ID end-to-end: request → task → DB txn → outbound.
-  - Se vier `X-Correlation-Id`, validar e reutilizar; senão gerar.
-  - Cloud Tasks devem propagar `X-Correlation-Id` e `X-Event-Source=tasks`.
-- [METRICS LABELS] Labels permitidos (baixa cardinalidade): env, service, event_source, provider, status, error_code.
-  - Proibidos como label: phone, message_id, hold_id (alta cardinalidade).
-- [IDEMPOTENCY OBSERVABLE] Todo dedupe/no-op deve ser medido e/ou logado (sem PII).
-- [RETENTION] Limpeza periódica (idempotente e segura); recomendação: Cloud Scheduler + Cloud Run Job (ou worker interno).
-  - Frequência recomendada diária para `processed_events`, `outbox_events`, `idempotency_keys`.
-  - Nunca logar payload dos registros limpos; só contagens.
-- [PILOT LIMITS] Piloto: até 10 pousadas, sem HA, usuários cientes de falhas; foco em observabilidade e aprendizado.
-- [QUALITY GATES] Gates normativos (quando afetar transação crítica/dinheiro/inventário):
-  - G0: compileall + build docker + /health.
-  - G1: migrate up em DB vazio + migrate up idempotente + constraints críticas presentes.
-  - G3–G5 obrigatórios para mudanças em transações críticas (retry/idempotência/concorrência/race).
-  - (Test plan) Create Hold: provar Idempotency-Key real + guarda ARI + ordem determinística + outbox na mesma transação + concorrência 20→1.
-  - (Test plan) Expire Hold: dedupe por processed_events(tasks, task_id) + FOR UPDATE + inv_held-- + outbox hold.expired + replay no-op.
-- [CI/CD NAMING] Segredos por ambiente (recomendado): `hotelly-{env}-db-url`, `hotelly-{env}-stripe-secret-key`, `hotelly-{env}-stripe-webhook-secret`, `hotelly-{env}-whatsapp-verify-token`, `hotelly-{env}-whatsapp-app-secret` (se aplicável), `hotelly-{env}-internal-task-secret` (se usar header).
-- [CLOUD TASKS QUEUES] Filas por ambiente (recomendado): `hotelly-{env}-default`, `hotelly-{env}-expires`, `hotelly-{env}-webhooks`.
-- [LOCAL DEV COMMANDS] Comandos "oficiais" esperados (se não existir no repo, vira tarefa):
-  - `./scripts/dev.sh` (subir app com hot-reload)
-  - `./scripts/verify.sh` (rodar checks)
-  - `uv run pytest -q`
-  - `python -m compileall -q src` (ou raiz)
-- [INCIDENT SEV0] Stop-ship inclui: overbooking/inventário negativo, reserva duplicada, pagamento confirmado sem trilha de reprocesso, vazamento de PII em logs, endpoint interno exposto publicamente.
+**Regra de prompt:** retornar **apenas JSON**; sem PII; se incerto ⇒ `intent="unknown"` + `reason`.
 
 ---
 
-## 2) spec-pack-tecnico-v2 (v2)
+## 2) Segurança, tenancy e RBAC (property-scoped)
 
-# Hotelly V2 — Spec Pack Técnico (v2.0 - Atualizado 05/02/2026)
+### 2.1 Regra de ouro (uniforme)
+Para endpoints “de dashboard”:
+- `property_id` é **obrigatório via querystring**: `?property_id=...`
+- validado por `require_property_role(min_role)`
+- **não aceitar** `property_id` no body (contrato uniforme)
 
-## Changelog v2.2 (05/02/2026)
-- Adicionado migration 010: room_type_rates (PAX pricing)
-- Adicionado endpoints GET/PUT /rates
-- Atualizado schema room_type_rates com campos reais (centavos)
-- Adicionado seção de Admin para página de Tarifas
+### 2.2 Autenticação (Clerk / JWT)
+Config de produção (referência):
+- Issuer: `https://clerk.hotelly.ia.br`
+- JWKS: `https://clerk.hotelly.ia.br/.well-known/jwks.json`
+- Audience: `hotelly-api`
+- JWT Template: `hotelly-api` (lifetime ~600s)
 
-## Changelog v2.1 (04/02/2026)
-- Atualizado endpoints do Dashboard com occupancy, rooms, assign-room
-- Atualizado schema de reservations (room_id, room_type_id)
-- Adicionado regra RBAC uniforme (property_id obrigatório em todos os endpoints)
-- Adicionado regra de deploy staging (rebuild → migrate → redeploy)
-- Migrations atualizadas até 009
+Claims esperados:
+- `sub` (user_id)
+- `aud = hotelly-api`
+- `metadata.property_ids` (lista de properties)
+- `metadata.role ∈ {owner, manager, receptionist}`
 
-## Changelog v2.0
-- Adicionado modelo de pricing por PAX (ocupação)
-- Adicionado estrutura de rooms (unidades físicas)
-- Adicionado políticas de criança e cancelamento
-- Atualizado configurações de produção GCP
-- Adicionado seção de Admin/Dashboard MVP
-- Adicionado seção de Autenticação (Clerk)
-- Atualizado Evolution API para v2.3.6
+2.2.1 Autorização DB-backed (Regra de Ouro)
 
----
+A autorização é 100% baseada no banco de dados (Postgres).
 
-## SEÇÃO 1: REGRAS GLOBAIS
+O Clerk é utilizado apenas para Autenticação (identidade do usuário).
 
-- [GLOBAL] Core transacional é determinístico; IA não decide estado crítico.
-- [GLOBAL] Transações críticas devem garantir: 0 overbooking, idempotência real e concorrência correta.
-- [GLOBAL] Timestamps `*_at` são TIMESTAMPTZ e sempre UTC; `date` é DATE (sem hora).
-- [GLOBAL] Nomenclatura canônica de schema/campos:
-  - `*_cents` INT (valores em centavos); não usar `total_amount_cents` nem `day` nem variações fora da tabela canônica.
-  - `currency` TEXT ISO-4217 (ex.: BRL).
-  - `*_id` TEXT ou UUID.
+Metadados do Clerk (property_ids, role) não são consultados pelo backend para controle de acesso; a fonte da verdade são as tabelas users e user_property_roles.
 
 ---
 
-## SEÇÃO 2: STACK E INFRAESTRUTURA
 
-- [STACK] Infra base: GCP + Cloud Run + FastAPI + Cloud SQL Postgres + Cloud Tasks + Secret Manager + Stripe + WhatsApp (Evolution API).
-- [REGION] Região padrão: `us-central1` (Iowa) para Cloud Run/Cloud SQL/Cloud Tasks/Secret Manager; piloto sem HA.
-- [SERVICES] Split obrigatório em 2 serviços Cloud Run:
-  - `hotelly-public`: expõe webhooks/APIs; valida assinatura/auth; faz dedupe/idempotência; enqueue; responde 2xx.
-  - `hotelly-worker`: privado (ingress interno); executa tasks/rotinas; aplica transações críticas no Postgres; emite outbox (sem PII).
+### 2.3 Webhooks WhatsApp — segurança (Meta + Evolution) [Security P0]
+- **Meta** (`/webhooks/whatsapp/meta`): fora de local, `META_APP_SECRET` é obrigatório. Se ausente, **não processar** o payload (fail-closed) e responder **200 OK** para evitar retry.
+- Local dev (`TASKS_OIDC_AUDIENCE == "hotelly-tasks-local"`): pode haver bypass, mas deve logar **warning**.
+- **Evolution** (`/webhooks/whatsapp/evolution`): exigir `EVOLUTION_WEBHOOK_SECRET` e header `X-Webhook-Secret` com match.
+- Fora de local: se ausente/errado ⇒ **401**.
 
-### 2.1 Configuração de Produção GCP
+### 2.4 Tasks Auth / OIDC Audience (ajuste obrigatório)
+- Cloud Tasks → worker: exigir **OIDC** (service account invoker).
+- `TASKS_OIDC_AUDIENCE` deve bater com a `status.url` do worker (por ambiente).
 
-```
-Project: hotelly--ia
-Region: us-central1
+## 3) PII, outbox e identidade de contato (WhatsApp)
 
-Cloud Run - hotelly-public:
-  URL: https://app.hotelly.ia.br
-  ENV:
-    APP_ROLE=public
-    TASKS_BACKEND=cloud_tasks
-    GOOGLE_CLOUD_PROJECT=hotelly--ia
-    GCP_PROJECT_ID=hotelly--ia
-    GCP_LOCATION=us-central1
-    GCP_TASKS_QUEUE=hotelly-default
-    TASKS_OIDC_SERVICE_ACCOUNT=hotelly-worker@hotelly--ia.iam.gserviceaccount.com
-    WORKER_BASE_URL=secret:hotelly-worker-url
-    CONTACT_HASH_SECRET=secret:contact-hash-secret
-    CONTACT_REFS_KEY=secret:contact-refs-key
-    DATABASE_URL=secret:hotelly-database-url
-    OIDC_ISSUER=secret:oidc-issuer
-    OIDC_AUDIENCE=secret:oidc-audience
-    OIDC_JWKS_URL=secret:oidc-jwks-url
+### 3.1 Definição e regra de ouro (PII)
+PII inclui: telefone, conteúdo de mensagem, email, documento, endereço, nome ligado ao contato e identificadores “sendable” (ex.: `remote_jid` / `wa_id`).  
+**É proibido** logar payload bruto, request body, mensagens, telefone, nome, `remote_jid`. Isso é incidente.
 
-Cloud Run - hotelly-worker:
-  URL: https://hotelly-worker-678865413529.us-central1.run.app (interno)
-  ENV:
-    APP_ROLE=worker
-    TASKS_OIDC_AUDIENCE=secret:hotelly-worker-url
-    (+ mesmos secrets de DB/OIDC)
+### 3.2 Worker PII-free
+O worker de mensagens (`handle-message`) é **PII-free**:
+- não recebe nem persiste `text`, `remote_jid`, `payload/raw`, nome, telefone.
 
-Cloud Tasks:
-  Queue: hotelly-default
-  Auth: OIDC com service account hotelly-worker@hotelly--ia.iam.gserviceaccount.com
+### 3.3 Outbox (obrigatório)
+- `outbox_events` é **append-only**, payload mínimo e **sem PII**.
+- Toda ação crítica (hold/payment/reservation) deve escrever outbox **na mesma transação**.
+- É proibido colocar no payload: telefone/email/nome/endereço/documento/texto de chat, payload bruto Stripe/WhatsApp.
 
-Artifact Registry:
-  Repositório: hotelly (NÃO hotelly-repo)
-  Imagem: us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest
-```
-
-### 2.1.1 Configuração de Staging GCP (isolado)
-
-Objetivo: staging **isolado de verdade** (DB + worker próprios) para validar E2E (Admin → API → Cloud Tasks → Worker → Outbox) sem tocar prod.
-
-**Serviços (staging):**
-- `hotelly-public-staging` (API)
-- `hotelly-worker-staging` (worker)
-
-**Cloud SQL (staging):**
-- Instância: `hotelly--ia:us-central1:hotelly-sql` (mesma instância)
-- Database: `hotelly_staging` (database separado)
-- Usuário: `hotelly_staging_app`
-- Secret: `hotelly-staging-database-url` (+ `hotelly-staging-db-password`)
-
-**Regras operacionais críticas:**
-- `WORKER_BASE_URL` (no `hotelly-public-staging`) deve apontar para o **URL canônico** do Cloud Run (`status.url`, domínio `*.a.run.app`), não para o alias `*.run.app`.
-- `TASKS_BACKEND=cloud_tasks` é obrigatório (staging não pode ficar em `inline`).
-- **Deploy staging sempre nesta ordem: rebuild imagem → migrate → redeploy** (worker + public). Se pular o rebuild, o worker roda com código antigo e pode dar `UndefinedColumn` ou erros similares.
-- O worker-staging precisa:
-  - **porta 8000** (deploy Cloud Run com `--port 8000`), pois o container do worker escuta em 8000.
-  - Cloud SQL anexado (`run.googleapis.com/cloudsql-instances=hotelly--ia:us-central1:hotelly-sql`).
-  - `TASKS_OIDC_AUDIENCE` alinhado com o próprio URL do worker-staging (ideal: secret dedicado `hotelly-worker-staging-url` contendo o `status.url` do worker-staging).
-
-**⚠️ Job hotelly-migrate-staging está quebrado** — DATABASE_URL mal formatado. Usar cloud-sql-proxy manualmente para migrations.
-
-**ENV mínimo (staging):**
-
-`hotelly-public-staging`:
-- `DATABASE_URL=secret:hotelly-staging-database-url`
-- `OIDC_ISSUER=secret:oidc-issuer-dev`
-- `OIDC_JWKS_URL=secret:oidc-jwks-url-dev`
-- `OIDC_AUDIENCE=hotelly-api`
-- `TASKS_BACKEND=cloud_tasks`
-- `GCP_TASKS_QUEUE=hotelly-default`
-- `WORKER_BASE_URL=https://<status.url do hotelly-worker-staging>`
-- `TASKS_OIDC_SERVICE_ACCOUNT=hotelly-worker@hotelly--ia.iam.gserviceaccount.com`
-- `GCP_PROJECT_ID=hotelly--ia`
-
-`hotelly-worker-staging`:
-- `APP_ROLE=worker`
-- `DATABASE_URL=secret:hotelly-staging-database-url`
-- `DB_PASSWORD=secret:hotelly-staging-db-password`
-- `OIDC_ISSUER=secret:oidc-issuer-dev`
-- `OIDC_JWKS_URL=secret:oidc-jwks-url-dev`
-- `OIDC_AUDIENCE=secret:oidc-audience`
-- `TASKS_OIDC_AUDIENCE=secret:hotelly-worker-staging-url`
-- Cloud Run:
-  - `--port 8000`
-  - `--add-cloudsql-instances hotelly--ia:us-central1:hotelly-sql`
-
-
-### 2.2 Autenticação (Clerk)
-
-```
-Clerk Production:
-  Issuer: https://clerk.hotelly.ia.br
-  JWKS: https://clerk.hotelly.ia.br/.well-known/jwks.json
-  Audience: hotelly-api
-  JWT Template: hotelly-api (lifetime 600s)
-  
-JWT Claims esperados:
-  - sub: user_id (Clerk)
-  - aud: hotelly-api
-  - azp: application_id
-  - metadata.property_ids: lista de properties do usuário
-  - metadata.role: owner | manager | receptionist
-```
+### 3.4 Contact hash + “vault” de destinatário (contact_refs)
+- Pipeline identifica contato por `contact_hash` (hash com secret; não reversível sem secret).
+- Resolução do destinatário outbound via “vault”:
+  - Mapeamento conceitual: `(property_id, channel, contact_hash) → remote_jid` **criptografado**
+  - Criptografia: **AES-256-GCM** com chave simétrica **`CONTACT_REFS_KEY`** (Secret Manager/env)
+  - TTL curto (recomendado ≤ 1h)
+  - Apenas sender (envio) lê o vault; `handle-message` não lê; worker não escreve no vault
+  - Nunca logar `remote_jid` descriptografado
+- Se vault não tiver entrada: **não envia** (comportamento intencional) e registra erro PII-safe.
 
 ---
 
-## SEÇÃO 3: REGRAS DE ENDPOINTS E TASKS
 
-- [PUBLIC ENDPOINT RULE] Endpoint público faz somente: (1) validação assinatura/auth, (2) receipt/dedupe durável quando aplicável, (3) enqueue, (4) responde 2xx; sem lógica pesada/transacional no público.
-- [TASK AUTH] Cloud Tasks chamando worker devem usar OIDC (service account invoker).
-- [CLOUD TASKS DEDUPE] `create_task` pode retornar 409 AlreadyExists (dedupe por nome). Isso deve ser tratado como **sucesso idempotente** (não 500).
-- [WHATSAPP TIMEOUT] Worker/task timeout recomendado: 30–60s.
+### 3.5 Persistência de mensagens (MVP/Piloto)
+- MVP/Piloto: **não persistir mensagens** (inbound/outbound) no Postgres.
+- Persistir: `processed_events`, entidades transacionais (holds/payments/reservations), e `outbox_events` (mínimo, sem PII).
 
----
+## 4) Inventário (ARI) e concorrência
 
-## SEÇÃO 4: BANCO DE DADOS
+### 4.1 Invariantes ARI
+Inventário nunca negativo e nunca excedido:
+- `inv_total >= inv_booked + inv_held` para todas as noites
+- Guardas no `WHERE` dos updates (incrementa hold só se houver saldo; decrementa só se `inv_held >= 1`)
+- Validar “1 linha por noite”; se alguma noite afetar 0 linhas ⇒ rollback (sem hold parcial)
 
-- [DB SOURCE OF TRUTH] Fonte da verdade do schema são as migrations em `/migrations`; arquivos `docs/data/*.sql` são referência humana.
-- [DB CONSTRAINTS] Guardrails por constraints/UNIQUE:
-  - Dedupe eventos: `processed_events(source, external_id)` UNIQUE.
-  - 1 reserva por hold: `reservations(property_id, hold_id)` UNIQUE.
-  - Payment canonical: `payments(property_id, provider, provider_object_id)` UNIQUE.
-  - Idempotency keys: `idempotency_keys(property_id, scope, key)` UNIQUE/PK.
-- [DB LOCKING] Em operações que competem no mesmo hold (expire/cancel/convert): `SELECT ... FOR UPDATE` no hold.
-- [DB DEADLOCK AVOIDANCE] Ao tocar várias noites, iterar sempre em ordem fixa: **(room_type_id, date ASC)**.
-
-### 4.1 Modelo de Pricing por PAX (Ocupação)
-
-- **Estado atual (migration 010):** `price_1chd_cents`, `price_2chd_cents`, `price_3chd_cents`
-- **Target (pós-Story 1):** `price_bucket1_chd_cents`, `price_bucket2_chd_cents`, `price_bucket3_chd_cents` + compat no `/rates` (GET retorna ambos; PUT aceita um ou outro; ambos divergentes ⇒ 400)
-
-O sistema usa modelo de preço por ocupação (PAX), padrão do mercado hoteleiro brasileiro:
-
-```sql
--- Tipos de quarto (categoria)
-room_types:
-  id: TEXT PK                   -- "rt_standard", "rt_suite"
-  property_id: TEXT FK
-  name: VARCHAR(100)            -- 'Suíte Deluxe', 'Chalé VIP'
-  description: TEXT
-  max_adults: INTEGER           -- capacidade máxima adultos
-  max_children: INTEGER         -- capacidade máxima crianças
-  max_occupancy: INTEGER        -- capacidade total
-  amenities: JSONB              -- ['ar-condicionado', 'hidro']
-  display_order: INTEGER
-  is_active: BOOLEAN
-
--- Unidades físicas (quartos individuais) — migration 007
-rooms:
-  property_id: TEXT FK          -- tenant
-  id: TEXT                      -- "101", "102", "201"
-  room_type_id: TEXT FK         -- FK composta → room_types(property_id, id)
-  name: TEXT                    -- "Quarto 101", "Suíte 201"
-  is_active: BOOLEAN
-  PK(property_id, id)
-
--- Tarifas por data (modelo PAX) — migration 010
-room_type_rates:
-  property_id: TEXT NOT NULL
-  room_type_id: TEXT NOT NULL
-  date: DATE NOT NULL
-  
-  -- Preços por ocupação adultos (em centavos)
-  price_1pax_cents: INT         -- preço 1 adulto
-  price_2pax_cents: INT         -- preço 2 adultos
-  price_3pax_cents: INT         -- preço 3 adultos (nullable)
-  price_4pax_cents: INT         -- preço 4 adultos (nullable)
-  
-  -- Adicional por criança (em centavos)
-  price_1chd_cents: INT         -- LEGADO: adicional por criança (bucket 1 — 0–3) (nullable)
-  price_2chd_cents: INT         -- LEGADO: adicional por criança (bucket 2 — 4–12) (nullable)
-  price_3chd_cents: INT         -- LEGADO: adicional por criança (bucket 3 — 13–17) (nullable)
-  
-  -- Restrições
-  min_nights: INT               -- mínimo de noites (nullable)
-  max_nights: INT               -- máximo de noites (nullable)
-  closed_checkin: BOOLEAN       -- não permite check-in (default false)
-  closed_checkout: BOOLEAN      -- não permite check-out (default false)
-  is_blocked: BOOLEAN           -- data indisponível (default false)
-  
-  created_at: TIMESTAMPTZ       -- default now()
-  updated_at: TIMESTAMPTZ       -- default now()
-  
-  PRIMARY KEY (property_id, room_type_id, date)
-  FOREIGN KEY (property_id) → properties(id) ON DELETE CASCADE
-  FOREIGN KEY (property_id, room_type_id) → room_types(property_id, id) ON DELETE RESTRICT
-  
-  INDEXES:
-    idx_room_type_rates_property_date (property_id, date)
-    idx_room_type_rates_type_date (room_type_id, date)
-
--- Inventário
-ari_days:
-  property_id: TEXT FK
-  room_type_id: TEXT FK
-  date: DATE
-  inv_total: INTEGER            -- total de unidades
-  inv_booked: INTEGER           -- reservas confirmadas
-  inv_held: INTEGER             -- holds ativos
-  base_rate_cents: INTEGER      -- ⚠️ DEPRECATED: migrar para room_type_rates
-  PK(property_id, room_type_id, date)
-```
-
-### 4.2 Políticas
-
-> **LEGADO/DEPRECATED:** a tabela `child_policies` abaixo **não é usada** no plano atual. A fonte de verdade para políticas de criança é `property_child_age_buckets` (3 buckets, 0..17, sem overlap, cobertura completa).
-
-```sql
--- Política de criança
-child_policies:
-  id: UUID PK
-  property_id: UUID FK UNIQUE
-  accepts_children: BOOLEAN
-  free_child_min_age: INTEGER      -- 0
-  free_child_max_age: INTEGER      -- 3 (até 3 anos grátis)
-  free_child_counts_as_guest: BOOLEAN
-  paid_child_min_age: INTEGER      -- 4
-  paid_child_max_age: INTEGER      -- 10
-  paid_child_counts_as_guest: BOOLEAN
-  description: TEXT
-
--- Política de cancelamento
-cancellation_policies:
-  id: UUID PK
-  property_id: UUID FK
-  name: VARCHAR(100)
-  penalty_type: VARCHAR(20)        -- 'free', 'partial', 'non_refundable'
-  days_before_checkin: INTEGER
-  penalty_percentage: DECIMAL(5,2)
-  admin_fee: DECIMAL(10,2)
-  description: TEXT
-  is_active: BOOLEAN
-
-cancellation_policy_periods:
-  id: UUID PK
-  policy_id: UUID FK
-  start_date: DATE
-  end_date: DATE
-  is_priority: BOOLEAN
-  is_continuous: BOOLEAN
-```
-
-### 4.3 Atualização de Reservations (implementado)
-
-```sql
--- Migration 008: atribuição de quarto
-ALTER TABLE reservations ADD COLUMN room_id TEXT;
--- FK composta: reservations(property_id, room_id) → rooms(property_id, id)
-
--- Migration 009: tipo de quarto na reserva
-ALTER TABLE reservations ADD COLUMN room_type_id TEXT;
--- FK composta: reservations(property_id, room_type_id) → room_types(property_id, id)
--- Preenchido automaticamente pelo convert_hold e via COALESCE no assign-room
-
--- Campos planejados (futuro)
--- adults INTEGER DEFAULT 2
--- children INTEGER DEFAULT 0
--- children_ages INTEGER[]
--- original_total DECIMAL(10,2)
--- adjustment_amount DECIMAL(10,2) DEFAULT 0
--- adjustment_reason TEXT
-```
-
-### 4.4 Migrations (status atual)
-
-```
-001_initial.py           -- properties, room_types, ari_days, holds, hold_nights
-002_conversations.py     -- conversations
-003_contact_refs.py      -- contact_refs
-004_payments.py          -- payments
-005_reservations.py      -- reservations, processed_events, idempotency_keys
-006_outbox_message_type.py -- outbox_events.message_type
-007_add_rooms.py         -- rooms (unidades físicas)
-008_add_reservation_room_id.py -- reservations.room_id
-009_reservations_room_type_id.py -- reservations.room_type_id
-010_room_type_rates.py   -- room_type_rates (PAX pricing) ← NOVO
-```
+### 4.2 Locking e deadlock avoidance
+- Operações concorrentes no mesmo hold (expire/cancel/convert): `SELECT ... FOR UPDATE` no hold.
+- Ao tocar várias noites: iterar sempre em ordem fixa **(room_type_id, date ASC)**.
 
 ---
 
-## SEÇÃO 5: INVARIANTES DE INVENTÁRIO (ARI)
+## 5) Idempotência (end-to-end)
 
-- [ARI INVARIANTS] Inventário nunca negativo e nunca excedido:
-  - `inv_total >= inv_booked + inv_held` para todas as noites.
-  - Guardas no `WHERE` dos updates (ex.: só incrementa hold se houver saldo; só decrementa se `inv_held >= 1`).
-  - Validar "1 linha por noite"; se alguma noite afetar 0 linhas => rollback (sem hold parcial).
+Idempotência ponta a ponta combina:
+- `processed_events` (dedupe de eventos externos/tasks)
+- `task_id` determinístico (Cloud Tasks)
+- UNIQUEs no banco (última linha de defesa)
+- `idempotency_keys` para endpoints com `Idempotency-Key` (escopo + key)
 
----
-
-## SEÇÃO 6: IDEMPOTÊNCIA
-
-- [IDEMPOTENCY] Idempotência ponta a ponta é composta por:
-  - `processed_events` para eventos externos/tasks,
-  - `task_id` determinístico em Cloud Tasks,
-  - UNIQUEs no banco (última linha de defesa),
-  - `idempotency_keys` para endpoints que aceitam Idempotency-Key.
+**Cloud Tasks:** `create_task` pode retornar **409 AlreadyExists** (dedupe por nome). Isso deve ser tratado como **sucesso idempotente** (não 500).
 
 ---
 
-## SEÇÃO 7: OUTBOX E PII
+## 6) Banco de dados (Postgres)
 
-- [OUTBOX] `outbox_events` é append-only, payload mínimo e sem PII.
-- [OUTBOX WRITE RULE] Toda ação crítica que altera estado (hold/payment/reservation) deve escrever outbox **na mesma transação**.
-- [OUTBOX PAYLOAD] Proibido no payload: telefone/email/nome/endereço/documento/texto de chat; proibido payload bruto de Stripe/WhatsApp.
-- [MESSAGE PERSISTENCE] MVP/Piloto: **não persistir mensagens** (inbound/outbound) no Postgres.
-- [PII DEFINITION] PII inclui: telefone, conteúdo de mensagem, email, documento, endereço completo, nome (quando ligado ao contato), identificadores "sendable" (ex.: remote_jid/wa_id).
-- [PII GOLD RULE] Proibido logar payload bruto/request body/mensagens/telefone/nome/remote_jid; isso é incidente.
-- [CONTACT HASH] Identidade de contato no pipeline deve ser via `contact_hash` (hash com secret; não reversível sem secret).
+### 6.1 Fonte da verdade
+- Fonte da verdade do schema são as migrations em `migrations/` (Alembic).
+- Arquivos auxiliares (ex.: `docs/data/*.sql`) são referência humana, não execução.
+
+### 6.2 Constraints/guardrails (essenciais)
+- Dedupe eventos: `processed_events(source, external_id)` **UNIQUE**
+- 1 reserva por hold: `reservations(property_id, hold_id)` **UNIQUE**
+- Payment canonical: `payments(property_id, provider, provider_object_id)` **UNIQUE**
+- Idempotency keys: `idempotency_keys(property_id, scope, key)` **UNIQUE/PK**
+
+### 6.3 Modelo de pricing por ocupação (PAX) — `room_type_rates`
+
+Tabela canônica: `room_type_rates` (PK `(property_id, room_type_id, date)`).
+
+Campos principais (centavos):
+- Adultos: `price_1pax_cents`, `price_2pax_cents`, `price_3pax_cents`, `price_4pax_cents`
+- Crianças (por bucket): `price_bucket1_chd_cents`, `price_bucket2_chd_cents`, `price_bucket3_chd_cents` (nullable)
+
+Restrições (por dia):
+- `min_nights`, `max_nights`, `closed_checkin`, `closed_checkout`, `is_blocked`
+
+Compatibilidade `/rates`:
+- **GET** retorna campos bucket **e** aliases legados (`price_1chd_cents`, `price_2chd_cents`, `price_3chd_cents`)
+- **PUT** aceita **bucket** ou **legado**; se ambos presentes e divergentes ⇒ **400**
+
+> Observação histórica: havia plano de coexistência (ADD colunas). Como o sistema ainda não estava em produção, a decisão operacional foi **RENAME no DB** e retrocompatibilidade apenas na API.
+
+### 6.4 Políticas de crianças (fonte da verdade) — `property_child_age_buckets`
+- Buckets por `property_id`:
+  - exatamente 3 buckets (`bucket ∈ {1,2,3}`)
+  - `min_age/max_age` dentro de `0..17` e `min_age <= max_age`
+  - **cobertura completa 0..17 sem gaps**
+  - **sem overlap garantido no DB** via **EXCLUDE constraint** (usa range; requer extensão `btree_gist`)
+
+### 6.5 Política de cancelamento (fonte da verdade) — `property_cancellation_policy`
+- 1 linha por `property_id`
+- Campos:
+  - `policy_type ∈ ('free','flexible','non_refundable')`
+  - `free_until_days_before_checkin` (0..365)
+  - `penalty_percent` (0..100)
+  - `notes` (nullable)
+  - `updated_at` default now()
+- Checks de consistência:
+  - `free`: `penalty_percent = 0`
+  - `non_refundable`: `penalty_percent = 100` e `free_until_days_before_checkin = 0`
+  - `flexible`: `penalty_percent` 1..100
+
+### 6.6 Ocupação nas entidades transacionais (estado atual)
+- `holds` e `reservations` persistem:
+  - `adult_count` (SMALLINT)
+  - `children_ages` (JSONB, default `[]`)
+- `guest_count` foi removido (DB + código).
 
 ---
 
-## SEÇÃO 8: INTELIGÊNCIA ARTIFICIAL
 
-- [AI ROLE] IA no MVP só para roteamento/extração; sempre substituível; core continua determinístico.
-- [AI INPUT] Entrada para IA deve ser redigida; nunca enviar payload bruto de webhook, tokens, segredos.
-- [AI OUTPUT CONTRACT] Saída da IA é JSON estrito (schema versionado); se JSON inválido/enum desconhecido => fallback determinístico.
-- [AI SCHEMA v1.0] `IntentOutput`:
-  - required: `schema_version` = "1.0", `intent` ∈ {quote_request, checkout_request, cancel_request, human_handoff, unknown}, `confidence` ∈ [0,1]
-  - opcionais: `entities` {checkin(date), checkout(date), guest_count(1..20), room_type_id(string)}, `reason` (<=200).
-- [AI PROMPT RULE] Prompt retorna **apenas JSON**; sem PII; se incerto => `intent="unknown"` + `reason`.
+**Nota de legado (pricing crianças):** documentação antiga pode referir colunas como `price_1chd_cents`, `price_2chd_cents`, `price_3chd_cents` (legado). A fonte de verdade atual é `room_type_rates` + `property_child_age_buckets`, com compat só via API quando necessário.
+
+## 7) Pricing/Quote (backend)
+
+### 7.1 Contrato atual do quote
+- Parâmetros primários: `adult_count` + `children_ages[]` (idades 0..17)
+- Sem fallback para `ari_days.base_rate_cents` (fallback legado removido)
+- Falha controlada gera `QuoteUnavailable(reason_code, meta)`; call-site loga `reason_code` e retorna `None` para o público (por enquanto)
+
+
+**Histórico:** versões antigas do spec descreviam fallback de quote para `ari_days.base_rate_cents`. O comportamento atual **não deve** depender desse campo (DEPRECATED).
+
+### 7.2 reason_codes mínimos (padronizados)
+- Dados/política: `child_policy_missing`, `child_policy_incomplete`
+- Tarifas: `rate_missing`, `pax_rate_missing`, `child_rate_missing`
+- Ocupação: `occupancy_exceeded`
+- Datas/ARI: `invalid_dates`, `no_ari_record`, `no_inventory`
+- Genérico: `unexpected_error`
 
 ---
 
-## SEÇÃO 9: WHATSAPP
+## 8) WhatsApp (Evolution) — pipeline e tasks
 
-- [WHATSAPP PIPELINE] Pipeline único obrigatório:
-  - inbound (public) → normalize → receipt/dedupe → enqueue (task) → worker processa → outbox → sender (task) envia.
-  - Proibido qualquer "caminho alternativo rápido" fora do pipeline (exceto debug/legado; ver `POST /tasks/whatsapp/send-message`).
-- [WHATSAPP PROVIDERS] Evolution API v2.3.6 como adapter único no MVP.
-- [WORKER PII-FREE] Worker `handle-message` é PII-free: não recebe/persiste `text`, `phone/sender_id`, `remote_jid/wa_id`, `payload/raw`, `name`.
+### 8.1 Pipeline único (obrigatório)
+`inbound (public) → normalize → receipt/dedupe → enqueue → worker(handle-message) → outbox → sender(send-response)`
 
-### 9.1 Configuração Evolution API (Produção)
+É proibido criar “caminho alternativo rápido” fora do pipeline (exceto debug/legado).
 
-```
-Evolution API:
-  URL: https://edge.roda.ia.br/
-  Instância: pousada-ia-v2
-  API Key: secret:evolution-api-key
-  Número WhatsApp: <redacted>
-  
-Webhook:
-  URL: https://app.hotelly.ia.br/webhooks/whatsapp/evolution
-  Headers: X-Property-Id: pousada-demo
-  Events: MESSAGES_UPSERT
-  
-Fluxo validado:
-  WhatsApp → Evolution → Hotelly Public → Cloud Tasks → Worker → Outbox ✓
-```
+### 8.2 Provider (MVP)
+- Evolution API (adapter único no MVP; Meta Cloud API pode entrar depois mantendo o mesmo contrato).
 
-### 9.2 Inbound Contract (PII-free)
+Config (produção — referência):
+- Evolution URL: `https://edge.roda.ia.br/`
+- Webhook: `https://app.hotelly.ia.br/webhooks/whatsapp/evolution`
+- Header obrigatório no webhook: `X-Property-Id: <property_id>`
+- Header obrigatório no webhook: `X-Webhook-Secret: <secret>` (match com `EVOLUTION_WEBHOOK_SECRET`; fora de local, ausente/errado ⇒ **401**)
 
+Outbound via Evolution:
+- `EVOLUTION_BASE_URL`
+- `EVOLUTION_INSTANCE`
+- `EVOLUTION_API_KEY` (secret)
+- `EVOLUTION_SEND_PATH` opcional (default `/message/sendText/{instance}`)
+
+### 8.3 Inbound contract (PII-free) para o worker
 ```json
 {
   "provider": "evolution",
@@ -552,2572 +321,2899 @@ Fluxo validado:
 }
 ```
 
----
+### 8.4 Semântica do endpoint de envio (task) — `POST /tasks/whatsapp/send-response`
+- Falha **transiente** (timeout/rede/5xx/429) ⇒ **HTTP 500** (habilita retry do Cloud Tasks)
+- Falha **permanente** (401/403, `contact_ref_not_found`, template inválido, env/secret faltando) ⇒ **HTTP 200** com payload `{ "ok": false, "terminal": true, "error": "<code>" }` (para parar retry)
+- No-op idempotente: se já enviado ⇒ **HTTP 200** `{ "ok": true, "already_sent": true }` e não chama provider
 
-## SEÇÃO 10: STRIPE
+### 8.5 Guard durável de idempotência no outbound — `outbox_deliveries`
+- UNIQUE por `(property_id, outbox_event_id)`
+- Campos operacionais:
+  - `status ∈ {sending, sent, failed_permanent}`
+  - `attempt_count`
+  - `last_error` (sanitizado, PII-safe)
+  - `sent_at`, timestamps
+- Lease anti-concorrência:
+  - `status='sending'` com `updated_at` recente ⇒ retorna **500 lease_held**
+  - lease stale permite takeover
 
-- [STRIPE PRINCIPLES] Webhook Stripe (public) faz: verificar assinatura + receipt durável (dedupe por `event.id`) + enqueue; conversão HOLD→RESERVATION só no worker.
-- [STRIPE LOG ALLOWLIST] Permitido logar: `event.id`, `event.type`, `checkout_session_id`, `payment_id`, `hold_id`, `property_id`, `correlation_id`, status, duration_ms.
-
-### 10.1 Configuração Stripe (Produção)
-
-```
-Secrets:
-  stripe-secret-key: sk_live_... (Secret Manager)
-  stripe-webhook-secret: whsec_... (Secret Manager)
-  
-Environment Variables (Cloud Run):
-  STRIPE_SUCCESS_URL=https://app.hotelly.ia.br/stripe/success
-  STRIPE_CANCEL_URL=https://app.hotelly.ia.br/stripe/cancel
-  
-Webhook (Stripe Dashboard):
-  URL: https://app.hotelly.ia.br/webhooks/stripe
-  Eventos: checkout.session.completed, payment_intent.succeeded
-```
-
----
-
-## SEÇÃO 11: LOGGING E OBSERVABILIDADE
-
-- [LOGGING FORMAT] Logs sempre estruturados (JSON por linha) com campos mínimos: severity, timestamp, service, env, correlation_id, event_name.
-- [CORRELATION] Correlation ID end-to-end: request → task → DB txn → outbound.
-- [METRICS LABELS] Labels permitidos (baixa cardinalidade): env, service, event_source, provider, status, error_code.
-  - Proibidos como label: phone, message_id, hold_id (alta cardinalidade).
-- [IDEMPOTENCY OBSERVABLE] Todo dedupe/no-op deve ser medido e/ou logado (sem PII).
+### 8.6 Diagnóstico controlado de retry (staging)
+Foi usado um diag hook *staging-only* para provar retry transiente via Cloud Tasks:
+- Gates:
+  - `APP_ENV=staging`
+  - `STAGING_DIAG_ENABLE=true`
+  - header `x-diag-force-transient: 1`
+  - `property_id` canônico `pousada-staging`
+- Efeito: grava `last_error="forced_transient"`, mantém `status='sending'` e retorna **HTTP 500**.
 
 ---
 
-## SEÇÃO 12: ADMIN/DASHBOARD MVP
+## 9) Stripe
 
-### 12.1 Escopo MVP
+### 9.1 Princípios
+Webhook Stripe (public) faz:
+- validar assinatura
+- receipt/dedupe durável por `event.id`
+- enqueue task
+- responde 2xx
 
-```
-Telas obrigatórias:
-  1. Dashboard (resumo do dia + métricas)
-  2. Grid de Ocupação (mapa de reservas estilo Rooms)
-  3. Lista de Reservas (tabela com filtros)
-  4. Calendário de Preços (edição PAX por data) ← IMPLEMENTADO
-  5. Edição em Lote (atualizar múltiplas datas)
-  6. Configurações (política criança, cancelamento)
-```
+Conversão HOLD→RESERVATION só no worker (transação crítica).  
+Nunca logar payload bruto Stripe.
 
-### 12.2 Endpoints do Dashboard
+### 9.2 Log allowlist (Stripe)
+Permitido logar: `event.id`, `event.type`, `checkout_session_id`, `payment_id`, `hold_id`, `property_id`, `correlation_id`, status, duration_ms, attempts.
 
-```
-Existentes:
-  GET  /auth/whoami
-  GET  /me
-  GET  /properties
-  GET  /properties/{id}
-  GET  /frontdesk/summary
-
-  GET  /reservations
-    - filtros (check-in): ?from=YYYY-MM-DD&to=YYYY-MM-DD&status=confirmed|cancelled
-    - retorno: {"reservations": [{id, checkin, checkout, status, total_cents, currency, room_id, room_type_id, created_at}]}
-
-  GET  /reservations/{id}
-    - retorno: {id, checkin, checkout, status, total_cents, currency, hold_id, room_id, room_type_id, created_at}
-    - room_id e room_type_id são nullable (reservas antigas podem não ter)
-
-  POST /reservations/{id}/actions/resend-payment-link
-    - 202 Accepted (idempotente)
-    - gera task Cloud Tasks → worker → escreve outbox
-
-  POST /reservations/{id}/actions/assign-room
-    - body: {"room_id": "<room_id>"}
-    - 202 Accepted (enqueue Cloud Task)
-    - worker: valida room existe + is_active + room_type compatível
-    - worker: atualiza room_id, preenche room_type_id via COALESCE quando NULL
-    - worker: grava outbox 'room_assigned' com reservation_id no payload
-    - dedupe: task_id determinístico (assign-room:{reservation_id}:{hash16})
-
-  GET  /occupancy
-property_id via `?property_id=` validado por RBAC
-    - query: start_date, end_date (exclusivo, max 90 dias)
-    - retorno: room_types com array de days (inv_total, booked, held, available)
-
-  GET  /rooms
-property_id via `?property_id=` validado por RBAC
-    - retorno: [{id, room_type_id, name, is_active}]
-
-  GET  /rates ← NOVO (Fase 13)
-    - RBAC: viewer
-    - query: start_date, end_date, room_type_id (opcional)
-    - limite: max 366 dias de range
-    - retorno: lista de rates com campos PAX
-    - se room_type_id omitido: retorna todos os room_types da property
-
-  PUT  /rates ← NOVO (Fase 13)
-    - RBAC: staff
-    - body: {"rates": [{room_type_id, date, price_1pax_cents, ...}]}
-    - limite: max 366 rates por request
-property_id via `?property_id=` validado por RBAC
-    - bulk upsert via INSERT ... ON CONFLICT DO UPDATE
-    - idempotente: updated_at atualizado em cada upsert
-    - retorno: {"upserted": N}
-
-  GET  /outbox
-    - query obrigatória: property_id=<propertyId>
-    - filtros: aggregate_type, aggregate_id, event_type, limit
-    - retorno: {"events": [...]} (PII-safe, sem payload)
-
-  GET  /payments
-  POST /payments/holds/{hold_id}/checkout
-  GET  /reports/ops
-  GET  /reports/revenue
-
-RBAC:
-  Todos os endpoints usam require_property_role("viewer"|"staff")
-  não aceitar `property_id` no body
-  property_id via `?property_id=` validado por RBAC/JWT
-  Contrato uniforme: sem atalhos single-tenant```
-
-
-### 12.3 Regras de Alteração de Reserva
-
-```
-Ao mover reserva para novo período:
-  1. Verificar disponibilidade no novo período
-  2. Recalcular valor total (modelo PAX)
-  3. Mostrar diferença de valor
-  4. NÃO cobrar automaticamente - informar para cobrar no check-in
-  5. NÃO notificar hóspede automaticamente - staff comunica manualmente
-  6. Atualizar reservation com adjustment_amount e adjustment_reason
-```
-
-### 12.4 Admin Frontend (hotelly-admin)
-
-```
-Stack:
-  - Next.js 14 (App Router)
-  - Clerk para auth
-  - Tailwind CSS (inline styles no momento)
-
-Repo: https://github.com/marcioluisms/hotelly-admin
-
-Páginas implementadas:
-  /select-property              - Seleção de property
-  /p/[propertyId]/dashboard     - Dashboard com métricas
-  /p/[propertyId]/reservations  - Lista de reservas
-  /p/[propertyId]/reservations/[id] - Detalhe + AssignRoomDialog
-  /p/[propertyId]/rates         - Calendário de preços PAX ← NOVO
-  /p/[propertyId]/frontdesk/occupancy - Grid de ocupação
-
-Proxies API (Next.js API Routes):
-  /api/p/[propertyId]/reservations
-  /api/p/[propertyId]/reservations/[id]/assign-room
-  /api/p/[propertyId]/rooms
-  /api/p/[propertyId]/occupancy
-  /api/p/[propertyId]/rates ← NOVO (GET + PUT)
-
-Libs:
-  src/lib/api.ts   - wrapper apiGet para chamadas server-side
-  src/lib/rates.ts - getRates, putRates, types ← NOVO
-```
-
-### 12.4 Fluxo de Continuous Deployment (CI/CD)
-
-Ambos os repositórios usam Cloud Build com triggers automáticos no push para a branch de produção.
-Os `cloudbuild.yaml` são **environment-agnostic** — staging e produção compartilham o mesmo arquivo,
-diferenciados apenas por substitution variables configuradas no trigger do GCP Console.
-
-#### hotelly-v2 (Backend)
-
-- **Branch de produção:** `master`
-- **Arquivo:** `cloudbuild.yaml` (raiz do repositório)
-- **Pipeline:** build → push → migrate (Cloud SQL Auth Proxy) → deploy-public + deploy-worker (paralelo)
-
-Substitution variables:
-
-| Variável | Staging (default) | Produção |
-|---|---|---|
-| `_IMAGE_TAG` | `staging` | `latest` |
-| `_SERVICE_NAME_PUBLIC` | `hotelly-public-staging` | `hotelly-public` |
-| `_SERVICE_NAME_WORKER` | `hotelly-worker-staging` | `hotelly-worker` |
-| `_CLOUD_SQL_INSTANCE` | *(vazio)* | `hotelly--ia:us-central1:hotelly-sql` |
-| `_DB_SECRET_NAME` | `hotelly-staging-database-url` | `hotelly-database-url` |
-
-Secrets (Secret Manager, referenciados via `availableSecrets`):
-- `DATABASE_URL` → resolvido dinamicamente pelo `_DB_SECRET_NAME`
-
-#### hotelly-admin (Frontend)
-
-- **Branch de produção:** `main`
-- **Arquivo:** `cloudbuild.yaml` (raiz do repositório)
-- **Pipeline:** build (com build-args Next.js) → push → deploy
-
-Substitution variables:
-
-| Variável | Staging (default) | Produção |
-|---|---|---|
-| `_IMAGE_TAG` | `staging` | `latest` |
-| `_SERVICE_NAME` | `hotelly-admin-staging` | `hotelly-admin` |
-| `_API_URL` | `https://hotelly-public-staging-dzsg3axcqq-uc.a.run.app` | `https://app.hotelly.ia.br` |
-| `_ENABLE_API` | `true` | `true` |
-| `_APP_ENV` | `staging` | `production` |
-| `_CLERK_PUBLISHABLE_KEY` | `pk_live_...` | *(confirmar se produção usa chave diferente)* |
-| `_CLERK_SIGN_IN_URL` | `/sign-in` | `/sign-in` |
-| `_CLERK_SIGN_UP_URL` | `/sign-up` | `/sign-up` |
-| `_CLERK_SIGN_IN_FALLBACK` | `/select-property` | `/select-property` |
-| `_CLERK_SIGN_UP_FALLBACK` | `/select-property` | `/select-property` |
-| `_BUILD_DATE` | *(vazio — auto)* | *(vazio — auto)* |
-
-#### Configuração do Trigger no GCP Console
-
-Para cada trigger:
-- **Event:** Push to a branch
-- **Branch regex:** `^master$` (hotelly-v2) ou `^main$` (hotelly-admin)
-- **Configuration:** Cloud Build configuration file → `/cloudbuild.yaml`
-- **Service Account:** Default Cloud Build SA (`<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com`)
-- **Substitution variables:** preencher conforme tabelas acima (override dos defaults)
-
-#### Notas importantes
-
-1. **Variáveis `NEXT_PUBLIC_*`** são injetadas no bundle do Next.js em **build time** via `--build-arg`.
-   Configurá-las como env vars do Cloud Run não tem efeito no client-side.
-2. **Migrations** rodam automaticamente no pipeline do hotelly-v2 via Cloud SQL Auth Proxy
-   antes do deploy, garantindo que o schema está atualizado antes de servir tráfego.
-3. **O mesmo `cloudbuild.yaml`** é usado para staging e produção — nunca duplique o arquivo.
-   Toda diferença entre ambientes deve ser resolvida via substitution variables.
+### 9.3 Config (produção — referência)
+- Secrets:
+  - `stripe-secret-key`
+  - `stripe-webhook-secret`
+- Env vars:
+  - `STRIPE_SUCCESS_URL=https://app.hotelly.ia.br/stripe/success`
+  - `STRIPE_CANCEL_URL=https://app.hotelly.ia.br/stripe/cancel`
+- Webhook URL: `https://app.hotelly.ia.br/webhooks/stripe`
+- Eventos: `checkout.session.completed`, `payment_intent.succeeded`
 
 ---
 
-## SEÇÃO 13: QUALITY GATES
+## 10) Logging e observabilidade
 
-- [QUALITY GATES] Gates normativos (quando afetar transação crítica/dinheiro/inventário):
-  - G0: compileall + build docker + /health.
-  - G1: migrate up em DB vazio + migrate up idempotente + constraints críticas presentes.
-  - G3–G5 obrigatórios para mudanças em transações críticas.
-- [INCIDENT SEV0] Stop-ship inclui: overbooking/inventário negativo, reserva duplicada, pagamento confirmado sem trilha de reprocesso, vazamento de PII em logs, endpoint interno exposto publicamente.
+### 10.1 Logs estruturados (mínimos)
+Sempre JSON por linha com: `severity`, `timestamp`, `service`, `env`, `correlation_id`, `event_name`.
 
----
+### 10.2 Correlation ID end-to-end
+- Se vier `X-Correlation-Id`, validar e reutilizar; senão gerar.
+- Cloud Tasks devem propagar:
+  - `X-Correlation-Id`
+  - `X-Event-Source=tasks`
 
-## SEÇÃO 14: RETENÇÃO E LIMPEZA
-
-- [RETENTION] Limpeza periódica (idempotente e segura); recomendação: Cloud Scheduler + Cloud Run Job.
-  - Frequência recomendada diária para `processed_events`, `outbox_events`, `idempotency_keys`.
-  - Nunca logar payload dos registros limpos; só contagens.
-
----
-
-## SEÇÃO 15: LIMITES DO PILOTO
-
-- [PILOT LIMITS] Piloto: até 10 pousadas, sem HA, usuários cientes de falhas; foco em observabilidade e aprendizado.
-- [SUPPORT CAPACITY] Estimativa de suporte solo: 15-20 clientes confortável, 25 no limite.
+### 10.3 Métricas/labels (baixa cardinalidade)
+Labels permitidos: `env`, `service`, `event_source`, `provider`, `status`, `error_code`.  
+Proibidos como label: phone, message_id, hold_id.
 
 ---
 
-## SEÇÃO 16: REFERÊNCIA RÁPIDA
 
-### Comandos de Desenvolvimento
+### 10.4 Retenção e limpeza (obrigatório)
+- Limpeza periódica **idempotente e segura** (Cloud Scheduler + Cloud Run Job, ou worker interno).
+- Frequência recomendada: **diária** para `processed_events`, `outbox_events`, `idempotency_keys`.
+- Nunca logar payload dos registros limpos; logar apenas **contagens** (PII-safe).
 
-```bash
-# Desenvolvimento local
-./scripts/dev.sh              # subir app com hot-reload
-./scripts/verify.sh           # rodar checks
-uv run pytest -q              # testes
-python -m compileall -q src   # verificar sintaxe
+## 11) Admin/Dashboard (hotelly-admin) — escopo e endpoints
 
-# GCP - Build
-gcloud builds submit --project hotelly--ia \
-  --tag us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest .
+### 11.1 Frontend (referência)
+- Stack: Next.js 14 (App Router) + Clerk + Tailwind
+- Repo: `hotelly-admin`
+- Páginas relevantes:
+  - `/select-property`
+  - `/p/[propertyId]/dashboard`
+  - `/p/[propertyId]/reservations`
+  - `/p/[propertyId]/reservations/[id]`
+  - `/p/[propertyId]/rates`
+  - `/p/[propertyId]/frontdesk/occupancy`
+  - `/p/[propertyId]/settings` (crianças + cancelamento)
+  - /p/[propertyId]/settings/team (Gestão de membros da equipe)
 
-# GCP - Redeploy
-gcloud run services update hotelly-public-staging --project hotelly--ia --region us-central1 \
-  --update-env-vars DEPLOY_SHA=$(date +%s)
+### 11.2 Endpoints backend (dashboard)
+- `GET /auth/whoami`, `GET /me`, `GET /properties`, `GET /properties/{id}`
+- `GET /frontdesk/summary`
+- `GET /reservations` (filtros `from`, `to`, `status`)
+- `GET /reservations/{id}` (campos podem ser nullable em reservas antigas)
+- `POST /reservations/{id}/actions/resend-payment-link` → 202 (task)
+- `POST /reservations/{id}/actions/assign-room` → 202 (task)
+- `GET /occupancy` (`start_date`, `end_date` exclusivo; max 90 dias)
+- `GET /rooms`
+- `GET /rates` / `PUT /rates` (contrato na seção 6.3)
+- `GET /outbox` (PII-safe)
+- `GET /payments`
+- `POST /payments/holds/{hold_id}/checkout`
+- `GET /child-policies` / `PUT /child-policies`
+- `GET /cancellation-policy` / `PUT /cancellation-policy`
+- GET /rbac/users — Lista membros e papéis da propriedade (Join com e-mails).
+- POST /rbac/users/invite — Vincula usuário existente (via e-mail) a uma role.
+- DELETE /rbac/users/{user_id} — Remove vínculo de acesso.
 
-# GCP - Logs
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=hotelly-public-staging AND severity>=ERROR" \
-  --project hotelly--ia --limit=10 --freshness=5m
-
-# Evolution API
-curl -X POST "https://edge.roda.ia.br/chat/findMessages/pousada-ia-v2" \
-  -H "apikey: <EVOLUTION_API_KEY>" \
-  -d '{"limit": 3}'
-
-# Cloud SQL Proxy (para migrations manuais)
-cloud-sql-proxy hotelly--ia:us-central1:hotelly-sql --port 15432 &
-DATABASE_URL="postgresql://hotelly_staging_app:<SENHA>@127.0.0.1:15432/hotelly_staging" uv run alembic upgrade head
-```
-
-### Secrets (Secret Manager)
-
-```
-# Produção
-hotelly-database-url
-hotelly-worker-url
-contact-hash-secret
-contact-refs-key
-oidc-issuer
-oidc-audience
-oidc-jwks-url
-stripe-secret-key
-stripe-webhook-secret
-
-# Staging
-hotelly-staging-database-url
-hotelly-staging-db-password
-hotelly-worker-staging-url
-oidc-issuer-dev
-oidc-jwks-url-dev
-```
-
-### URLs de Produção
-
-```
-Public API:    https://app.hotelly.ia.br
-Clerk:         https://clerk.hotelly.ia.br
-Evolution:     https://edge.roda.ia.br
-```
-
-### URLs de Staging (operacional)
-
-```
-Public API (staging):  https://hotelly-public-staging-678865413529.us-central1.run.app
-Worker (staging):      use sempre o URL canônico do Cloud Run (status.url, domínio *.a.run.app)
-Property ID (staging): pousada-staging
-Rooms (staging):       101 (Standard), 102 (Standard), 201 (Suíte)
-Room Types (staging):  rt_standard, rt_suite
-```
-
+**RBAC:** tudo é property-scoped via `?property_id=...`.
 
 ---
 
-**FIM DO SPEC PACK v2.2**
+## 12) Ambientes e configuração (GCP)
 
----
+### 12.1 Produção (referência)
+Project: `hotelly--ia`  
+Region: `us-central1`
 
-## 2. Runbook de Ambientes
-
-# runbook-de-ambientes-hotelly-v4-corrigido
-(Baseado em `runbook-de-ambientes-hotelly-v4`, com adições mínimas para cobrir lacunas do runbook anterior.)
-
-Atualizado em **05/02/2026** com base na execução da Fase 13 (Calendário de Preços PAX).
-
----
-
-## 0) Regras de ouro
-
-1. **Staging precisa de worker próprio** (não reaproveitar `hotelly-worker`).
-2. **`TASKS_BACKEND=inline` é proibido em staging/prod**.
-3. **Worker em Cloud Run**: porta **8000** + Cloud SQL anexado.
-4. **OIDC audience**: usar sempre `*.a.run.app` (canônico), nunca `*.run.app` (alias).
-5. **`/outbox` exige `property_id` na query**.
-6. **CI usa `uv run alembic upgrade head`** para migrations.
-7. **Deploy staging**: rebuild imagem → migrate → redeploy (nesta ordem, sempre).
-8. **Artifact Registry**: repositório é `hotelly`, NÃO `hotelly-repo`.
-9. **Cloud SQL**: única instância `hotelly-sql`, databases separados (`hotelly` prod, `hotelly_staging` staging).
-
----
-
-## 1) Ambientes e serviços (Cloud Run)
-
-### Serviços
-| Ambiente | API | Worker |
-|---|---|---|
-| Prod/principal | `hotelly-public` | `hotelly-worker` |
-| Staging | `hotelly-public-staging` | `hotelly-worker-staging` |
-
-### Jobs (staging)
-- `hotelly-migrate-staging` — ⚠️ DATABASE_URL mal formatado, usar cloud-sql-proxy
-- `hotelly-seed-staging`
-
-### Databases (mesma instância `hotelly-sql`)
-| Database | Usuário | Ambiente |
-|----------|---------|----------|
-| `hotelly` | `hotelly_app` | Produção |
-| `hotelly_staging` | `hotelly_staging_app` | Staging |
-
-### URLs canônicas
-```bash
-gcloud run services describe hotelly-worker-staging --project hotelly--ia --region us-central1 --format="value(status.url)"
-```
-
-### Artifact Registry
-```bash
-# Repositório correto
-us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest
-
-# Verificar repositórios existentes
-gcloud artifacts repositories list --project hotelly--ia --location us-central1
-```
-
----
-
-## 2) Configuração obrigatória por serviço
-
-### 2.1 `hotelly-public-staging` (API staging)
-Obrigatório:
-- `DATABASE_URL` → secret `hotelly-staging-database-url`
-- `OIDC_ISSUER` → secret `oidc-issuer-dev`
-- `OIDC_JWKS_URL` → secret `oidc-jwks-url-dev`
-- `OIDC_AUDIENCE=hotelly-api`
-
-Cloud Tasks:
+Cloud Run `hotelly-public` (env relevante):
+- `APP_ROLE=public`
 - `TASKS_BACKEND=cloud_tasks`
-- `GCP_TASKS_QUEUE=hotelly-default`
-- `WORKER_BASE_URL=<status.url do hotelly-worker-staging>`
-- `TASKS_OIDC_SERVICE_ACCOUNT=hotelly-worker@hotelly--ia.iam.gserviceaccount.com`
 - `GCP_PROJECT_ID=hotelly--ia`
+- `GCP_LOCATION=us-central1`
+- `GCP_TASKS_QUEUE=hotelly-default`
+- `TASKS_OIDC_SERVICE_ACCOUNT=hotelly-worker@hotelly--ia.iam.gserviceaccount.com`
+- `WORKER_BASE_URL` (secret `hotelly-worker-url`)
+- `CONTACT_HASH_SECRET` (secret `contact-hash-secret`)
+- `CONTACT_REFS_KEY` (secret `contact-refs-key`)
+- `DATABASE_URL` (secret `hotelly-database-url`)
+- `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`
 
-Verificação:
-```bash
-gcloud run services describe hotelly-public-staging --project hotelly--ia --region us-central1   --format="value(spec.template.spec.containers[0].env)" | rg "TASKS_BACKEND|WORKER_BASE_URL"
-```
-
-### 2.2 `hotelly-worker-staging` (worker staging)
-Obrigatório:
+Cloud Run `hotelly-worker`:
 - `APP_ROLE=worker`
-- Porta: **8000**
-- Cloud SQL: `hotelly--ia:us-central1:hotelly-sql`
-- `DATABASE_URL` → secret `hotelly-staging-database-url`
-- `DB_PASSWORD` → secret `hotelly-staging-db-password`
-- `OIDC_ISSUER` → secret `oidc-issuer-dev`
-- `OIDC_JWKS_URL` → secret `oidc-jwks-url-dev`
-- `OIDC_AUDIENCE` → secret `oidc-audience`
-- `TASKS_OIDC_AUDIENCE` → secret `hotelly-worker-staging-url` (= `status.url`)
+- `TASKS_OIDC_AUDIENCE` alinhado com o próprio URL do worker
+- (+ mesmos secrets de DB/OIDC e provider WhatsApp/Stripe quando aplicável)
 
-Verificação:
-```bash
-gcloud run services describe hotelly-worker-staging --project hotelly--ia --region us-central1   --format="yaml(status.url,spec.template.spec.containers[0].ports,spec.template.spec.containers[0].env)"
-```
+Artifact Registry:
+- repositório correto: **`hotelly`** (não `hotelly-repo`)
+- imagem: `us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest`
 
-### 2.3 Prod (`hotelly-public` e `hotelly-worker`)
-- Secrets próprios (`hotelly-database-url`, etc.)
-- **Não** apontar staging para esses serviços.
+### 12.2 Staging (isolado de verdade)
+Objetivo: staging isolado (DB + worker próprios) para validar E2E.
+
+Serviços:
+- `hotelly-public-staging`
+- `hotelly-worker-staging`
+
+DB staging:
+- Instância: `hotelly--ia:us-central1:hotelly-sql`
+- Database: `hotelly_staging`
+- User: `hotelly_staging_app`
+- Secrets: `hotelly-staging-database-url`, `hotelly-staging-db-password`, `hotelly-worker-staging-url`
+
+Regras operacionais críticas:
+- `WORKER_BASE_URL` deve apontar para **status.url canônico** (`*.a.run.app`), não alias `*.run.app`
+- `TASKS_BACKEND=cloud_tasks` é obrigatório (staging não pode ficar em `inline`)
+- worker-staging deve expor **porta 8000** e ter Cloud SQL anexado
+- Ordem segura de deploy: **rebuild imagem → migrate → redeploy** (public + worker)
+
+⚠️ Observação: job `hotelly-migrate-staging` estava quebrado (DATABASE_URL mal formatado). Preferir Cloud SQL Proxy manual.
+
+### 12.3 Ciclo Financeiro e Folio (v1.7)
+**Status:** Validado em Staging.
+
+**Regras de Ouro Financeiras:**
+1. **Trava de Check-out:** O sistema aplica a política "No Balance, No Exit". O status `checked_out` é bloqueado via código (409 Conflict) se `balance_due > 0`.
+2. **Resiliência de Cálculo:** Em caso de erro na consulta do Folio, o sistema deve adotar o comportamento *Fail-Closed*, impedindo o check-out por segurança.
+3. **Terminologia Única:** O estado operacional pós-entrada é `in_house`. O termo `checked_in` está depreciado e não deve ser utilizado em novas implementações.
+
+**Infraestrutura:**
+- As migrações de banco (`folio_payments`) devem ser executadas via CI/CD (Cloud Build) para garantir paridade entre Staging e Produção.
 
 ---
 
-## 3) Deploy / promoção
+## 13) Runbooks (operacional)
 
-**ADICIONADO PARA COBERTURA (origem A):** **Realidade atual** — `hotelly-public-staging` pode estar apontando para **imagem `:latest`**. Nessa configuração, tag `v*` **não garante** promoção se o pipeline/serviço não trocar digest/imagem de fato (trocar tag no Git não muda a revisão do Cloud Run sozinho).
-
-### Procedimento completo (rebuild + migrate + redeploy)
+### 13.1 Dev local
 ```bash
-# 1) Build
-cd ~/projects/hotelly-v2
+./scripts/dev.sh
+./scripts/verify.sh
+uv run pytest -q
+python -m compileall -q src
+```
+
+### 13.2 Build (GCP)
+```bash
 gcloud builds submit --project hotelly--ia   --tag us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest .
+```
 
-# 2) Migrate (VIA CLOUD-SQL-PROXY - job staging está quebrado)
-# Terminal 1: iniciar proxy
-cloud-sql-proxy hotelly--ia:us-central1:hotelly-sql --port 15432 &
-
-# Terminal 2: rodar migration
-# Para STAGING (database hotelly_staging):
-DATABASE_URL="postgresql://hotelly_staging_app:<SENHA>@127.0.0.1:15432/hotelly_staging" uv run alembic upgrade head
-
-# Para PROD (database hotelly):
-DATABASE_URL="postgresql://hotelly_app:<SENHA>@127.0.0.1:15432/hotelly" uv run alembic upgrade head
-
-# Matar proxy após uso
-kill %1
-
-# 3) Redeploy (forçar nova revisão)
+### 13.3 Redeploy (forçar nova revisão)
+```bash
 gcloud run services update hotelly-public-staging --project hotelly--ia --region us-central1   --update-env-vars DEPLOY_SHA=$(date +%s)
 
 gcloud run services update hotelly-worker-staging --project hotelly--ia --region us-central1   --update-env-vars DEPLOY_SHA=$(date +%s)
 ```
 
-### Obter senhas do banco
+### 13.4 Logs (Cloud Run)
 ```bash
-# Senha do hotelly_app (prod)
-gcloud secrets versions access latest --secret=hotelly-db-password --project=hotelly--ia
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=hotelly-public-staging AND severity>=ERROR"   --project hotelly--ia --limit=10 --freshness=5m
 
-# Senha do hotelly_staging_app (staging) - está no secret staging-database-url
-gcloud secrets versions access latest --secret=hotelly-staging-database-url --project=hotelly--ia
+gcloud run services logs read hotelly-worker-staging   --project hotelly--ia --region us-central1 --limit 20
 ```
 
-### Verificar imagem atual do worker
-```bash
-gcloud run services describe hotelly-worker-staging --project hotelly--ia --region us-central1   --format="value(spec.template.spec.containers[0].image)"
-```
-
----
-
-## 4) Cloud Tasks: validação operacional
-
-### Confirmar task criada
+### 13.5 Cloud Tasks (debug)
 ```bash
 gcloud tasks list --project hotelly--ia --location us-central1 --queue hotelly-default --limit 20
-```
-
-**ADICIONADO PARA COBERTURA (origem A):** Rodar task manualmente (debug) — útil para isolar se a falha é do handler/OIDC/worker vs criação/enfileiramento.
-```bash
 gcloud tasks run <TASK_NAME> --project hotelly--ia --location us-central1 --queue hotelly-default
 ```
 
-### Logs do worker-staging
+### 13.6 Migrations via Cloud SQL Proxy (manual)
+> O proxy é para acesso local; Cloud Run não precisa dele para operar.
 ```bash
-gcloud run services logs read hotelly-worker-staging --project hotelly--ia --region us-central1 --limit 20
-```
-
-**ADICIONADO PARA COBERTURA (origem A):** Logs de requests do worker-staging (HTTP) — filtra o log de requests do Cloud Run para ver status/latência por chamada.
-```bash
-gcloud logging read   'resource.type="cloud_run_revision" AND resource.labels.service_name="hotelly-worker-staging" AND logName:"run.googleapis.com%2Frequests"'   --project hotelly--ia --limit 20 --freshness 30m --format json
-```
-
-### Logs de erro (últimos 5 minutos)
-```bash
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=hotelly-public-staging AND severity>=ERROR"   --project hotelly--ia --limit=10 --freshness=5m
-```
-
----
-
-## 5) Endpoints relevantes (Admin)
-
-### Reservas
-- Lista: `GET /reservations` (RBAC, filtros `from`/`to`/`status`)
-- Detalhe: `GET /reservations/{id}` (RBAC, retorna `room_id` e `room_type_id`)
-- Ação: `POST /reservations/{id}/actions/resend-payment-link` (staff, 202)
-- Ação: `POST /reservations/{id}/actions/assign-room` (staff, 202, body: `{"room_id": "..."}`)
-
-### Ocupação
-- `GET /occupancy` (RBAC, query: `start_date`, `end_date` exclusivo)
-
-### Rooms
-- `GET /rooms` (RBAC, retorna id/room_type_id/name/is_active)
-
-### Rates (PAX Pricing)
-- `GET /rates` (RBAC viewer)
-  - Query: `start_date`, `end_date`, `room_type_id` (opcional)
-  - Limite: max 366 dias
-  - Retorna: lista de rates com campos PAX
-- `PUT /rates` (RBAC staff)
-  - Body: `{"rates": [...]}`
-  - Limite: max 366 rates
-  - Bulk upsert idempotente
-
-### Outbox
-- `GET /outbox?property_id=<id>&aggregate_type=reservation&aggregate_id=<id>&limit=50`
-
-### Worker tasks
-- `POST /tasks/reservations/resend-payment-link` (OIDC)
-- `POST /tasks/reservations/assign-room` (OIDC)
-
----
-
-## 6) DB Staging (acesso direto)
-
-### Via Cloud SQL Proxy (RECOMENDADO)
-```bash
-# Terminal 1: iniciar proxy
 cloud-sql-proxy hotelly--ia:us-central1:hotelly-sql --port 15432 &
-
-# Terminal 2: conectar ao staging
-PGPASSWORD='<senha_hotelly_staging_app>' psql -h 127.0.0.1 -p 15432 -U hotelly_staging_app -d hotelly_staging
-
-# Terminal 2: conectar ao prod
-PGPASSWORD='<senha_hotelly_app>' psql -h 127.0.0.1 -p 15432 -U hotelly_app -d hotelly
+DATABASE_URL="postgresql://hotelly_staging_app:<SENHA>@127.0.0.1:15432/hotelly_staging" uv run alembic upgrade head
+kill %1
 ```
 
-### Verificações úteis
+### 13.7 Alembic: “single head” (higiene obrigatória)
+- `scripts/verify.sh` deve exigir **exatamente 1 head** (`uv run alembic heads`).
+- Se aparecer “multiple heads”, criar merge revision:
+```bash
+uv run alembic merge -m "merge heads" <REV_A> <REV_B> ...
+```
+
+### 13.8 Staging DB drift (lição operacional)
+Caso staging esteja com schema “adiantado” e `alembic_version` atrasado:
+- alinhar com `alembic stamp` (com extremo cuidado) e então `upgrade head`.
+
+---
+
+## 14) Troubleshooting (rápido, prático)
+
+- “202 mas nada acontece”: `TASKS_BACKEND=inline` ou `TASKS_BACKEND` errado impede execução real.
+- `401` em tasks: audience OIDC errado (`TASKS_OIDC_AUDIENCE`) ou token emitido para host diferente.
+- PermissionDenied `iam.serviceAccounts.actAs`: falta `roles/iam.serviceAccountUser` para o SA que cria tasks com OIDC usando `TASKS_OIDC_SERVICE_ACCOUNT`.
+- `InvalidTag` (AESGCM): `CONTACT_HASH_SECRET` / `CONTACT_REFS_KEY` divergentes entre public e worker. Após alinhar, limpar `contact_refs` para regenerar.
+- Provider WhatsApp 400/exists:false: número inexistente em teste; validar com número real.
+- `UndefinedColumn`: imagem desatualizada / migrations não aplicadas (rebuild + migrate + redeploy).
+- Artifact Registry: repo certo é **`hotelly`**.
+
+
+- Evolution API (debug — buscar últimas mensagens):
+```bash
+curl -X POST "https://edge.roda.ia.br/chat/findMessages/<instance>" \
+  -H "apikey: <EVOLUTION_API_KEY>" \
+  -d '{"limit": 3}'
+```
+---
+
+## 15) Secrets (referência)
+
+**Produção (nomes):**
+- `hotelly-database-url`
+- `hotelly-worker-url`
+- `contact-hash-secret`
+- `contact-refs-key`
+- `oidc-issuer`
+- `oidc-audience`
+- `oidc-jwks-url`
+- `stripe-secret-key`
+- `stripe-webhook-secret`
+
+**Staging (nomes):**
+- `hotelly-staging-database-url`
+- `hotelly-staging-db-password`
+- `hotelly-worker-staging-url`
+- `oidc-issuer-dev`
+- `oidc-jwks-url-dev`
+
+
+### 15.1 Convenções recomendadas (por ambiente)
+- Secrets (sugestão): `hotelly-{env}-db-url`, `hotelly-{env}-stripe-secret-key`, `hotelly-{env}-stripe-webhook-secret`, `hotelly-{env}-whatsapp-verify-token`, `hotelly-{env}-whatsapp-app-secret` (se aplicável), `hotelly-{env}-internal-task-secret` (se usar header).
+- Filas Cloud Tasks (sugestão): `hotelly-{env}-default`, `hotelly-{env}-expires`, `hotelly-{env}-webhooks`.
+
+---
+
+## 16) Checklist de manutenção (o que sempre checar)
+
+- Public e Worker usam os **mesmos** secrets de `CONTACT_REFS_KEY` e `CONTACT_HASH_SECRET` (por ambiente).
+- `TASKS_BACKEND=cloud_tasks` em produção/staging.
+- `TASKS_OIDC_AUDIENCE` e `WORKER_BASE_URL` apontam para **status.url** do worker (`*.a.run.app`).
+- `alembic heads` retorna **1 head**.
+- Logs não vazam PII (nunca `remote_jid`, texto, telefone, body bruto).
+
+---
+
+## 17) Quality gates e incidentes (normativo)
+
+### 17.1 Gates (quando afetar transação crítica / dinheiro / inventário)
+- **G0:** `compileall` + build docker + `/health`.
+- **G1:** `migrate up` em DB vazio + `migrate up` idempotente + constraints críticas presentes.
+- **G2:** segurança/PII (lint simples) — falhar CI se houver logs/prints com payload/body/webhook sem redação, ou se rotas internas estiverem expostas no router público.
+- **G3–G5:** obrigatórios para mudanças em retry/idempotência/concorrência/race em transações críticas.
+
+17.1.1 Trava de Segurança RBAC (P0)
+- Proteção de Propriedade Órfã: O sistema impede a remoção de um usuário se ele for o único Owner restante da propriedade.
+- Qualquer tentativa de auto-deleção do último Owner deve retornar 400 Bad Request.
+
+**Test plan mínimo (transações críticas):**
+- Create Hold: provar `Idempotency-Key` real + guarda ARI + ordem determinística + **outbox na mesma transação** + concorrência 20→1.
+- Expire Hold: dedupe por `processed_events(tasks, task_id)` + `FOR UPDATE` + `inv_held--` + outbox `hold.expired` + replay no-op.
+
+### 17.2 INCIDENT SEV0 (stop-ship)
+- Overbooking / inventário negativo.
+- Reserva duplicada.
+- Pagamento confirmado sem trilha de reprocesso.
+- Vazamento de PII em logs.
+- Endpoint interno exposto publicamente.
+
+---
+
+### Orientações para (Clerk/Auth/Proxy) e evitar recaídas
+
+**1) Definições (terminologia obrigatória)**
+
+* **Proxy (Frontend/FAPI)** = `NEXT_PUBLIC_CLERK_PROXY_URL`, `proxyUrl` no `ClerkProvider`, endpoints tipo `__clerk`. Isso altera de onde o **browser** chama o Clerk.
+* **Issuer/JWKS (Backend/OIDC)** = `OIDC_ISSUER`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE`. Isso altera de onde o **backend** baixa chaves para validar JWT.
+* Não chamar Issuer/JWKS de “proxy”. No doc, separar como dois tópicos distintos.
+
+**2) Regra de baseline do Admin (padrão obrigatório)**
+
+* Admin **NÃO** usa Satellite/Proxy FAPI por padrão.
+* Proibir no staging/prod (a menos que exista story explícita):
+
+  * `CLERK_IS_SATELLITE`, `CLERK_DOMAIN`
+  * `NEXT_PUBLIC_CLERK_PROXY_URL`, `CLERK_PROXY_URL`
+  * `NEXT_PUBLIC_CLERK_FRONTEND_API`
+  * qualquer configuração que faça o Clerk “inventar host” (`clerk.<app-domain>`).
+
+**3) Regra do Backend (validação JWT)**
+
+* Backend valida tokens **somente** com:
+
+  * `OIDC_ISSUER=https://clerk.hotelly.ia.br`
+  * `OIDC_JWKS_URL=https://clerk.hotelly.ia.br/.well-known/jwks.json`
+  * `OIDC_AUDIENCE=hotelly-api`
+* Staging e Prod devem ter **valores próprios**, versionados e auditáveis (sem “misturar ambientes”).
+
+**4) Regra de coerência de chaves (anti “kid mismatch”)**
+
+* `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` e `CLERK_SECRET_KEY` devem ser do **mesmo environment/instância** do Clerk.
+* Proibir combinações `pk_test` + `sk_live` (e vice-versa).
+* Se houver troca de chaves/instância:
+
+  * obrigar teste em aba anônima (cookies limpos) antes de declarar estável.
+
+**5) Build-time vs Runtime (o erro que mais aconteceu)**
+
+* Tudo que é `NEXT_PUBLIC_*` é **build-time** no Next.js.
+* Variáveis públicas do Admin (mínimo): `NEXT_PUBLIC_HOTELLY_API_BASE_URL`, `NEXT_PUBLIC_ENABLE_API`, `NEXT_PUBLIC_ENABLE_DEBUG_TOKEN`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`.
+* Portanto, trocar env no Cloud Run **sem rebuild** é considerado inválido (pode manter bundle antigo).
+* O pipeline deve preencher `BUILD_SHA` e `BUILD_DATE` e a página `/debug/env` deve mostrar ambos.
+* Regra operacional: “se `/debug/env` não refletir a mudança, o deploy não está válido”.
+
+**6) Secrets e pinagem (evitar drift)**
+
+* Secrets usados pelo backend (issuer/jwks/audience) devem ser referenciados por **versão fixa** (`:2` etc.), nunca `:latest`.
+* O service account do Cloud Run deve ter `secretAccessor` para os secrets necessários — registrar isso como pré-requisito.
+
+**7) Runbook mínimo de validação (sempre igual)**
+
+* Sempre validar em aba anônima:
+
+  1. abrir `/debug/env` e checar `APP_ENV`, `API_HOST`, `BUILD_SHA/DATE`
+  2. login em `/sign-in`
+  3. abrir `/select-property` (não pode loopar)
+  4. abrir rota protegida `/p/<id>/...`
+  5. DevTools Network: **não pode** haver request para `clerk.<app-domain>` (ex.: `clerk.dash...`)
+  6. requests protegidos devem indicar auth “signed-in” (headers Clerk/middleware)
+
+**8) Regras de mudança (governança)**
+
+* Mudança em qualquer item abaixo só via story aprovada e checklist de validação:
+
+  * habilitar Proxy FAPI/Satellite no Admin
+  * mudar `OIDC_ISSUER`/`OIDC_JWKS_URL`/`OIDC_AUDIENCE`
+  * mudar chaves Clerk (pk/sk) ou instância/environment
+
+**9) Mensagens de erro que viram “gatilho de diagnóstico”**
+
+* `jwk-kid-mismatch` ⇒ chaves/instância incompatíveis **ou** issuer/jwks apontando para ambiente errado.
+* Loop `/sign-in ↔ /select-property` ⇒ sessão não persistiu no server; tratar como auth inválida até prova em contrário.
+
+---
+
+Observação importante (sobre metadata no Clerk)
+
+Clerk metadata não é usada; a vinculação é via DB/seed
+Não é um bug. É um modelo de autorização “DB-backed RBAC”: Clerk autentica (quem é você), Postgres autoriza (o que você pode fazer). Implicação prática: para dar acesso a uma property, você precisa criar/atualizar `users` e `user_property_roles` no banco (via seed script ou SQL), não no Clerk. O único risco é desalinhamento de expectativas (story/documentação dizendo “atualize metadata no Clerk” quando na verdade não tem efeito).
+
+O backend não lê metadata.property_ids nem metadata.role do Clerk. Ele só usa sub e resolve autorização via Postgres (users + user_property_roles). Logo, a vinculação correta é no banco, não no Clerk.
+
+---
+
+## Como o RBAC funciona hoje (fonte da verdade)
+
+* Autorização é **100% DB-backed** no backend:
+
+  * `JWT.sub` → `users.external_subject` → `user_property_roles`
+* **Clerk user metadata (`property_ids`, `role`) não é usado** para autorização no backend (não adianta ajustar metadata esperando liberar property).
+
+---
+
+## Diagnóstico do incidente “Sem propriedades vinculadas”
+
+* Sintoma: após login estável, `/select-property` mostrava “Sem propriedades vinculadas à sua conta.”
+* Causa: o `sub` real do usuário logado **não tinha registro/vínculo** no Postgres STAGING.
+
+  * O banco já tinha a property `pousada-staging`, mas estava vinculada a **outro** `external_subject`.
+
+---
+
+## Correção aplicada (somente dados)
+
+* No Postgres STAGING:
+
+  * Inserir o usuário em `users` com `external_subject = <JWT.sub>`
+  * Inserir vínculo em `user_property_roles`:
+
+    * `<external_subject>` → `pousada-staging` com role `owner`
+* Resultado: `/select-property` passou a listar **“Pousada Staging (STAGING)”** e a navegação para `/p/pousada-staging/dashboard` funcionou.
+
+---
+
+## Runbook curto — Vincular usuário do Clerk a uma property (staging)
+
+1. Obter o `sub` do usuário (payload do JWT no browser/DevTools).
+2. Conferir se existe `users.external_subject = <sub>`.
+3. Criar/atualizar `user_property_roles` para a property desejada com role adequada (ex.: `owner`).
+4. Validar em aba anônima: login → `/select-property` → selecionar → `/p/<id>/dashboard`.
+
+---
+
+## Hardening / Reprodutibilidade — Secrets pinados (hotelly-public-staging)
+
+* OIDC (nome de secret legado):
+
+  * `oidc-issuer-dev:2`
+  * `oidc-jwks-url-dev:2`
+* Pinados adicionais:
+
+  * `hotelly-staging-database-url:3`
+  * `contact-hash-secret-staging:1`
+  * `contact-refs-key-staging:1`
+* Env fixa:
+
+  * `OIDC_AUDIENCE=hotelly-api`
+
+---
+
+## Critério de aceite operacional (para futuras validações)
+
+* Em aba anônima:
+
+  * `/debug/env` confirma `APP_ENV` e `BUILD_SHA/DATE` do deploy.
+  * Login em `/sign-in`.
+  * `/select-property` não loopa e lista property.
+  * `/p/<propertyId>/dashboard` abre sem redirecionar para `/sign-in`.
+
+---
+
+Infraestrutura e IAM
+Permissões de Conta de Serviço: A Service Account do Cloud Run (hotelly-public) deve possuir obrigatoriamente o papel roles/secretmanager.secretAccessor para os segredos de Webhook e Autenticação.
+
+Dependências de Inicialização: O serviço Cloud Run não entrará em estado Ready se não houver acesso imediato ao Secret Manager e ao Cloud SQL.
+
+Configuração de Banco de Dados (PostgreSQL)
+Enums Customizados: Ao configurar um novo banco, certifique-se de que o tipo reservation_status contenha o conjunto completo: ['confirmed', 'cancelled', 'in_house', 'checked_in', 'checked_out'].
+
+Casting em Consultas: Queries que utilizam operadores de comparação (= ANY ou =) com colunas do tipo Enum exigem casting explícito (ex: status::reservation_status = %s) devido às restrições do driver psycopg2.
+
+Variáveis de Ambiente Obrigatórias
+Para o funcionamento da autenticação OIDC (Clerk) e integridade (ADR-008), o serviço requer:
+
+CLERK_SECRET_KEY: Chave privada do Clerk.
+
+OIDC_ISSUER / OIDC_AUDIENCE: URLs de validação de token.
+
+DATABASE_URL: String de conexão (via Cloud SQL Auth Proxy ou Unix Sockets no Cloud Run).
+
+---
+
+Integridade de Reserva e Prevenção de Conflitos de Quarto
+
+## Status
+Proposto
+
+## Contexto
+É inaceitável para a operação hoteleira que o mesmo quarto físico () seja atribuído a duas reservas distintas no mesmo período. Precisamos de um algoritmo padronizado e centralizado para validar colisões.
+
+## Decisão
+Utilizaremos o algoritmo de interseção de intervalos para identificar conflitos:
+Um conflito existe se: `(NovoInicio < FimExistente) AND (NovoFim > InicioExistente)`.
+
+## Regras de Negócio
+1. **Exclusividade de Check-out**: O check-out é considerado um momento de saída (manhã/meio-dia) e o novo check-in de entrada (tarde). Portanto, a comparação é estrita (`<` e `>`), permitindo que uma reserva comece no mesmo dia em que outra termina.
+2. **Status Operacional**: Apenas reservas com status `confirmed`, `in_house` ou `checked_out` geram conflito. Reservas canceladas são ignoradas.
+3. **Ignorar Auto-Conflito**: Ao editar datas de uma reserva já existente, o sistema deve ignorar o próprio ID da reserva para evitar falsos positivos.
+
+## Consequências
+- Garantia de integridade física dos quartos.
+- Centralização da lógica de colisão no Core do domínio.
+- Conformidade com a ADR-006 (PII), proibindo o log de dados de hóspedes em caso de erro de colisão.
+
+---
+
+### 12.2 Staging (Topologia Validada v1.3)
+**Objetivo:** Ambiente de validação com paridade de dados, mas isolamento de infraestrutura.
+
+**Domínios e URLs (Source of Truth):**
+- **Frontend (Admin):** `https://dash.hotelly.ia.br`
+- **Backend (API):** `https://hotelly-public-staging-678865413529.us-central1.run.app` (URL Nativa Cloud Run)
+
+**Variáveis de Build (Frontend):**
+Para que o SSR (Server-Side Rendering) do Next.js funcione, as variáveis abaixo devem ser injetadas como `build-args` no Cloud Build:
+- `NEXT_PUBLIC_HOTELLY_API_BASE_URL`: Deve apontar para a URL Nativa do Backend de Staging.
+- `NEXT_PUBLIC_ENABLE_API`: `true`.
+- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`: Chave pública `pk_live_...` (Production Instance), mas o Backend Staging deve ter os secrets `OIDC_*` alinhados a esta instância.
+
+**Deploy Command (Padrão):**
+```bash
+gcloud builds submit --config cloudbuild.yaml \
+  --substitutions=_API_URL=https://hotelly-public-staging-678865413529.us-central1.run.app,_ENABLE_API=true
+```
+
+---
+
+### 12.4 Fluxo de Continuous Deployment (CI/CD)
+**Fonte da Verdade:** GitHub. Deploys manuais via CLI local estão descontinuados.
+
+**Triggers de Produção (Geração 2):**
+- **hotelly-admin:** Dispara em PUSH na branch `main`.
+- **hotelly-v2:** Dispara em PUSH na branch `master`.
+
+**Variáveis de Substituição Críticas (GCP Console):**
+| Repositório | Variável | Valor Produção |
+| :--- | :--- | :--- |
+| hotelly-admin | `_IMAGE_TAG` | `latest` |
+| hotelly-admin | `_SERVICE_NAME` | `hotelly-admin` |
+| hotelly-admin | `_API_URL` | `https://app.hotelly.ia.br` |
+| hotelly-v2 | `_SERVICE_NAME_PUBLIC` | `hotelly-public` |
+| hotelly-v2 | `_SERVICE_NAME_WORKER` | `hotelly-worker` |
+| hotelly-v2 | `_DB_SECRET_NAME` | `hotelly-database-url` |
+| hotelly-v2 | `_CLOUD_SQL_INSTANCE` | `hotelly--ia:us-central1:hotelly-sql` |
+
+**Ordem de Execução do Build (v2):**
+`Docker Build` -> `Push Artifact Registry` -> `Database Migrate` (Alembic) -> `Cloud Run Deploy`.
+
+---
+
+Padrões
+
+### Padrão de Localização Temporal (Timezone)
+**Problema:** O servidor roda em UTC, mas a operação hoteleira é local.
+**Solução:**
+1. **Banco de Dados:** Sempre armazena em UTC (`timestamp with time zone`).
+2. **Propriedade:** A tabela `properties` possui coluna `timezone` (ex: `America/Sao_Paulo`).
+3. **Lógica de Negócio (Check-in/Hoje):**
+   - O sistema converte `now_utc` para o fuso da propriedade antes de validar regras de data.
+   - Regra de Check-in: Permitido se `DataLocal >= DataCheckInReserva` (suporta late check-in na madrugada).
+
+---
+
+### Módulo de Gestão de Acesso (RBAC UI)
+**Objetivo:** Autonomia para o Owner gerenciar a equipe sem intervenção no DB.
+
+**Endpoints (Backend `rbac.py`):**
+- `GET /rbac/users`: Lista colaboradores (join seguro com emails).
+- `POST /rbac/users/invite`: Vincula usuário existente à propriedade.
+- `DELETE /rbac/users/{user_id}`: Remove acesso.
+
+**Regras de Segurança (Invariantes):**
+1. **Proteção de Orfandade:** É proibido remover um usuário com role `owner` se ele for o único owner ativo da propriedade. O backend deve retornar **400 Bad Request** (fail-closed).
+2. **Pré-requisito de Convite:** O sistema não envia e-mails de convite externos. O usuário deve criar sua conta (login no Clerk) antes de ser adicionado pelo e-mail exato.
+3. **Auditoria:** Logs de alteração de permissão devem registrar `actor_user_id`, `target_user_id` e `role`, mas nunca PII (emails/nomes) no payload do log.
+
+---
+
+As definições abaixo são agora verdades arquiteturais do Hotelly e devem ser registradas:
+
+Arquitetura de Deploy (CI/CD)
+Padrão de Build: O projeto utiliza Google Cloud Build com injeção de variáveis em tempo de compilação.
+
+Variáveis Obrigatórias: Todo cloudbuild.yaml deve prever a substituição _CLOUD_SQL_INSTANCE para permitir o acesso ao banco de dados durante as etapas de build/migration.
+
+Conexão SQL: Migrações em ambiente serverless devem utilizar o Cloud SQL Auth Proxy via socket TCP local ou Unix Socket, conforme a configuração do ambiente.
+
+Padrões de API e Roteamento
+Aliases de Rota: Para manter a compatibilidade entre o legado do frontend e a evolução do backend, é permitida a utilização de múltiplos decorators em funções de rota no FastAPI.
+
+Consumo de Reservas: A rota padrão para adição de serviços deve ser POST /reservations/{reservation_id}/extras.
+
+Lógica de Negócio e Estados
+Normalização de Status: Para fins de lançamento de receitas, os status in_house (backend) e checked_in (frontend) são semanticamente equivalentes.
+
+Matriz de Permissão de Consumo:
+
+Permitidos: confirmed, in_house, checked_in.
+
+Bloqueados: pending, cancelled, checked_out.
+
+Imutabilidade Financeira (Snapshotting): Ao vincular um extra a uma reserva, o sistema deve obrigatoriamente copiar os valores de price_cents e pricing_mode para a tabela de vínculo. Alterações no catálogo de extras nunca devem retroagir em consumos já lançados.
+
+Integração Frontend-Backend
+Injeção de Variáveis (Next.js): Variáveis de ambiente com prefixo NEXT_PUBLIC_ (como a NEXT_PUBLIC_HOTELLY_API_BASE_URL) devem ser injetadas exclusivamente no momento do build no Cloud Build para garantir que o bundle estático aponte para o ambiente correto (Staging vs Produção).
+
+---
+
+---
+
+## Notas e lacunas conhecidas (P0)
+
+- **Evolution provider por property:** o provider é property-scoped (DB), mas **credenciais Evolution** ainda são **env-only** (não por property). Se isso mudar, atualizar contrato aqui e criar migration.
+- **Retry Cloud Tasks (send-response):** o contrato correto está na seção 8.4/8.5 (500 = transiente para retry; 200 terminal). Se o código atual estiver retornando 200 em falha transiente, tratar como **bug P0** (mata retry).
+- **Staging checklist (mínimo):** `EVOLUTION_*`, `CONTACT_REFS_KEY`, `CONTACT_HASH_SECRET`, `TASKS_*`, `DATABASE_URL` e OIDC precisam estar montados **no public e no worker** (por ambiente).
+
+
+---
+
+## Apêndice A — Máquinas de estado (MVP)
+
+### State Machines — Hotelly V2 (MVP)
+
+#### Objetivo
+Definir estados e transições mínimas do domínio para orientar:
+- implementação de handlers (`/webhooks/*`, `/tasks/*`) — TARGET
+- constraints no Postgres (UNIQUEs e invariantes)
+- runbook e reprocessamento idempotente
+
+**Nota:** no estado atual do repo, essas máquinas são especificação do sistema-alvo.
+
+---
+
+#### 1) Conversation
+Representa a sessão de conversa/contexto com a pousada e o hóspede.
+
+##### Estados (MVP)
+- `open`: conversa ativa, ainda sem hold ativo para pagamento
+- `waiting_payment`: existe um hold ativo associado aguardando pagamento
+- `confirmed`: existe reserva confirmada (derivada da conversão bem-sucedida)
+- `closed`: conversa encerrada (manual ou por timeout de inatividade) — opcional no MVP
+
+##### Transições (MVP)
+- `open → waiting_payment`
+  - gatilho: hold criado com sucesso
+  - invariantes:
+    - no máximo 1 hold ativo por conversa (recomendado; pode ser relaxado se o produto permitir)
+- `waiting_payment → confirmed`
+  - gatilho: pagamento confirmado + conversão hold→reservation concluída
+- `waiting_payment → open`
+  - gatilho: hold expirado/cancelado sem pagamento
+
+##### Eventos/outbox (TARGET)
+- `conversation.waiting_payment`
+- `conversation.confirmed`
+
+---
+
+#### 2) Hold
+Bloqueio temporário de inventário (ARI) para garantir "zero overbooking".
+
+##### Estados (MVP)
+- `active`: inventário bloqueado (`inv_held` refletindo hold_nights)
+- `expired`: expirou e liberou inventário
+- `cancelled`: cancelado manualmente e liberou inventário (opcional no MVP)
+- `converted`: convertido em reservation (inventário migra `held → booked`)
+
+##### Transições (MVP)
+- `active → expired`
+  - gatilho: `now() >= expires_at` e execução do expire_hold (task/worker)
+  - invariantes:
+    - após expiração, `inv_held` deve ter sido decrementado exatamente para cada `hold_nights`
+    - não pode ficar `inv_held` negativo
+- `active → converted`
+  - gatilho: pagamento confirmado + conversão executada com sucesso
+  - invariantes:
+    - reserva única por hold: `UNIQUE(reservations.property_id, reservations.hold_id)`
+    - para cada noite: `inv_held--` e `inv_booked++` (ordem determinística por data)
+    - não pode ficar `inv_held` negativo
+- `active → cancelled` (opcional)
+  - gatilho: cancelamento manual/decisão de produto
+  - invariantes: liberar inventário como no expire
+
+##### Eventos/outbox (TARGET)
+- `hold.created`
+- `hold.expired`
+- `hold.cancelled`
+- `hold.converted`
+
+---
+
+#### 3) Payment (Stripe)
+Registro interno do estado de pagamento associado a um hold.
+
+##### Estados (MVP)
+- `created`: checkout session criada e persistida
+- `pending`: checkout iniciado mas não confirmado como pago
+- `succeeded`: confirmado como pago (ex.: `checkout.session.completed` + `payment_status == "paid"`)
+- `failed`: expirado/cancelado/erro definitivo
+- `needs_manual`: inconsistente (ex.: pagamento após hold expirar; dados incompletos)
+
+##### Transições (MVP)
+- `created → pending`
+  - gatilho: webhook indica progresso, mas não "paid"
+- `pending|created → succeeded`
+  - gatilho: webhook canônico confirma `paid`
+  - invariantes:
+    - pode disparar conversão do hold, mas a conversão é idempotente (UNIQUE reservation por hold)
+- `created|pending → failed`
+  - gatilho: checkout expira/cancela (opcional no MVP)
+- `* → needs_manual`
+  - gatilho: violação de pré-condição (ex.: hold expirado antes da confirmação; metadata faltando; conflito)
+
+##### Eventos/outbox (TARGET)
+- `payment.created`
+- `payment.succeeded`
+- `payment.failed`
+- `payment.needs_manual`
+
+---
+
+#### 4) Reservation
+Reserva confirmada (resultado final da conversão).
+
+##### Estados (MVP)
+- `confirmed`
+- `cancelled` (opcional no MVP)
+
+##### Invariantes (MVP)
+- `UNIQUE(property_id, hold_id)` garante "no máximo 1 reserva por hold"
+- ARI consistente:
+  - `inv_total >= inv_booked + inv_held` para todas as noites
+  - nenhum valor negativo
+
+##### Eventos/outbox (TARGET)
+- `reservation.confirmed`
+- `reservation.cancelled`
+
+---
+
+## Apêndice B — Outbox: catálogo mínimo de eventos
+
+### Outbox — Contrato (append-only)
+
+#### Objetivo
+
+Manter uma trilha **append-only** de eventos de domínio relevantes para:
+- auditoria operacional,
+- métricas (ex.: conversões, expirações),
+- diagnóstico (correlação por request),
+- futura integração/analytics.
+
+**Regra:** payload **mínimo** e **sem PII**.
+
+#### Tabela
+
+`outbox_events` (Postgres / Cloud SQL)
+
+Campos principais:
+- `property_id` (tenant)
+- `event_type` (string)
+- `aggregate_type` (string)
+- `aggregate_id` (string)
+- `occurred_at` (timestamptz)
+- `correlation_id` (string, opcional)
+- `payload` (jsonb, opcional)
+
+#### Event Types (catálogo mínimo)
+
+##### Holds
+- `HOLD_CREATED`
+- `HOLD_EXPIRED`
+- `HOLD_CANCELLED`
+- `HOLD_CONVERTED`
+
+##### Payments
+- `PAYMENT_CREATED`
+- `PAYMENT_SUCCEEDED`
+- `PAYMENT_FAILED`
+
+##### Reservations
+- `RESERVATION_CONFIRMED`
+- `RESERVATION_CANCELLED`
+
+##### Observações
+- `event_type` deve ser **estável** e usado em métricas.
+- Evitar tipos "genéricos" (ex.: `UPDATED`) sem contexto.
+
+#### Aggregate Types
+
+Valores previstos (mínimo):
+- `hold`
+- `payment`
+- `reservation`
+- `conversation`
+
+#### Payload permitido (mínimo)
+
+O payload deve ser pequeno e não conter PII. Campos típicos:
+- `hold_id`, `reservation_id`, `payment_id` (ids internos)
+- `provider`, `provider_object_id` (ex.: `stripe`, `checkout.session.id`)
+- `amount_cents`, `total_cents`, `currency`
+- `checkin`, `checkout`
+- `room_type_id`, `guest_count` (sem nomes/telefones/emails)
+
+**Proibido no payload:**
+- telefone, email, nome, endereço, documento, mensagem de chat
+- payload bruto do provedor (Stripe/WhatsApp)
+
+#### Regras de escrita
+
+- Sempre dentro da **mesma transação** que altera o estado crítico (hold/payment/reservation).
+- Uma ação crítica deve emitir **exatamente um** evento outbox correspondente.
+- `correlation_id` deve ser propagado do request/task.
+
+#### Retenção
+
+Ver `docs/operations/08_retention_policy.md`.
+
+---
+
+## Apêndice C — Transações críticas (SQL/pseudocódigo)
+
+### 01 — Create Hold
+
+Este documento descreve a transação crítica do Hotelly V2, com:
+- objetivo e invariantes
+- locks (ordem fixa) para evitar race/deadlock
+- SQL/pseudocódigo de referência (PostgreSQL)
+
+> Regra global: ao tocar várias noites, iterar sempre em ordem **(room_type_id, date ASC)**.
+
+#### Objetivo
+Criar um **hold** que reserva inventário com expiração, garantindo **zero overbooking** sob concorrência.
+
+#### Entrada
+- `property_id`
+- `conversation_id`
+- `quote_option_id` (contém `room_type_id`, `rate_plan_id`, `total_cents`)
+- `checkin`, `checkout`
+- `expires_at`
+- `idempotency_key` (recomendado)
+
+#### Saída
+- `hold_id`, `expires_at`
+
+#### Invariantes
+- Se alguma noite não tiver disponibilidade, **nenhum inventário** deve ser reservado.
+- Após sucesso: para cada noite do hold, `ari_days.inv_held` incrementa em 1 (ou `qty`).
+
+#### Locks e concorrência
+- Lock primário: **linhas de ARI** afetadas, via `UPDATE ... WHERE ... AND inv_total >= inv_booked + inv_held + 1`.
+- O hold é criado dentro da mesma transação; se falhar, rollback total.
+
+#### SQL/pseudocódigo (referência)
 ```sql
--- Migration aplicada
-SELECT version_num FROM alembic_version;
+BEGIN;
 
--- Rooms
-SELECT id, room_type_id, name, is_active FROM rooms WHERE property_id = 'pousada-staging';
+-- (Opcional) Idempotência para endpoint interno (recomendado)
+-- INSERT INTO idempotency_keys(property_id, scope, idempotency_key, created_at)
+-- VALUES (:property_id, 'create_hold', :idempotency_key, now())
+-- ON CONFLICT (property_id, scope, idempotency_key) DO NOTHING;
+-- Se já existia, retornar a resposta gravada.
 
--- Reservas com quarto
-SELECT id, room_id, room_type_id, status FROM reservations WHERE property_id = 'pousada-staging';
+-- 1) Criar hold
+INSERT INTO holds(id, property_id, conversation_id, quote_option_id, status, expires_at)
+VALUES (gen_random_uuid(), :property_id, :conversation_id, :quote_option_id, 'active', :expires_at)
+RETURNING id;
 
--- Room type rates (PAX pricing)
-SELECT room_type_id, date, price_1pax_cents, price_2pax_cents
-FROM room_type_rates
-WHERE property_id = 'pousada-staging'
-ORDER BY date LIMIT 10;
+-- 2) Inserir noites do hold (no app, ou via generate_series)
+-- Para cada date em [checkin, checkout):
+INSERT INTO hold_nights(hold_id, property_id, room_type_id, date, qty)
+VALUES (:hold_id, :property_id, :room_type_id, :date, 1);
 
--- Permissões do usuário
-SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public';
+-- 3) Reservar inventário (uma noite por vez, em ordem date ASC)
+UPDATE ari_days
+SET inv_held = inv_held + 1, updated_at = now()
+WHERE property_id = :property_id
+  AND room_type_id = :room_type_id
+  AND date = :date
+  AND stop_sell = false
+  AND inv_total >= (inv_booked + inv_held + 1);
+
+-- 4) Validar: o UPDATE acima deve afetar 1 linha por noite.
+-- Se alguma noite afetou 0 linhas -> ROLLBACK (sem hold).
+COMMIT;
 ```
 
-### Dar permissões a um usuário (como owner das tabelas)
+#### Falhas esperadas (e como responder)
+- Sem inventário: retornar “sem disponibilidade” e não criar hold.
+- Stop-sell: idem.
+- Conflito de idempotency_key: retornar resposta anterior.
+
+### 02 — Expire Hold (Cloud Tasks)
+
+Este documento descreve a transação crítica do Hotelly V2, com:
+- objetivo e invariantes
+- locks (ordem fixa) para evitar race/deadlock
+- SQL/pseudocódigo de referência (PostgreSQL)
+
+> Regra global: ao tocar várias noites, iterar sempre em ordem **(room_type_id, date ASC)**.
+
+#### Objetivo
+Expirar um hold ACTIVE após `expires_at`, liberando inventário (`inv_held--`) de forma idempotente.
+
+#### Entrada
+- `property_id`
+- `hold_id`
+- `task_id` (para dedupe em `processed_events`)
+- `now` (UTC)
+
+#### Saída
+- `holds.status = expired` (se aplicável)
+- inventário liberado
+
+#### Invariantes
+- Expirar duas vezes não pode liberar inventário duas vezes.
+- Se o hold já foi convertido/cancelado/expirado, operação é no-op.
+
+#### Locks e concorrência
+- `SELECT ... FOR UPDATE` no hold para serializar com `convert_hold` e `cancel_hold`.
+
+#### SQL/pseudocódigo (referência)
 ```sql
--- Conectar como hotelly_staging_app (owner das tabelas no staging)
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hotelly_app;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO hotelly_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO hotelly_app;
+BEGIN;
+
+-- 0) Dedupe do job/task
+INSERT INTO processed_events(property_id, source, external_id)
+VALUES (:property_id, 'tasks', :task_id)
+ON CONFLICT (property_id, source, external_id) DO NOTHING;
+
+-- Se já existia, sair (idempotente)
+
+-- 1) Lock do hold
+SELECT status, expires_at
+FROM holds
+WHERE id = :hold_id AND property_id = :property_id
+FOR UPDATE;
+
+-- 2) Guardas idempotentes
+-- Se status != 'active' -> COMMIT
+-- Se now() < expires_at -> COMMIT (ainda não expira)
+
+-- 3) Atualizar status
+UPDATE holds
+SET status = 'expired', updated_at = now()
+WHERE id = :hold_id AND property_id = :property_id AND status = 'active';
+
+-- 4) Liberar inventário por noite (ordem date ASC)
+-- Para cada (room_type_id, date) em hold_nights:
+UPDATE ari_days
+SET inv_held = inv_held - 1, updated_at = now()
+WHERE property_id = :property_id
+  AND room_type_id = :room_type_id
+  AND date = :date
+  AND inv_held >= 1;
+
+COMMIT;
 ```
 
-> Observação: ajuste o usuário alvo (`hotelly_app` vs `hotelly_staging_app`) conforme o objetivo; idealmente, cada DB só recebe grants do usuário do próprio ambiente.
+#### Observabilidade
+- Logar: property_id, hold_id, task_id, status anterior e final (sem PII).
+- Métrica: holds_expired_count, holds_expire_noop_count.
+
+### 03 — Cancel Hold (User/Admin)
+
+Este documento descreve a transação crítica do Hotelly V2, com:
+- objetivo e invariantes
+- locks (ordem fixa) para evitar race/deadlock
+- SQL/pseudocódigo de referência (PostgreSQL)
+
+> Regra global: ao tocar várias noites, iterar sempre em ordem **(room_type_id, date ASC)**.
+
+#### Objetivo
+Cancelar um hold ACTIVE por decisão de usuário/admin, liberando inventário.
+
+#### Entrada
+- `property_id`
+- `hold_id`
+- `actor` (user/admin/system)
+- `idempotency_key` (recomendado)
+
+#### Saída
+- `holds.status = cancelled`
+- inventário liberado
+
+#### Invariantes
+- Cancelar duas vezes não pode liberar inventário duas vezes.
+- Se já convertido/expirado, operação é no-op (ou erro de negócio, conforme UX).
+
+#### Locks e concorrência
+- `SELECT ... FOR UPDATE` no hold.
+- Ordem fixa nas noites (date ASC).
+
+#### SQL/pseudocódigo (referência)
+```sql
+BEGIN;
+
+-- (Opcional) Idempotência
+-- INSERT INTO idempotency_keys(property_id, scope, idempotency_key, created_at)
+-- VALUES (:property_id, 'cancel_hold', :idempotency_key, now())
+-- ON CONFLICT (...) DO NOTHING;
+
+-- 1) Lock hold
+SELECT status
+FROM holds
+WHERE id = :hold_id AND property_id = :property_id
+FOR UPDATE;
+
+-- 2) Se status != 'active' -> COMMIT (no-op)
+UPDATE holds
+SET status = 'cancelled', updated_at = now()
+WHERE id = :hold_id AND property_id = :property_id AND status = 'active';
+
+-- 3) Liberar inventário (inv_held--)
+UPDATE ari_days
+SET inv_held = inv_held - 1, updated_at = now()
+WHERE property_id = :property_id
+  AND room_type_id = :room_type_id
+  AND date = :date
+  AND inv_held >= 1;
+
+COMMIT;
+```
+
+#### Notas de produto (MVP)
+- Se cancelamento acontece por “timeout do usuário”, considere usar o mesmo mecanismo de expiração (task) para simplificar.
+
+### 04 — Stripe Confirm → Convert Hold → Create Reservation
+
+Este documento descreve a transação crítica do Hotelly V2, com:
+- objetivo e invariantes
+- locks (ordem fixa) para evitar race/deadlock
+- SQL/pseudocódigo de referência (PostgreSQL)
+
+> Regra global: ao tocar várias noites, iterar sempre em ordem **(room_type_id, date ASC)**.
+
+#### Objetivo
+Processar pagamento confirmado (Stripe) de forma idempotente, convertendo hold ACTIVE em reserva confirmada.
+
+#### Entrada
+- `property_id`
+- `stripe_event_id` (dedupe)
+- `checkout_session_id` (canonical object)
+- `hold_id`
+- `conversation_id`
+- `amount_cents`, `currency`
+
+#### Saída
+- `payments.status = succeeded` (upsert)
+- `holds.status = converted` (se ACTIVE e não expirado)
+- `reservations` criada (1:1 com hold)
+- Inventário: `inv_held--` e `inv_booked++` por noite
+
+#### Invariantes
+- Reprocessar o mesmo Stripe event não duplica reserva.
+- Reprocessar a mesma checkout session não duplica payment.
+- Corrida com expiração é serializada pelo lock no hold.
+- Se hold expirou antes do pagamento: não cria reserva automaticamente (caminho manual/política).
+
+#### Locks e concorrência
+- `processed_events` impede duplicidade do webhook.
+- `SELECT ... FOR UPDATE` em `holds` serializa com expiração/cancelamento.
+- Ordem fixa ao atualizar ARI (date ASC).
+
+#### SQL/pseudocódigo (referência)
+```sql
+BEGIN;
+
+-- 0) Dedupe do webhook
+INSERT INTO processed_events(property_id, source, external_id)
+VALUES (:property_id, 'stripe', :stripe_event_id)
+ON CONFLICT (property_id, source, external_id) DO NOTHING;
+
+-- Se já existia, sair (idempotente)
+
+-- 1) Upsert payment (dedupe por checkout.session.id)
+INSERT INTO payments(property_id, conversation_id, hold_id, provider, provider_object_id,
+                     status, amount_cents, currency, created_at, updated_at)
+VALUES (:property_id, :conversation_id, :hold_id, 'stripe', :checkout_session_id,
+        'succeeded', :amount_cents, :currency, now(), now())
+ON CONFLICT (property_id, provider, provider_object_id)
+DO UPDATE SET status='succeeded', updated_at=now();
+
+-- 2) Lock do hold
+SELECT status, expires_at
+FROM holds
+WHERE id = :hold_id AND property_id = :property_id
+FOR UPDATE;
+
+-- 3) Guardas
+-- Se status != 'active' -> COMMIT (no-op / já processado)
+-- Se now() > expires_at -> COMMIT (caminho manual: payment succeeded com hold expirado)
+
+-- 4) Converter inventário (por noite)
+UPDATE ari_days
+SET inv_held = inv_held - 1,
+    inv_booked = inv_booked + 1,
+    updated_at = now()
+WHERE property_id = :property_id
+  AND room_type_id = :room_type_id
+  AND date = :date
+  AND inv_held >= 1;
+
+-- Validar: atualizou 1 linha por noite (senão, rollback: dado inconsistente)
+
+-- 5) Criar reservation (dedupe via unique property_id+hold_id)
+INSERT INTO reservations(property_id, conversation_id, hold_id, status, checkin, checkout, total_cents, currency)
+VALUES (:property_id, :conversation_id, :hold_id, 'confirmed', :checkin, :checkout, :total_cents, :currency)
+ON CONFLICT (property_id, hold_id) DO NOTHING;
+
+-- 6) Mark hold converted
+UPDATE holds
+SET status = 'converted', updated_at = now()
+WHERE id = :hold_id AND property_id = :property_id AND status = 'active';
+
+COMMIT;
+```
+
+#### Caminho manual (MVP) — pagamento confirmado com hold expirado
+Recomendação:
+- registrar evento (outbox) e criar pendência operacional.
+- política decide: remarcar/estornar/reservar manualmente se ainda houver inventário.
 
 ---
 
-## 7) Secrets Management
+## Apêndice D — Operação (Local dev, Test Plan, Observabilidade, Runbook, Retenção)
 
-### Listar secrets
+### D.1 Local dev (resumo)
+
+Comandos canônicos:
 ```bash
-gcloud secrets list --project hotelly--ia
+./scripts/dev.sh
+./scripts/verify.sh
+uv run pytest -q
+python -m compileall -q src
 ```
 
-### Atualizar secret (ex: após trocar senha no Cloud SQL)
+### D.2 Local dev (detalhado)
+
+### Desenvolvimento Local — Hotelly V2 (`docs/operations/01_local_dev.md`)
+
+#### Objetivo
+Permitir que **uma pessoa** rode o Hotelly V2 localmente com o mínimo de atrito, mantendo as mesmas garantias que importam em produção:
+- **idempotência** (webhooks/tasks/mensagens)
+- **0 overbooking**
+- **sem PII/payload raw em logs**
+- **replay confiável** (webhooks e tasks)
+
+Este documento é **normativo**: se um comando “oficial” não existir no repo, isso vira tarefa de implementação.
+
+---
+
+#### Pré-requisitos
+Obrigatórios:
+- Git
+- `uv` (gerenciador de dependências e runner)
+- Acesso a um Postgres (local ou remoto) configurado via `DATABASE_URL`
+
+Recomendados (para debug e integração com GCP):
+- `psql` (cliente Postgres)
+- Google Cloud SDK (`gcloud`)
+- Stripe CLI (para replay realista de webhooks)
+- (Opcional) `jq`
+- Docker (útil para subir Postgres local rapidamente)
+
+---
+
+#### Estado atual no repo (hoje)
+O repositório **já suporta** desenvolvimento local via `uv` e script:
+- `uv sync --all-extras`
+- `./scripts/dev.sh` (sobe API com hot-reload)
+
+E o repositório **ainda NÃO possui** (TARGET / backlog):
+- `docker-compose.yml`
+- `Makefile`
+- `.env.example`
+
+Este documento separa o que é **executável hoje** do que é **TARGET**.
+
+---
+
+#### Convenções locais
+- **Nada de segredos versionados.** Use `.env.local` (gitignored).
+- **Nada de payload bruto em logs.** Se precisar depurar, logue apenas:
+  - `correlation_id`
+  - `event_id/message_id/task_id`
+  - `property_id`, `hold_id`, `reservation_id`
+  - códigos de erro (sem dados do hóspede)
+
+---
+
+#### TL;DR (quickstart)
+1) Instalar deps:
 ```bash
-# Atenção: usar aspas simples para evitar expansão de caracteres especiais
-echo -n 'dbname=hotelly_staging user=hotelly_staging_app password=<NOVA_SENHA> host=/cloudsql/hotelly--ia:us-central1:hotelly-sql'   | gcloud secrets versions add hotelly-staging-database-url --data-file=- --project hotelly--ia
+uv sync --all-extras
 ```
 
-### Ver valor atual
+2) Configurar ambiente (`.env.local`) com `DATABASE_URL` apontando para um Postgres acessível.
+
+3) Aplicar schema core (se estiver usando um DB vazio):
 ```bash
-gcloud secrets versions access latest --secret=hotelly-staging-database-url --project=hotelly--ia
+psql "${DATABASE_URL}" -f docs/data/01_sql_schema_core.sql
+```
+
+4) Subir a API:
+```bash
+./scripts/dev.sh
+```
+
+5) Rodar testes:
+```bash
+uv run pytest -q
+```
+
+6) Smoke:
+```bash
+curl -sS http://localhost:${APP_PORT:-8000}/health
 ```
 
 ---
 
-## 8) Troubleshooting rápido
+#### Docker Compose (TARGET)
+**TARGET / backlog:** padronizar `docker-compose.yml` (Postgres + app) e comandos únicos (Makefile/scripts).
 
-| Problema | Causa | Solução |
-|----------|-------|---------|
-| 202 mas nada acontece | `TASKS_BACKEND=inline` | Setar `cloud_tasks` |
-| Cloud Tasks 401 | OIDC audience errado | Atualizar secret com `status.url` canônico |
-| Worker 500 `/cloudsql/...` | Cloud SQL não anexado | `--add-cloudsql-instances ...` |
-| Worker `UndefinedColumn` | **Imagem desatualizada** | Rebuild + redeploy |
-| AlreadyExists 409 | Dedupe por task_id | Sucesso idempotente (já tratado) |
-| assign-room 422 | reservation sem room_type_id | COALESCE preenche; seed antigo |
-| Teste timezone | Python vs Postgres date | Usar `CURRENT_DATE` do banco |
-| password authentication failed | Senha alterada no Cloud SQL | Atualizar secret correspondente |
-| Repository "hotelly-repo" not found | Nome errado | Usar `hotelly` (sem `-repo`) |
-| permission denied for table | Usuário sem GRANT | Conectar como owner e dar GRANT |
-| Job migrate-staging falha | DATABASE_URL mal formatado | Usar cloud-sql-proxy manualmente |
+A execução local deve ter, no mínimo, estes serviços:
+- `db`: Postgres
+- `app`: API (FastAPI)
+- `worker`: consumidor de tasks (modo local) **ou** worker que processa jobs/outbox
+
+Portas padrão recomendadas:
+- API: `8000`
+- Postgres: `5432`
+
+Se o repo ainda não tiver `docker-compose.yml`, crie como parte do backlog (Sprint 0). Este documento assume que ele existe.
 
 ---
 
-## 9) Auditoria de serviços obsoletos
+#### Arquivo `.env.local` (mínimo)
+Crie `.env.local` manualmente (não há `.env.example` versionado hoje).
 
-```bash
-gcloud logging read   'resource.type="cloud_run_revision" AND resource.labels.service_name=("hotelly-public" OR "hotelly-public-staging" OR "hotelly-worker" OR "hotelly-worker-staging")'   --project hotelly--ia --freshness 7d --limit 500   --format "value(resource.labels.service_name,httpRequest.status,timestamp)"
-```
-
-**ADICIONADO PARA COBERTURA (origem A):** critério operacional — serviço com **0 requests** no período (ex.: 7 dias) é candidato a obsoleto; antes de remover, confirmar dependências e plano de rollback.
-
----
-
-## 10) Admin (hotelly-admin)
-
-### Desenvolvimento local
-```bash
-cd ~/projects/hotelly-admin
-npm run dev
-# Acessa http://localhost:3000
-```
-
-### Variáveis de ambiente (.env.local)
+Exemplo (ajuste nomes conforme o código):
 ```env
-NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
-CLERK_SECRET_KEY=sk_test_...
-NEXT_PUBLIC_HOTELLY_API_BASE_URL=https://hotelly-public-staging-678865413529.us-central1.run.app
-NEXT_PUBLIC_ENABLE_API=true
+ENV=local
+APP_PORT=8000
+
+### Postgres local (compose)
+POSTGRES_DB=hotelly
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/hotelly
+
+### Logs
+LOG_LEVEL=INFO
+
+### Tasks
+TASKS_BACKEND=local  # local | inline | gcp (staging/prod)
+
+### Stripe (para integração real)
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+### WhatsApp (quando integrar)
+WHATSAPP_PROVIDER=meta  # meta | evolution
+WHATSAPP_VERIFY_TOKEN=dev-token
 ```
 
-### Rotas de proxy (Next.js API routes)
-| Rota | Descrição |
-|------|-----------|
-| `/api/p/[propertyId]/reservations` | Lista reservas |
-| `/api/p/[propertyId]/reservations/[id]/assign-room` | Atribuir quarto |
-| `/api/p/[propertyId]/rooms` | Lista quartos |
-| `/api/p/[propertyId]/rates` | GET/PUT tarifas PAX |
-| `/api/p/[propertyId]/occupancy` | Grid de ocupação |
-
-### Páginas principais
-| Página | Descrição |
-|--------|-----------|
-| `/p/[propertyId]/dashboard` | Dashboard com métricas |
-| `/p/[propertyId]/reservations` | Lista de reservas |
-| `/p/[propertyId]/reservations/[id]` | Detalhe da reserva |
-| `/p/[propertyId]/rates` | Calendário de preços PAX |
-| `/p/[propertyId]/frontdesk/occupancy` | Grid de ocupação |
+Notas:
+- `TASKS_BACKEND=inline` é útil para debug (executa handlers no mesmo processo). **Proibido em staging/prod.**
+- Em staging/prod, o backend é `gcp` (Cloud Tasks).
 
 ---
 
-## 3. Roadmap
+#### Comandos "oficiais" (make targets) — TARGET
+Recomendação: padronizar `make` para reduzir variação local.
 
-# Roadmap Hotelly V2 — Atualizado 05/02/2026
+Targets mínimos:
+- `make dev` — sobe stack local (equivalente ao compose)
+- `make migrate` — aplica migrações
+- `make seed-minimal` — cria 1 property, 1 room_type, ARI de um range curto
+- `make test` — roda a suíte mínima (incluindo gates relevantes)
+- `make lint` — lint básico (inclui gate PII/print se aplicável)
+- `make e2e` — fluxo controlado (quando existir)
 
-## ✅ FASE 1: Infraestrutura Base — CONCLUÍDA
-- GCP Project: `hotelly--ia`, região `us-central1`
-- Cloud Run: `hotelly-public` + `hotelly-worker`
-- Cloud SQL: Postgres, migrations até 010
-- Cloud Tasks: fila `hotelly-default`
-- Secrets no Secret Manager
-
-## ✅ FASE 2: Autenticação — CONCLUÍDA
-- Clerk Production com domínios próprios
-- JWT template `hotelly-api` com `aud=hotelly-api`
-- `/auth/whoami` funcionando
-
-## ✅ FASE 3: Dashboard Backend (V2-S11 a V2-S21) — CONCLUÍDA
-- Auth/RBAC implementado
-- Endpoints validados: `/me`, `/properties`, `/frontdesk/summary`, `/reservations`, `/conversations`, `/payments`, `/reports/*`
-- Worker recebendo tasks via OIDC
-- Permissões IAM configuradas
-
-## ✅ FASE 4: Cloud Tasks Backend — CONCLUÍDA
-- `cloud_tasks_backend.py` implementado
-- Dependência `google-cloud-tasks` adicionada
-
-## ✅ FASE 5: Webhook WhatsApp E2E — CONCLUÍDA
-- Evolution API v2: instância `pousada-ia-v2` funcionando
-- Fluxo completo: WhatsApp → Evolution → Hotelly Public → Cloud Tasks → Worker → Outbox
-
-## ✅ FASE 6: Staging Isolado — CONCLUÍDA (02/02/2026)
-- DB staging isolado (`hotelly_staging` + usuário `hotelly_staging_app`)
-- Cloud Run staging: `hotelly-public-staging` + `hotelly-worker-staging`
-- **WORKER_BASE_URL (staging)** deve usar a URL canônica do Cloud Run (`status.url`, domínio `*.a.run.app`), não o alias `*.run.app`.
-- Jobs: `hotelly-migrate-staging` + `hotelly-seed-staging`
-- Cloud Tasks configurado corretamente (não mais `inline`)
-- OIDC audience do worker-staging isolado
-- Runbook de ambientes documentado
-
-## ✅ FASE 7: Admin MVP — Navegação e Auth — CONCLUÍDA (02/02/2026)
-- Next.js 14 (App Router) + Clerk + shadcn/ui
-- Property selection com URL como fonte da verdade (`/p/[propertyId]/*`)
-- Guard server-side validando acesso via `GET /properties`
-- `/select-property` + redirect automático com localStorage (conveniência)
-- Repo: https://github.com/marcioluisms/hotelly-admin
-
-## ✅ FASE 8: Admin MVP — Dashboard e Reservas — CONCLUÍDA (02/02/2026)
-
-### Dashboard
-- Cards de métricas consumindo `/frontdesk/summary`
-- Lista de erros recentes
-
-### Reservas
-- Lista `/p/[propertyId]/reservations` com filtros por **check-in** (`from`/`to`, formato YYYY-MM-DD) e `status`
-- Detalhe `/p/[propertyId]/reservations/[reservationId]`
-- Backend filtra `checkin >= from` e `checkin <= to` (params `from`/`to`), não `date_from/date_to`
-- Status como select
-
-### Ações
-- "Reenviar link de pagamento" via proxy server-side (evita CORS)
-
-### Debug/Outbox
-- Página `/p/[propertyId]/debug/outbox`
-- Seção "Eventos" no detalhe da reserva consumindo `GET /outbox`
-
-### Backend (correções)
-- `GET /outbox` implementado (PII-safe, sem payload)
-- Cloud Tasks: `AlreadyExists (409)` tratado como sucesso (dedupe)
-- Seed staging com dados de teste (hold + reservation)
-
-## ✅ FASE 9: Ocupação, Quartos e Atribuição (S11-S13) — CONCLUÍDA (04/02/2026)
-
-### S11: GET /occupancy (por room_type)
-- Endpoint `GET /occupancy` com RBAC (viewer)
-- Cálculo: inv_total (ari_days), held (hold_nights ativo), booked (reservations confirmadas), available = max(0, inv_total - booked - held)
-
-### S12: Rooms (unidades físicas) + GET /rooms
-- Migration 007: tabela `rooms` (property_id, id, room_type_id, name, is_active)
-- Endpoint `GET /rooms` (viewer) com testes
-
-### S13: Atribuição de quarto + room_type_id em reservations
-- Migration 008: `reservations.room_id` com FK composta → `rooms(property_id, id)`
-- Migration 009: `reservations.room_type_id` com FK composta → `room_types(property_id, id)`
-- `POST /reservations/{id}/actions/assign-room` (staff) → Cloud Task → worker
-- Worker valida room_type_id, atualiza room_id, grava outbox `room_assigned`
-- `convert_hold` preenche `room_type_id` na criação da reserva
-
-### Fixes pós-S13 (04/02/2026)
-- **GET /reservations e GET /reservations/{id}**: adicionados `room_id` e `room_type_id` no SELECT e JSON (nullable)
-- **assign-room COALESCE**: worker preenche `room_type_id` da reserva via `COALESCE(room_type_id, <room.room_type_id>)` quando NULL
-- **outbox payload**: evento `room_assigned` agora inclui `reservation_id` no payload
-- **Imagem staging**: rebuild + redeploy resolveu `UndefinedColumn` no worker (imagem desatualizada)
-
-### Validação E2E Staging (04/02/2026)
-- `GET /reservations` → 200, 3 reservas
-- `GET /rooms` → 200, 3 rooms (101, 102, 201)
-- `POST assign-room {"room_id":"101"}` → 202 enqueued
-- Confirmado no psql: `room_id = '101'` preenchido
-- Evento `room_assigned` com `reservation_id` no outbox
-
-### Admin (hotelly-admin)
-- Grid de ocupação: `/p/[propertyId]/frontdesk/occupancy`
-  - Modo "Por categoria" (`?view=types`) e "Por quarto" (`?view=rooms`)
-  - Navegação 14 dias, header com totais
-
-### CI/CD
-- GitHub Actions: migração via `uv run alembic upgrade head`
-- `tests/helpers.py` para helpers compartilhados de auth
-- 392 testes passando
-
-### Decisão RBAC
-- Endpoints property-scoped do dashboard: **`property_id` obrigatório via `?property_id=`**, validado por `require_property_role(min_role)`
-- **Não aceitar `property_id` no body**
-- Contrato uniforme, sem atalhos single-tenant
-
-## ✅ FASE 10: Admin — Assign Room na UI + Grid Real — CONCLUÍDA (04/02/2026)
-- Componente `AssignRoomDialog` na página de detalhe da reserva
-- API route proxy `/api/p/[propertyId]/reservations/[reservationId]/assign-room`
-- `router.refresh()` após POST assign-room
-- Grid `?view=rooms` com dados reais de `reservations.room_id`
-
-## ✅ FASE 11: Stripe Webhook — CONCLUÍDA (04/02/2026)
-- Endpoint `POST /webhooks/stripe` no backend (hotelly-public)
-- Secret `stripe-webhook-secret` criado no GCP Secret Manager
-- Verificação de assinatura Stripe via `webhook_signing_secret`
-- Webhook configurado no Stripe Dashboard apontando para `https://app.hotelly.ia.br/webhooks/stripe`
-- Eventos escutados: `checkout.session.completed`, `payment_intent.succeeded`
-- Fluxo validado E2E: Stripe → hotelly-public → Cloud Tasks → worker → outbox
-
-## ✅ FASE 12: Calendário de Preços PAX — CONCLUÍDA (05/02/2026)
-
-### Decisão Arquitetural
-- **Modelo PAX completo desde o início** (não evoluir base_rate_cents)
-- Tabela separada `room_type_rates` com pricing por ocupação
-- Preços em centavos (padrão do projeto)
-
-### Backend
-- **Migration 010**: `room_type_rates`
-  - PK composta: `(property_id, room_type_id, date)`
-  - FK composta: `(property_id, room_type_id) → room_types(property_id, id)`
-  - Preços adultos: `price_1pax_cents`, `price_2pax_cents`, `price_3pax_cents`, `price_4pax_cents`
-  - Adicionais crianças: `price_1chd_cents`, `price_2chd_cents`, `price_3chd_cents` (nullable)
-  - Restrições: `min_nights`, `max_nights`, `closed_checkin`, `closed_checkout`, `is_blocked`
-  - Índices: `idx_room_type_rates_property_date`, `idx_room_type_rates_type_date`
-- **GET /rates**: RBAC viewer, query params `property_id`, `start_date`, `end_date`, `room_type_id` (opcional)
-  - Limite: max 366 dias de range
-  - Retorna lista de rates com todos os campos PAX
-- **PUT /rates**: RBAC staff, bulk upsert via `INSERT ... ON CONFLICT DO UPDATE`
-  - Limite: max 366 rates por request
-  - `property_id` obrigatório via `?property_id=` e validado por `require_property_role(...)`; não aceitar `property_id` no body
-  - Idempotente: `updated_at` atualizado em cada upsert
-
-### Admin (hotelly-admin)
-- Proxy: `src/app/api/p/[propertyId]/rates/route.ts` (GET + PUT)
-- Lib: `src/lib/rates.ts` (getRates, putRates, types)
-- Página: `/p/[propertyId]/rates`
-- Componente: `RatesGrid`
-  - Grid 14 dias por room_type
-  - 4 linhas por tipo (1-4 adultos)
-  - Navegação: ±1 dia, ±7 dias, date picker
-  - Destaque de fim de semana (sex/sab/dom em amarelo)
-  - Tracking de células alteradas (dirty)
-  - Conversão automática reais ↔ centavos
-  - Botão "Salvar" com contador de alterações
-- Navegação: "Tarifas" adicionado ao `PropertyHeader`
-
-### Deploy Staging (05/02/2026)
-- Build: `gcloud builds submit --tag .../hotelly:latest`
-- Migration manual via cloud-sql-proxy (job staging com DATABASE_URL mal formatado)
-- Secret `hotelly-staging-database-url` atualizado com nova senha do `hotelly_staging_app`
-- Redeploy: `gcloud run services update ... --update-env-vars DEPLOY_SHA=$(date +%s)`
-
-### Observações
-- `quote.py` ainda usa `ari_days.base_rate_cents` — migrar para PAX é story separada
-- Grid de rates mostra 0.00 quando não há dados (tabela vazia)
+Se `make` não for usado, estes comandos devem existir como scripts/documentados.
 
 ---
 
-## Configurações Atuais
-
-### Ambientes Cloud Run
-
-| Ambiente | Serviços | DB |
-|----------|----------|-----|
-| **Prod** | `hotelly-public`, `hotelly-worker` | `hotelly` (prod) |
-| **Staging** | `hotelly-public-staging`, `hotelly-worker-staging` | `hotelly_staging` |
-
-### Jobs Staging
-- `hotelly-migrate-staging` — migrations (⚠️ DATABASE_URL mal formatado, usar cloud-sql-proxy)
-- `hotelly-seed-staging` — seed idempotente
-
-### Databases (mesma instância `hotelly-sql`)
-| Database | Usuário | Uso |
-|----------|---------|-----|
-| `hotelly` | `hotelly_app` | Produção |
-| `hotelly_staging` | `hotelly_staging_app` | Staging |
-
-### Evolution API (Prod)
-| Item | Valor |
-|------|-------|
-| URL | https://edge.roda.ia.br/ |
-| Instância | `pousada-ia-v2` |
-| API Key | `FC4A3BCF9071-4357-852C-94ABA41DA0B5` |
-
-### Clerk / Auth
-| Item | Valor |
-|------|-------|
-| Issuer (Prod) | https://clerk.hotelly.ia.br |
-| Issuer (Dev) | via secrets `*-dev` |
-| Audience | hotelly-api |
-| JWT Template | hotelly-api (lifetime 600s) |
-
-### Admin
-| Item | Valor |
-|------|-------|
-| Repo | https://github.com/marcioluisms/hotelly-admin |
-| API Staging | https://hotelly-public-staging-678865413529.us-central1.run.app |
-| Worker Staging (canônico) | https://hotelly-worker-staging-dzsg3axcqq-uc.a.run.app |
-| Dev local | http://localhost:3000 (WSL + portproxy) |
-
-### Artifact Registry
-| Item | Valor |
-|------|-------|
-| Repositório | `hotelly` (não `hotelly-repo`) |
-| Imagem | `us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest` |
-
----
-
-### ✅ FASE 13: Deploy Admin em Produção
-- Cloudflare Pages (LEGACY; tentativa anterior, abandonada)
-- Deploy oficial: **GCP Cloud Run** (ver seção 4)
-- Domínios: `dash.hotelly.ia.br` (staging) e `adm.hotelly.ia.br` (prod)
-- CI/CD: Cloud Build + scripts no repo (`ops/cloudrun/*`)
-
-### ✅ FASE 14: Migrar quote.py para PAX
-- `quote.py` atualmente usa `ari_days.base_rate_cents`
-- Migrar para usar `room_type_rates` com lógica PAX
-- Calcular preço baseado em ocupação (adultos + crianças)
-- Atualização 05/02/2026: **Status: CONCLUÍDA** (commit `9b9652c`); ver evidências na seção 6.
-
-### ✅ FASE 15: Precificação de crianças por idade (robusta) — plano em 5 stories
-
-**Decisões fechadas**
-- Buckets por `property_id`: **sem sobreposição + cobertura completa 0..17**. Se policy incompleta → quote indisponível (`reason_code=child_policy_incomplete`).
-- Quote indisponível deve registrar `reason_code` (log estruturado). Resposta pública continua `None` por enquanto.
-
-**Stories (sequenciais)**
-- Story 1 (DB + endpoints): buckets + `/child-policies` + compat no `/rates` (legado + novo).
-- Story 2 (Quote engine): `adult_count` + `children_ages[]`, sem fallback, `QuoteUnavailable(reason_code, meta)`.
-- Story 3 (WhatsApp multi-turn): `conversations.context` com entidades normalizadas + prompts/parse estrito de idades.
-- Story 4 (Admin UI): configurar buckets e editar rates por bucket.
-- Story 5 (Persistência): holds/reservations com `adult_count` + `children_ages`; remover `guest_count` e remover legado quando o Admin já estiver migrado.
-
----
-
-WhatsApp (Evolution) → Webhook (public) → Cloud Tasks → Worker (staging): estado validado e requisitos
-
-Em 07/02/2026, foi validado o fluxo end-to-end no staging: POST /webhooks/whatsapp/evolution (serviço hotelly-public-staging) enfileira uma task no Cloud Tasks (hotelly-default, us-central1) que é consumida pelo hotelly-worker-staging em POST /tasks/whatsapp/handle-message, com status 200 no worker.
-
-URLs e serviços (staging)
-
-Worker URL (staging): https://hotelly-worker-staging-dzsg3axcqq-uc.a.run.app
-
-Public URL (staging): https://hotelly-public-staging-678865413529.us-central1.run.app
-
-Configuração necessária no Cloud Run (hotelly-public-staging)
-
-Para o webhook funcionar sem 500, o hotelly-public-staging precisa estar com:
-
-APP_ROLE=public
-
-TASKS_BACKEND=cloud_tasks
-
-GCP_LOCATION=us-central1
-
-GCP_TASKS_QUEUE=hotelly-default
-
-WORKER_BASE_URL=<worker staging url>
-
-TASKS_OIDC_SERVICE_ACCOUNT=hotelly-worker@hotelly--ia.iam.gserviceaccount.com
-
-TASKS_OIDC_AUDIENCE=<worker staging url>
-
-Além disso, dois secrets são obrigatórios (causavam 500 quando ausentes):
-
-CONTACT_HASH_SECRET (secret: contact-hash-secret)
-Erro típico: RuntimeError: CONTACT_HASH_SECRET not configured
-
-CONTACT_REFS_KEY (secret: contact-refs-key)
-Erro típico: RuntimeError: CONTACT_REFS_KEY not configured
-
-IAM mínimo validado (Cloud Run + Tasks)
-
-Para o Cloud Tasks conseguir chamar o worker:
-
-O serviço hotelly-worker-staging deve permitir invocação por serviceAccount:hotelly-worker@hotelly--ia.iam.gserviceaccount.com com roles/run.invoker.
-
-O enfileiramento usa a fila hotelly-default (Cloud Tasks) e deve existir permissão de enqueue no projeto (ex.: roles/cloudtasks.enqueuer) no contexto correto.
-
-Contrato de segurança (ADR-006) observado no código
-
-No webhook:
-
-PII (ex.: remote_jid, text) só existe em memória durante o processamento.
-
-contact_hash é gerado via HMAC (CONTACT_HASH_SECRET) e não é reversível.
-
-remote_jid é armazenado criptografado em contact_refs usando CONTACT_REFS_KEY.
-
-O payload da task não contém PII.
-
-Causa raiz do 500 após secrets: property_id inválido (FK)
-
-Após configurar os secrets, o 500 passou a ser violação de FK:
-
-Erro típico: ForeignKeyViolation ... Key (property_id)=(pousada-demo) is not present in table "properties"
-
-Conclusão: o header X-Property-Id precisa ser um properties.id existente no staging DB.
-
-No staging DB, foi confirmado:
-
-properties.id existente: pousada-staging
-
-Logo, para testar o webhook no staging, o header correto é:
-
-X-Property-Id: pousada-staging
-
-Teste manual recomendado (staging)
-
-Requisição mínima para validar o pipeline (exemplo de payload compatível com o adapter):
-
-POST {PUBLIC_URL}/webhooks/whatsapp/evolution
-
-Headers:
-
-Content-Type: application/json
-
-X-Property-Id: pousada-staging
-
-Body com shape:
-
-data.key.id
-
-data.key.remoteJid
-
-data.messageType
-
-data.message.conversation (ou extendedTextMessage.text)
-
-Interpretação:
-
-Se o webhook retornar 200, por contrato do handler ele só devolve 2xx quando: gravou vault (contact_refs), gravou dedupe (processed_events) e enfileirou task.
-
-Observação crítica: Admin não está alinhado com o staging DB
-
-Mesmo após inserir user_property_roles para pousada-staging, o Admin acessado em adm.hotelly.ia.br continuou mostrando apenas pousada-demo e redirecionando para seleção de pousada quando forçada a URL de pousada-staging. Isso indica forte evidência de que o Admin nessa URL não está apontando para o mesmo ambiente/banco do staging usado pelo hotelly-public-staging. É necessário identificar o admin staging real e/ou verificar para qual backend ele aponta para alinhar ambientes.
-
-Nota operacional: Cloud SQL Proxy
-
-O Cloud SQL Proxy não é necessário para o Cloud Run operar; ele só é necessário para acesso local ao banco via psql. O secret hotelly-staging-database-url está em formato DSN key=value (libpq) e normalmente vem com host=/cloudsql/... (socket). Para uso local, deve-se substituir o host socket por TCP (host=127.0.0.1 port=<porta>). Foi usado 5433 porque 5432 estava ocupada.
-
----
-
-### ✅ FASE 16: Automação de Mensagens (WhatsApp)
-- Garantir env/secrets no `hotelly-worker-staging`: `EVOLUTION_BASE_URL`, `EVOLUTION_INSTANCE`, `EVOLUTION_API_KEY` (secret), `CONTACT_REFS_KEY` (secret), `DATABASE_URL` (e `EVOLUTION_SEND_PATH` se necessário).
-- Corrigir `POST /tasks/whatsapp/send-response`: **5xx** em falha transitória (para retry) e **2xx** em falha permanente (sem retry).
-- Implementar idempotência do outbound: guard durável por `outbox_event_id` (ex.: `outbox_deliveries`).
-- Validar E2E em staging (Evolution): inbound → handle-message → outbox → send-response → mensagem chega no WhatsApp.
-
----
-Atualizado em 08/02/2026
-
-Segue um **registro “colável”** para o agente de documentos atualizar o `doc_unificado` (somente fatos + decisões + runbook + follow-up).
-
----
-
-## Atualização — Story 16 (WhatsApp send-response) + Rollout/validação em staging
-
-### Status
-
-* **Story 16: DONE em staging** (persistência + idempotência comprovadas via runbook + DB).
-* **Follow-up recomendado:** **Task 16.1** para prova determinística de **retry transiente via Cloud Tasks** (diag hook staging bem gateado).
-
----
-
-## Implementação (TO-BE já entregue no código)
-
-### Semântica do endpoint `POST /tasks/whatsapp/send-response`
-
-* **Falha transiente** (`timeout/rede/5xx/429`) ⇒ **HTTP 500** (habilita retry do Cloud Tasks).
-
-  * `outbox_deliveries` permanece `status='sending'` e atualiza `attempt_count` + `last_error` **sanitizado**.
-* **Falha permanente** (`401/403`, `contact_ref_not_found`, template inválido, config/env/secret faltando) ⇒ **HTTP 200** com payload **`{ ok:false, terminal:true, ... }`** (evita retry infinito).
-
-  * `outbox_deliveries.status='failed_permanent'`, `last_error` sanitizado.
-* **Idempotência (no-op terminal)**: se já `sent` ⇒ **HTTP 200** `{ ok:true, already_sent:true }` e **não chama provider**.
-
-### Guard durável / idempotência
-
-* Nova tabela `outbox_deliveries` com **UNIQUE(property_id, outbox_event_id)**, status (`sending|sent|failed_permanent`), `attempt_count`, `last_error`, `sent_at`, timestamps.
-* **Lease anti-concorrência**: `status='sending'` com `updated_at` recente ⇒ retorna **500 lease_held** (não envia); lease stale permite takeover.
-
-### Segurança / PII
-
-* **Não logar** `remote_jid`, texto, nem `contact_hash` completo.
-* Logs/DB: apenas `property_id`, `outbox_event_id`, `correlation_id` e erro **sanitizado**.
-
----
-
-## Migrações / Alembic (lição operacional)
-
-* O projeto aplica migrations via **Alembic** (`migrations/versions/`).
-* `migrations/sql/*.sql` é histórico/manual e **não roda** no `make migrate` por si só.
-* Foi necessário PR separado criando **Alembic revision** para `outbox_deliveries`.
-
-### Observação de higiene (staging DB drift)
-
-* Staging apresentou **drift** (schema adiantado com `alembic_version` atrasado), causando falha em migration 013 (`guest_count` ausente).
-* Foi usado `alembic stamp` para alinhar versão e prosseguir com `upgrade head`.
-* Após isso, `outbox_deliveries` existe e o head ficou atualizado.
-
----
-
-## Runbook oficial — testar `send-response` em staging (manual)
-
-**Regra:** o endpoint exige **Google OIDC identity token (JWT)** com:
-
-* **audience exatamente igual ao `TASKS_OIDC_AUDIENCE`**
-* chamada feita no **mesmo host** do audience
-
-Na prática, para teste manual foi necessário **impersonation** da service account:
-
-* `hotelly-worker@hotelly--ia.iam.gserviceaccount.com`
-
-(Esse runbook elimina o “curl qualquer” que gerava alternância entre 401 do Cloud Run e 401 do app.)
-
----
-
-## Rollout/validação em staging (fatos finais)
-
-* Imagem do backend atualizada em `:latest` (novo digest: `sha256:a0bc723b6b87567d6dd701afac315d8b91c4025834a6e7428e7be90fea5ab89b`).
-* Cloud Run `hotelly-worker-staging` redeployado para revisão **`hotelly-worker-staging-00019-mf8`** (100% tráfego).
-
-### Validação funcional (DB + endpoint)
-
-* Chamada manual com token OIDC correto ⇒ resposta terminal:
-
-  * `{"ok":false,"terminal":true,"error":"contact_ref_not_found"}`
-* Confirmada persistência:
-
-  * `outbox_deliveries` criado para `(property_id='pousada-staging', outbox_event_id=8)` com
-    `status='failed_permanent'`, `attempt_count=1`, `last_error='contact_ref_not_found'`.
-* Confirmada idempotência:
-
-  * reexecução não gerou duplicata (count permaneceu 1).
-
-### `already_sent` em staging (seed controlado)
-
-* Não havia casos reais `sent` (por ausência de `contact_refs` válidos; TTL expirado).
-* Para validar `already_sent`:
-
-  * criado `outbox_event` id=9 (cópia do 8) + inserido `outbox_delivery` `status='sent'`.
-  * chamada `send-response` para `outbox_event_id=9` retornou `{ "ok": true, "already_sent": true }` e **não incrementou `attempt_count`**.
-
----
-
-## Follow-up: Task 16.1 — Prova determinística de retry transiente (Cloud Tasks)
-
-**Motivação:** validar retry transiente sem mexer em provider/infra.
-
-### Requisitos do diag hook (somente staging)
-
-* Gate em camadas:
-
-  * `ENV=staging`
-  * `STAGING_DIAG_ENABLE=true`
-  * header `x-diag-force-transient: 1`
-  * `property_id` canônico == `pousada-staging`
-* Hook ocorre **depois** do lease/attempt increment e **antes** do provider call.
-* Efeito:
-
-  * grava `last_error="forced_transient"` (PII-safe)
-  * mantém `status='sending'`
-  * retorna **HTTP 500** para forçar retry do Cloud Tasks
-* Prova (DoD):
-
-  * Cloud Tasks attempts subindo + `outbox_deliveries.attempt_count` subindo + status permanecendo `sending`.
-
-* Implementado **diag hook de staging** no handler `POST /tasks/whatsapp/send-response`:
-
-  * Gates: `APP_ENV=staging`, `STAGING_DIAG_ENABLE=true`, header `x-diag-force-transient: 1`, `property_id` canônico `pousada-staging`.
-  * Quando ativo, força **HTTP 500** (`error=forced_transient`) sem chamar provider.
-  * Atualiza `outbox_deliveries`: incrementa `attempt_count` e seta `last_error='forced_transient'`.
-  * Ajuste para evitar bloqueio por `lease_held` durante retries: grava `updated_at` como “stale” (-600s), permitindo novas tentativas incrementarem.
-  * Testes unitários adicionados/ajustados em `tests/test_send_response_delivery.py`.
-
-* Deploy staging:
-
-  * Build+push da imagem `latest` (digest `sha256:919eaff...`).
-  * Cloud Run `hotelly-worker-staging` atualizado para revisão `00022-4tk` com código novo.
-  * Env vars staging ajustadas (incluindo `APP_ROLE=worker`, `APP_ENV=staging`).
-  * Hook habilitado temporariamente via `STAGING_DIAG_ENABLE=true`, depois desabilitado (`false`) em nova revisão `00023-k8j`.
-
-* Prova de retry real (Cloud Tasks + DB):
-
-  * Criada Cloud Task com OIDC e header do hook.
-  * Observado retry (5xx) e, no DB, `outbox_deliveries` para `outbox_event_id=10` com `status='sending'`, `last_error='forced_transient'` e `attempt_count` subindo (ex.: 8).
-
-* Limpeza:
-
-  * Task de diagnóstico removida (`diag-forced-transient-10b`).
-  * Hook desabilitado em staging.
-
-### Runbook — Provar retry transiente (Cloud Tasks) em staging
-
-**1) Criar um outbox_event novo (no psql)**
-
-```sql
-insert into outbox_events (property_id, event_type, aggregate_type, aggregate_id, occurred_at, correlation_id, payload, message_type)
-select property_id, event_type, aggregate_type, aggregate_id, now(), 'diag-forced-transient', payload, message_type
-from outbox_events
-where id = 8
-returning id;
-```
-
-> Guarde o `id` retornado (ex.: `OUTBOX_EVENT_ID=10`).
-
-**2) Habilitar hook (Cloud Run)**
-
+#### Banco local: operações úteis
+##### Entrar no Postgres
 ```bash
-gcloud run services update hotelly-worker-staging \
-  --region us-central1 \
-  --update-env-vars STAGING_DIAG_ENABLE=true,APP_ENV=staging,APP_ROLE=worker
+docker compose exec db psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hotelly}
 ```
 
-**3) Criar Cloud Task (gera 5xx e retry)**
-
-```bash
-gcloud tasks create-http-task "diag-forced-transient-$OUTBOX_EVENT_ID" \
-  --queue="hotelly-default" \
-  --location="us-central1" \
-  --url="https://hotelly-worker-staging-dzsg3axcqq-uc.a.run.app/tasks/whatsapp/send-response" \
-  --method=POST \
-  --header="Content-Type:application/json" \
-  --header="x-diag-force-transient:1" \
-  --oidc-service-account-email="hotelly-worker@hotelly--ia.iam.gserviceaccount.com" \
-  --oidc-token-audience="https://hotelly-worker-staging-dzsg3axcqq-uc.a.run.app" \
-  --body-content='{"property_id":"pousada-staging","outbox_event_id":'"$OUTBOX_EVENT_ID"'}'
-```
-
-**4) Evidência de retry (Cloud Tasks)**
-
-```bash
-gcloud tasks describe "diag-forced-transient-$OUTBOX_EVENT_ID" \
-  --queue="hotelly-default" --location="us-central1"
-```
-
-> Ver `dispatchCount` subindo e `lastAttempt.responseStatus` com HTTP 500.
-
-**5) Evidência no DB (psql)**
-
+##### Queries de sanidade (inventário e invariantes)
+**1) Checar overbooking (deve ser 0 linhas):**
 ```sql
-select status, attempt_count, last_error, updated_at
-from outbox_deliveries
-where property_id='pousada-staging' and outbox_event_id=<OUTBOX_EVENT_ID>;
+SELECT property_id, room_type_id, date
+FROM ari_days
+WHERE (inv_booked + inv_held) > inv_total;
 ```
 
-> Esperado: `status='sending'`, `last_error='forced_transient'`, `attempt_count` subindo.
+**2) Holds ativos vencidos (candidato a expire):**
+```sql
+SELECT id, property_id, status, expires_at
+FROM holds
+WHERE status = 'active' AND expires_at < now()
+ORDER BY expires_at ASC;
+```
 
-**6) Desligar e limpar**
+**3) Pagamentos confirmados sem reserva (deve ser 0 ou virar runbook):**
+```sql
+SELECT p.*
+FROM payments p
+LEFT JOIN reservations r
+  ON r.property_id = p.property_id
+  AND r.hold_id = p.hold_id
+WHERE p.status = 'succeeded'
+  AND r.id IS NULL
+  AND p.created_at < now() - interval '15 minutes';
+```
 
+---
+
+#### Rodar a API localmente (sem container)
+Use isso só se estiver iterando rápido em código Python.
+
+Exemplo:
 ```bash
-gcloud run services update hotelly-worker-staging \
-  --region us-central1 \
-  --update-env-vars STAGING_DIAG_ENABLE=false
+export $(cat .env.local | xargs)  # cuidado com espaços/quotes
+uv run uvicorn hotelly.api.app:app --reload --host 0.0.0.0 --port ${APP_PORT:-8000}
 ```
 
+Regras:
+- Ainda assim, o Postgres deve estar acessível via `DATABASE_URL` (local, Docker ou remoto).
+- Logs devem continuar sem payload raw/PII.
+
+---
+
+#### Tasks local (Cloud Tasks “simulado”)
+Como Cloud Tasks não tem emulador oficial simples, a estratégia local deve ser uma destas:
+
+##### Opção A (preferida): `TASKS_BACKEND=local` + worker rodando
+- `app` apenas enfileira (persistindo receipt/processed_events quando necessário)
+- `worker` consome (poll) e executa handlers
+
+Exemplo esperado:
 ```bash
-gcloud tasks delete "diag-forced-transient-$OUTBOX_EVENT_ID" \
-  --queue="hotelly-default" --location="us-central1" --quiet
+docker compose up -d worker
+docker compose logs -f worker
 ```
 
-Staging WhatsApp — Destravamento E2E (webhook → tasks → send-response → Evolution)
-Status
+##### Opção B: `TASKS_BACKEND=inline` (debug)
+- Enfileiramento executa imediatamente no mesmo processo.
+- Bom para depurar, ruim para simular retries e concorrência.
 
-Fluxo completo funcionando em staging (evidência: outbox_event_id=17 com outbox_deliveries.status='sent' em 2026-02-09T13:03:22Z).
+**Regra:** qualquer comportamento de retry/idempotência deve ser testado também no modo `local` (ou em staging com Cloud Tasks).
 
-Sintoma observado
+---
 
-Webhook Evolution retornava 200 (“received”), porém o envio não completava.
+#### Replay de webhooks (Stripe)
+Objetivo: provar **dedupe + ACK correto** e fechar o loop `payment_succeeded → convert_hold`.
 
-handle-message rodava, mas send-response não era enfileirado/rodado corretamente e/ou falhava antes de enviar.
+##### Configurar listener local
+1) Setar `STRIPE_WEBHOOK_SECRET` no `.env.local`
+2) Rodar:
+```bash
+stripe listen --forward-to http://localhost:${APP_PORT:-8000}/webhooks/stripe
+```
 
-Causas-raiz confirmadas
+##### Disparar eventos de teste
+Exemplos (variar conforme seu fluxo):
+```bash
+stripe trigger checkout.session.completed
+stripe trigger payment_intent.succeeded
+```
 
-Worker sem config de Cloud Tasks backend
-Ausência de TASKS_BACKEND, GCP_*, WORKER_BASE_URL, TASKS_OIDC_SERVICE_ACCOUNT impedia handle-message de enfileirar send-response.
+##### O que validar
+- Repetir o mesmo evento não duplica efeito:
+  - `processed_events` impede duplicidade
+  - `reservations` tem UNIQUE por `(property_id, hold_id)`
+- Resposta 2xx só ocorre após receipt durável (registrar processed_events e/ou task durável)
 
-IAM: falta de permissão iam.serviceAccounts.actAs
-Erro PermissionDenied: iam.serviceAccounts.actAs ao criar task com OIDC usando TASKS_OIDC_SERVICE_ACCOUNT.
+---
 
-Chaves CONTACT_* divergentes entre public e worker (InvalidTag)
-public e worker usavam secrets diferentes para CONTACT_REFS_KEY/CONTACT_HASH_SECRET, gerando contact_refs.remote_jid_enc com uma chave e tentando decriptar com outra ⇒ aesgcm.decrypt InvalidTag.
+#### Replay de inbound WhatsApp (quando existir)
+Regra: **um único contrato interno** de mensagem; provider só adapta.
 
-Config Evolution outbound ausente no worker
-Falha permanente até configurar EVOLUTION_BASE_URL, EVOLUTION_INSTANCE, EVOLUTION_API_KEY.
+Exemplo genérico de POST (payload *redigido*):
+```bash
+curl -sS -X POST "http://localhost:${APP_PORT:-8000}/webhooks/whatsapp/evolution" \
+  -H "Content-Type: application/json" \
+  -H "X-Correlation-Id: dev-123" \
+  -d '{
+    "provider":"meta",
+    "message_id":"wamid.TEST",
+    "from":"+5500000000000",
+    "text":"quero reservar",
+    "timestamp":"2026-01-25T00:00:00Z"
+  }'
+```
 
-Erro 400 do provider por número inexistente
-Testes com número fake retornavam exists:false; com número real, envio ok.
+O que validar:
+- Repetir o mesmo `message_id` não processa duas vezes
+- Nada do payload aparece integralmente em logs
 
-Correções aplicadas
-hotelly-worker-staging (worker)
+---
 
-Config de Cloud Tasks:
+#### Suite mínima local (TARGET: espelhar Quality Gates)
+**Nota:** os gates G0–G6 são TARGET (ver `02_cicd_environments.md`). Enquanto não houver script oficial/CI cobrindo,
+use esta seção como checklist local.
 
-TASKS_BACKEND=cloud_tasks
+Rodar antes de fechar qualquer story relevante:
 
-GCP_PROJECT_ID=hotelly--ia
+- G0 — build & startup:
+```bash
+docker compose exec app python -m compileall -q src
+curl -sS http://localhost:${APP_PORT:-8000}/health
+```
 
-GCP_LOCATION=us-central1
+- G1 — migrações e schema:
+```bash
+docker compose exec app make migrate
+docker compose exec app make migrate  # repetir (idempotente)
+```
 
-GCP_TASKS_QUEUE=hotelly-default
+- G2 — segurança/PII:
+```bash
+docker compose exec app make lint
+```
 
-WORKER_BASE_URL=https://hotelly-worker-staging-dzsg3axcqq-uc.a.run.app
+- G3–G5 (quando transações críticas existirem):
+```bash
+docker compose exec app make test-idempotency
+docker compose exec app make test-concurrency
+docker compose exec app make test-race-expire-vs-convert
+```
 
-TASKS_OIDC_SERVICE_ACCOUNT=hotelly-worker@hotelly--ia.iam.gserviceaccount.com
+Se os targets ainda não existirem, a story deve criá-los (ou documentar o comando equivalente).
 
-TASKS_OIDC_AUDIENCE mantido via secret
+---
 
-IAM:
+#### Reset completo do ambiente local
+Quando o estado do banco estiver “sujo”:
+```bash
+docker compose down -v
+docker compose up -d --build
+docker compose exec app make migrate
+docker compose exec app make seed-minimal
+```
 
-concedido roles/iam.serviceAccountUser no hotelly-worker@... para permitir actAs (OIDC Cloud Tasks).
+---
 
-Evolution outbound:
+#### Troubleshooting (curto e prático)
+##### App sobe, mas não conecta no DB
+- Confirme `DATABASE_URL` (host deve ser `db` no compose, não `localhost`)
+- Veja logs:
+```bash
+docker compose logs -f app
+docker compose logs -f db
+```
 
-EVOLUTION_BASE_URL
+##### Migração falha por schema “meio aplicado”
+- Reset com `down -v` (ambiente de dev local é descartável)
 
-EVOLUTION_INSTANCE
+##### Duplicidade de eventos (webhook/task)
+- Verifique UNIQUE em `processed_events(source, external_id)`
+- Verifique que o handler grava receipt **antes** de produzir efeitos colaterais
 
-EVOLUTION_API_KEY (secret)
+##### Overbooking no teste de concorrência
+- Falta guarda no `WHERE` do update de ARI
+- Falta transação envolvendo todas as noites
+- Ordem de updates não determinística
 
-hotelly-public-staging (public/webhooks)
+---
 
-Alinhamento de secrets:
+#### Checklist antes de integrar qualquer coisa “real”
+- [ ] `processed_events`, `idempotency_keys`, `outbox_events` existem e estão cobertos por testes
+- [ ] overbooking query retorna 0
+- [ ] replay de webhook e message_id não duplica efeito
+- [ ] logs sem payload bruto/PII
 
-CONTACT_HASH_SECRET passou a usar contact-hash-secret-staging
+### D.3 CI/CD e ambientes (detalhado)
 
-CONTACT_REFS_KEY passou a usar contact-refs-key-staging
+### CI/CD e Ambientes — Hotelly V2 (`docs/operations/02_cicd_environments.md`)
 
-IAM secrets:
+#### Objetivo
+Definir **como** o Hotelly V2 é construído, testado e promovido entre ambientes (**dev → staging → prod**) com:
+- **burocracia mínima**
+- **gates objetivos**
+- **segurança** (sem PII/segredos e sem rotas internas expostas)
+- **confiabilidade** (idempotência, dedupe e retry corretos)
 
-SA do public (hotelly-public@...) recebeu roles/secretmanager.secretAccessor nos secrets *-staging.
+Este documento é **normativo**: se uma etapa “oficial” não existir no repo/infra, vira tarefa.
 
-Banco (staging)
+---
 
-Limpeza de contact_refs para property_id='pousada-staging' e channel='whatsapp' após alinhar CONTACT_REFS_KEY, para regenerar ciphertext compatível.
+#### Ambientes
 
-Checklist “staging operacional” (WhatsApp)
+##### Local (`local`)
+- Propósito: desenvolvimento e testes rápidos.
+- Infra: Docker Compose (Postgres + app).
+- Stripe: **test mode**.
+- Dados: sintéticos/seed. Nunca PII real.
 
-Public e Worker devem usar os mesmos secrets para:
+##### Dev (`dev`)
+- Propósito: integração contínua e validação rápida.
+- Deploy: automático no merge/push na branch principal.
+- Stripe: **test mode**.
+- Dados: sintéticos + fixtures.
+- Regra: pode quebrar, mas **gates não**.
 
-CONTACT_REFS_KEY
+##### Staging (`staging`)
+- Propósito: pré-produção (ensaio do que vai para prod).
+- Deploy: promoção controlada (tag/release).
+- Stripe: **test mode** (recomendado) ou “modo híbrido” apenas se necessário e isolado.
+- Dados: sintéticos + cenários E2E.
 
-CONTACT_HASH_SECRET
+##### Produção (`prod`)
+- Propósito: operação real.
+- Deploy: promoção controlada + checklist.
+- Stripe: **live mode**.
+- Dados: reais (PII real existe aqui; logs nunca).
 
-Worker deve ter Evolution outbound configurado:
+---
 
-EVOLUTION_BASE_URL, EVOLUTION_INSTANCE, EVOLUTION_API_KEY
+#### Topologia recomendada por ambiente (GCP)
 
-Tasks pipeline deve estar explícito:
+##### Estado atual do repo (importante)
+No momento, o serviço FastAPI no repositório expõe apenas `/health`.
+Os paths `/webhooks/*` e `/tasks/*` descritos abaixo são o **TARGET** de arquitetura/infra
+e só passam a ser "verdade operacional" quando estiverem implementados no código e no deploy.
 
-TASKS_BACKEND=cloud_tasks, GCP_LOCATION, GCP_TASKS_QUEUE, WORKER_BASE_URL, TASKS_OIDC_SERVICE_ACCOUNT, TASKS_OIDC_AUDIENCE
+Enquanto isso, trate estas seções como especificação do sistema-alvo.
 
-Manter APP_ROLE=worker no worker (senão /tasks/* vira 404).
+##### Opção preferida (mais segura): **2 serviços Cloud Run**
+1) **`hotelly-public`** (público)
+   - Só expõe: `/webhooks/stripe/*`, `/webhooks/whatsapp/*`, `/health`
+   - Faz **receipt durável** + **enqueue** (Cloud Tasks). Não processa pesado.
+2) **`hotelly-worker`** (privado / auth obrigatório)
+   - Só expõe: `/tasks/*`, `/internal/*` (se existir)
+   - Executa o motor de domínio/transações críticas.
 
-IAM mínimo:
+**Por quê:** Cloud Run é “auth por serviço”, não por rota. Separar serviços elimina o risco clássico de “rota interna exposta no público”.
 
-enqueuer: SA do serviço que enfileira precisa de roles/cloudtasks.enqueuer
+##### Opção mínima (aceitável no começo): **1 serviço Cloud Run público**
+- Exigir verificação forte em **toda** rota pública:
+  - Stripe: assinatura obrigatória
+  - WhatsApp: verificação do provider
+  - Tasks: header secreto + audience rígida (ou assinatura OIDC verificada)
+- Rotas internas **não devem existir** no router público. (Gate G2 deve barrar.)
 
-invoker: SA OIDC precisa roles/run.invoker no worker
+---
 
-actAs: chamador precisa permissão iam.serviceAccounts.actAs no TASKS_OIDC_SERVICE_ACCOUNT
+#### Infra mínima por ambiente
 
-Evidências de sucesso
+##### Cloud SQL (Postgres)
+- Fonte da verdade transacional.
+- Conexão Cloud Run → Cloud SQL via **Cloud SQL Connector/Auth Proxy** com IP público (conforme decisão do projeto).
+- Estratégia de dados:
+  - **dev/staging**: pode usar a mesma instância com **bases separadas** (`hotelly_dev`, `hotelly_staging`).
+  - **prod**: instância dedicada (recomendado).
 
-Cloud Tasks executou:
+##### Cloud Tasks
+- Filas por ambiente (ex.: `default`, `expires`, `webhooks`).
+- Tasks devem usar **OIDC** (service account) quando chamarem `hotelly-worker`.
+- Retries configurados para tolerar falhas transitórias (DB/429 do provider).
 
-/tasks/whatsapp/handle-message (200)
+##### Secret Manager
+- Segredos **por ambiente** (nomenclatura recomendada):
+  - `hotelly-{env}-db-url` (ou host/user/pass separados)
+  - `hotelly-{env}-stripe-secret-key`
+  - `hotelly-{env}-stripe-webhook-secret`
+  - `hotelly-{env}-whatsapp-verify-token`
+  - `hotelly-{env}-whatsapp-app-secret` (se aplicável)
+  - `hotelly-{env}-internal-task-secret` (se usar header)
+- Regra: **zero segredos no repo**.
 
-/tasks/whatsapp/send-response (200)
+##### Service Accounts (mínimo)
+- `sa-hotelly-{env}-runtime` (Cloud Run)
+  - Secret Manager Secret Accessor (apenas segredos do env)
+  - Cloud SQL Client
+  - Cloud Tasks Enqueuer (se o serviço enfileira)
+- `sa-hotelly-{env}-tasks-invoker` (Cloud Tasks OIDC)
+  - Invoker do `hotelly-worker` (Cloud Run)
 
-DB:
+---
 
-outbox_deliveries.status='sent', attempt_count=1 para outbox_event_id=17.
+#### Estratégia de branch e versionamento (solo)
+- Branches com trigger de produção (SoT): `hotelly-admin` => `main`; `hotelly-v2` => `master`.
+- Trabalho diário: feature branch curta (`feat/...`, `fix/...`).
+- Merge na principal somente com CI verde.
+- Versões:
+  - `v0.Y.Z` (enquanto em piloto)
+  - tags são o artefato de promoção para staging/prod.
 
-## Runbook — Recuperar `InvalidTag` (CONTACT_REFS_KEY mudou / desalinhou)
+---
 
-**Quando usar**
-Se o worker/public estiverem com `CONTACT_REFS_KEY` diferente do que criptografou `contact_refs.remote_jid_enc`, o decrypt vai falhar com `cryptography.exceptions.InvalidTag`.
+#### CI — Pipeline (sempre)
 
-**Pré-condição**
-Primeiro alinhar `CONTACT_REFS_KEY` (e `CONTACT_HASH_SECRET`) entre **public** e **worker**. Só depois limpar.
+##### Estado atual (repo hoje)
+No momento, o CI no repositório cobre apenas o mínimo (ex.: `compileall` e `pytest`).
+Os **Quality Gates (G0–G6)** abaixo representam o **alvo normativo** do projeto.
+Até estarem implementados no CI (ou em um script local padronizado), eles **não podem ser tratados como "aplicados"**.
 
-### Opção A — Limpar somente a property/canal afetados (recomendado)
+Regra: qualquer item descrito como gate e ainda não implementado deve virar tarefa explícita (story) antes de ser usado como critério de aceite.
 
+##### Gatilhos
+- Pull Request (feature → main): roda CI completo.
+- Push/merge em `main`: roda CI completo + (opcional) deploy automático `dev`.
+- Tag `v*`: roda CI + promove (staging/prod conforme regra abaixo).
+
+> Nota: "CI completo" aqui significa **o que existe no repo**. Quando os gates forem implementados,
+> esta seção permanece válida e passa a refletir a prática.
+
+##### Jobs mínimos (ordem)
+1) **Lint/format** (rápido)
+2) **Unit tests**
+3) **Build Docker**
+4) **Gates** (ver abaixo)
+5) (opcional) **Integration tests** com Postgres (dev/staging)
+
+##### Quality Gates (hard fail)
+Os gates são a régua objetiva. Se falhar, não fecha story.
+
+**Importante:** a lista abaixo é o **TARGET** (normativo).
+Marque um gate como "aplicável" somente quando houver implementação real no CI (ou script oficial versionado).
+
+- **G0 — Build & Startup**
+  - `python -m compileall -q src` (ou raiz)
+  - build Docker
+  - app sobe e responde `/health`
+
+- **G1 — Migrações e schema**
+  - `migrate up` em DB vazio
+  - `migrate up` novamente (idempotente)
+  - valida constraints críticas:
+    - UNIQUE `processed_events(source, external_id)`
+    - UNIQUE `reservations(property_id, hold_id)`
+    - UNIQUE `payments(property_id, provider, provider_object_id)`
+
+- **G2 — Segurança/PII**
+  - falha se existir `print(` em código de produção
+  - falha se houver log de `payload/body/request.json/webhook` sem redaction
+  - falha se `/internal/*` estiver montado no router público
+
+- **G3 — Idempotência e retry**
+  - mesmo webhook Stripe 2x → 1 efeito
+  - mesma task id 2x → no-op
+  - `Idempotency-Key` repetida → mesma resposta
+
+- **G4 — Concorrência (no overbooking)**
+  - teste concorrente (última unidade): 1 sucesso, N-1 falhas limpas
+
+- **G5 — Race expire vs convert**
+  - sem inventário negativo
+  - no máximo 1 reserva
+
+- **G6 — Pricing determinístico**
+  - golden tests para BPS/FIXED/PACKAGE* (quando pricing existir)
+
+---
+
+#### CD — Promoção e Deploy
+
+##### Artefato de deploy
+- **Imagem Docker** publicada no Artifact Registry (tag por commit e por versão).
+
+##### Deploy automático (dev)
+- Trigger: push/merge em `main`
+- Passos:
+  1) CI completo (com gates)
+  2) build + push da imagem (tag `sha`)
+  3) deploy `hotelly-public`/`hotelly-worker` em `dev` apontando para segredos `dev`
+
+##### Promoção controlada (staging)
+- Trigger: tag `v0.Y.Z` (ou release manual)
+- Passos:
+  1) CI completo (gates)
+  2) promover **a mesma imagem** (não rebuildar) para `staging`
+  3) smoke E2E (mínimo): hold → checkout → webhook → reserva confirmada (com replay de webhook)
+
+##### Promoção controlada (prod)
+- Trigger: tag/release marcada como “prod”
+- Passos:
+  1) CI completo (gates)
+  2) **migração manual** (ver política abaixo)
+  3) deploy **a mesma imagem** em `prod`
+  4) smoke pós-deploy (mínimo) + checagem de alertas
+
+---
+
+#### Política de migrações (Postgres)
+Regras para não virar incidente:
+1) **Sempre forward-only** em prod (sem `down`).
+2) Migrações devem ser:
+   - **aditivas** primeiro (add coluna/tabela/índice),
+   - depois mudança de código,
+   - depois limpeza/removal (em versão futura).
+3) Execução:
+   - dev/staging: pode rodar automaticamente no pipeline
+   - prod: **passo manual** antes do deploy (ou Cloud Run Job dedicado)
+
+Checklist de migração prod:
+- backup/point-in-time habilitado (quando houver)
+- migração revisada
+- plano de rollback lógico (feature flag / compatibilidade)
+
+---
+
+#### Segurança de endpoints (regras mínimas)
+- **Webhook Stripe**
+  - verificar assinatura sempre
+  - regra de ACK: **2xx só após receipt durável**
+- **WhatsApp inbound**
+  - validar token/assinatura do provider
+  - nunca logar payload bruto
+- **Tasks**
+  - preferir OIDC (service account) chamando serviço privado (`hotelly-worker`)
+  - se usar header secreto: rotacionar e manter por env
+- **Rotas internas**
+  - não expor em serviço público (preferência: outro serviço)
+  - Gate G2 deve impedir regressão
+
+---
+
+#### Checklist curto de release (staging/prod)
+1) CI verde (todos gates aplicáveis).
+2) Segredos do env existem e estão referenciados (sem hardcode).
+3) Migrações revisadas e compatíveis.
+4) Smoke E2E:
+   - create hold (com idempotency)
+   - replay create hold (no-op)
+   - checkout session ok
+   - webhook Stripe replay (no-op)
+   - convert gera 1 reserva
+5) Alertas principais silenciosos (fila tasks, erros 5xx, erros DB).
+
+---
+
+#### Rollback (sem drama)
+- **Rollback de app (Cloud Run):** voltar para revisão anterior (revisions).
+- **Rollback de DB:** não contar com “down”.
+  - usar compatibilidade (migração aditiva + código antigo ainda funciona)
+  - se necessário: feature flag / desabilitar entrada (webhooks) temporariamente
+
+---
+
+#### Convenções de nomes (sugestão)
+- Serviços:
+  - `hotelly-public-{env}`
+  - `hotelly-worker-{env}`
+- Cloud SQL:
+  - instância: `hotelly-{env}-db` (ou `hotelly-db-prod`)
+  - databases: `hotelly_dev`, `hotelly_staging`, `hotelly_prod`
+- Filas Tasks:
+  - `hotelly-{env}-default`
+  - `hotelly-{env}-expires`
+  - `hotelly-{env}-webhooks`
+- Secrets:
+  - `hotelly-{env}-*`
+
+---
+
+#### Próximo documento
+- `docs/operations/03_test_plan.md` — adaptar o plano V1 para o modelo SQL/Tasks/Stripe (e transformar G3–G5 em testes “oficiais”).
+
+### D.4 Test plan (detalhado)
+
+### Plano de Testes — Hotelly V2 (`docs/operations/03_test_plan.md`)
+
+#### Objetivo
+Garantir que o Hotelly V2 opere com **segurança transacional** e **previsibilidade operacional**, com foco em:
+- **0 overbooking** sob concorrência (inventário nunca negativo e nunca excedido)
+- **idempotência real** em webhooks, tasks e endpoints internos
+- **semântica correta de ACK** (não matar retry do provedor por erro interno)
+- **nenhum vazamento de PII/payload raw** em logs
+- **replay confiável** (webhooks e tasks podem ser reprocessados com segurança)
+
+Este documento é **normativo**: quando um teste/gate é marcado como MUST, a story relacionada só fecha quando houver prova executável em CI.
+
+---
+
+#### Princípios
+1) **Risk-based testing**: o esforço de teste escala com o risco (dinheiro/inventário > UX).
+2) **Prova executável > revisão subjetiva**: gates objetivos substituem burocracia.
+3) **Determinismo**: testes devem ser reproduzíveis (fixtures estáveis, tempo controlado, seeds consistentes).
+4) **Isolamento**: integração com provedores é testada por “contrato” (payload fixtures + validações), e E2E real fica reservado a staging.
+
+---
+
+#### Pirâmide de testes (o que existe e por quê)
+
+##### 1) Unit tests (rápidos, puros)
+**Escopo:** validações, normalização de payloads, mapeamentos, parsing, cálculos de preço (quando aplicável).  
+**Não cobre:** concorrência e atomicidade (isso é Integration).
+
+##### 2) Integration tests (Postgres + transações)
+**Escopo:** todas as regras que dependem de lock, constraint, idempotência e atomicidade.  
+Aqui vivem os testes que **evitam os erros da V1**.
+
+##### 3) Contract tests (provedores)
+**Escopo:** garantir que os adaptadores aceitam/rejeitam payloads reais sem efeitos colaterais.  
+Stripe/WhatsApp entram aqui com fixtures e validação de assinatura/campos.
+
+##### 4) E2E (staging) — mínimo e cirúrgico
+**Escopo:** comprovar o fluxo completo (mensagem → hold → pagamento → reserva) e o comportamento de replay.  
+Deve ser curto, repetível e rodar sob comando (script).
+
+---
+
+#### Ambientes e dados
+
+##### Banco
+- **Local/CI:** Postgres efêmero (container) + migrações aplicadas do zero.
+- **Staging:** Postgres real (Cloud SQL) com migrações via pipeline.
+
+##### Dataset mínimo (fixture)
+Todo teste de integração deve conseguir criar (ou reaproveitar) o conjunto mínimo:
+- 1 `property`
+- 1 `room_type`
+- `ari_days` preenchido para um range de datas (ex.: hoje+1 até hoje+14)
+- 1 `conversation` (quando necessário)
+- holds/reservations/payments conforme o cenário
+
+**Regra:** fixture deve ser pequena, mas suficiente para reproduzir concorrência (última unidade).
+
+---
+
+#### Suites e casos mínimos (MUST)
+
+##### A) Gates de qualidade (mapeamento direto para CI)
+Os gates abaixo são obrigatórios e devem falhar o CI quando não cumpridos.
+
+**G0 — Build & Startup (MUST)**
+- `python -m compileall -q src` (ou raiz)
+- build do container
+- app responde `/health`
+
+**G1 — Migrações e schema (MUST)**
+- migrações sobem em banco vazio
+- migrações rodam novamente sem erro (idempotente)
+- constraints críticas existem (verificação por SQL)
+
+**G2 — Segurança/PII (MUST)**
+- falha CI se existir `print(` em código de produção
+- falha CI se houver log de `payload/body/request.json/webhook` sem redação
+- falha CI se rotas `/internal/*` estiverem montadas no router público
+
+**G3 — Idempotência e retry (MUST para eventos e jobs)**
+- mesmo webhook/evento 2x → **1 efeito**
+- mesma task id 2x → **no-op**
+- mesma `Idempotency-Key` repetida → mesma resposta, sem duplicidade
+
+**G4 — Concorrência (MUST para inventário)**
+- teste concorrente na **última unidade**: 20 tentativas → 1 sucesso, 19 falhas limpas
+
+**G5 — Race Expire vs Convert (MUST para pagamentos)**
+- simular expire e convert competindo → sem inventário negativo e no máximo 1 reserva
+
+**G6 — Pricing determinístico (MUST quando existir pricing)**
+- golden tests (BPS/FIXED/PACKAGE) para impedir regressão
+
+> Observação: a lista completa dos gates está em `docs/operations/07_quality_gates.md`.
+
+---
+
+#### B) Testes de integração — transações críticas (Postgres)
+
+##### B1) CREATE HOLD (MUST)
+**O que provar**
+- `Idempotency-Key` é persistida em `idempotency_keys` (não é “de mentira”).
+- ARI atualiza com guarda no `WHERE` (não permite overbooking).
+- `hold_nights` é determinística (mesma ordem de noites).
+- Outbox grava `hold.created` na mesma transação.
+
+**Casos mínimos**
+1) **Sucesso**: inventário disponível → hold criado + `inv_held` incrementado.
+2) **Sem disponibilidade**: inventário insuficiente → rollback total (sem hold parcial).
+3) **Idempotência**: repetir request com mesma chave → mesma resposta, sem duplicar.
+4) **Concorrência (G4)**: 20 concorrentes na última unidade → 1 hold.
+
+##### B2) EXPIRE HOLD (MUST)
+**O que provar**
+- Dedupe por `processed_events(source='tasks', external_id=task_id)` ou equivalente.
+- `SELECT ... FOR UPDATE` no hold (evita double-free).
+- Libera ARI (`inv_held--`) e marca status `expired`.
+- Outbox grava `hold.expired`.
+
+**Casos mínimos**
+1) Expirar hold elegível → libera ARI e muda status.
+2) Repetir a mesma task → no-op (G3).
+3) Hold já cancelado/convertido → no-op.
+
+##### B3) CANCEL HOLD (MUST)
+**O que provar**
+- Mesmo desenho de expire: lock, liberar ARI, status `cancelled`.
+- Idempotência: cancelar 2x não “desconta duas vezes”.
+- Outbox `hold.cancelled`.
+
+##### B4) CONVERT HOLD (MUST)
+**O que provar**
+- Dedupe de evento Stripe em `processed_events(source='stripe', external_id=event_id)` (ou session id, conforme contrato).
+- Payment upsert com UNIQUE `(property_id, provider, provider_object_id)`.
+- Lock no hold; se hold não `active` → no-op.
+- Se expirado → não cria reserva; marca payment para operação.
+- Se ok → `inv_held--` e `inv_booked++` por noite (ordem fixa) + cria reserva UNIQUE por hold.
+- Outbox `payment.succeeded` e `reservation.confirmed`.
+
+**Casos mínimos**
+1) Convert sucesso → 1 reserva, inventário consistente.
+2) Replay do mesmo evento → no-op (G3).
+3) Race expire vs convert (G5) → no máximo 1 reserva e inventário nunca negativo.
+4) Pagamento após expiração → payment marcado para manual e **sem reserva**.
+
+---
+
+#### C) Testes de contrato — provedores (sem efeitos colaterais)
+
+##### C1) Stripe (MUST)
+**Objetivo:** garantir parsing e validações antes de enfileirar/rodar efeitos.
+- Assinatura inválida → rejeitar (4xx) sem side effect.
+- Evento válido mas tipo não suportado → 2xx ou no-op documentado (sem efeitos).
+- Evento duplicado → dedupe garante 1 efeito (coberto em G3/G5 via integração, mas aqui valida parsing).
+
+**Fixtures**
+- `checkout.session.completed` (ou evento adotado)
+- `payment_intent.succeeded` (se usado)
+- payloads com campos faltando (devem falhar limpo)
+
+##### C2) WhatsApp (MUST)
+**Objetivo:** adaptadores (Meta/Evolution) convertem para um **InboundMessage** interno único.
+- payload mínimo válido → gera InboundMessage
+- payload com campos ausentes → rejeita limpo
+- message_id repetido → dedupe é garantido no pipeline (G3), mas aqui validamos extração correta do ID
+
+---
+
+#### D) E2E (staging) — mínimo obrigatório
+
+##### D1) Fluxo MVP (MUST)
+**Roteiro**
+1) Inbound WhatsApp (mensagem controlada)
+2) Quote simples (read-only)
+3) Create hold
+4) Criar checkout session
+5) Receber webhook Stripe
+6) Convert hold → reservation confirmada
+7) Outbound confirmação
+
+**Provas obrigatórias**
+- 1 hold criado
+- 1 payment registrado
+- 1 reservation criada
+- Replays (mesma mensagem e mesmo webhook) não duplicam nada
+
+##### D2) Replay e recuperação (MUST)
+- Reprocessar webhook Stripe (replay) sem duplicidade
+- Reprocessar task de expire sem double-free
+- Reprocessar convert após falha transient (DB/timeout) com idempotência preservada
+
+---
+
+#### Segurança e privacidade (testes e lint)
+
+##### S1) PII/log hygiene (MUST)
+- CI falha ao detectar padrões proibidos (Gate G2).
+- Testes devem inspecionar logs em cenários críticos para garantir que **não** há payload raw.
+
+##### S2) Rotas internas (MUST)
+- Teste de introspecção garante que `/internal/*` não aparece no router público.
+
+---
+
+#### Como rodar (padrão recomendado)
+
+##### Local
+- Unit:
+  - `pytest -q tests/unit`
+- Integration (com Postgres):
+  - `docker compose up -d postgres` (ou serviço equivalente)
+  - `pytest -q tests/integration`
+- Contract:
+  - `pytest -q tests/contract`
+- Suite mínima (antes de abrir PR):
+  - `pytest -q tests/unit tests/integration -k "g3 or g4 or g5"`
+
+##### CI (ordem sugerida)
+1) G0 (compile/build/start)
+2) G1 (migrate + constraints)
+3) Unit tests
+4) Integration tests (incluindo G3–G5)
+5) Contract tests
+6) (Opcional) E2E em staging (manual/cron de pré-release)
+
+---
+
+#### Critérios de aceite por story (regra prática)
+- Story que toca **inventário/pagamento/transação crítica**: **G3–G5 obrigatórios**.
+- Story que toca **pricing**: **G6 obrigatório**.
+- Story qualquer: **G0–G2 obrigatórios**.
+
+---
+
+#### Checklist para adicionar um novo teste (rápido e consistente)
+1) Identificar se a mudança é: unit, integration, contract, e2e
+2) Se tocar “dinheiro/inventário”: escrever caso de replay (idempotência) + caso de concorrência/race quando aplicável
+3) Fixar tempo (ex.: usar clock controlado) e usar fixture mínima
+4) Garantir que logs não incluem payload/PII
+5) Amarrar ao gate correspondente (G3–G6) se aplicável
+
+---
+
+#### Troubleshooting (quando teste falha)
+- **Intermitência** geralmente indica falta de lock/ordem fixa de updates (ver guia de transações críticas).
+- **Duplicidade** normalmente indica ausência de UNIQUE/processed_events ou uso incorreto de idempotency_keys.
+- **Inventário negativo** indica double-free (expire/cancel/convert executando mais de uma vez sem proteção).
+- **Webhook “sumindo”** indica 2xx retornado cedo demais (ACK errado) — consertar para receipt durável + enqueue.
+
+---
+
+#### Não‑objetivos (por enquanto)
+- Testes de carga completos (k6/locust) antes do MVP rodar em staging.
+- Cobertura alta como meta em si (cobertura é consequência; gates são meta).
+- UI/admin (fora do escopo do V2 MVP inicial).
+
+### D.5 Observabilidade
+
+### Observability (Logs, Métricas, Tracing e Alertas)
+
+**Documento:** docs/operations/04_observability.md  
+**Objetivo:** garantir visibilidade operacional do Hotelly V2 (piloto e produção) com foco em **segurança**, **idempotência**, **concorrência** (anti-overbooking) e **tempo de resolução** (MTTR), sem vazamento de PII.
+
+> Regra de ouro: se não está medido/alertado, não existe. Se está logado com PII, é incidente.
+
+---
+
+#### 1. Escopo e prioridades
+
+##### 1.1 Prioridade do piloto
+A observabilidade do piloto deve cobrir:
+- **Fluxo de receita**: hold → payment → reservation.
+- **Confiabilidade de ingestão**: WhatsApp inbound + Stripe webhooks + Cloud Tasks.
+- **Integridade do inventário**: *overbooking = 0* e invariantes do ARI.
+- **Recuperabilidade**: reprocessamento e reconciliação com rastreabilidade (processed_events + outbox).
+
+##### 1.2 Fora de escopo (no piloto)
+- APM avançado com instrumentação profunda em todas as libs.
+- Análise de custo por requisição no detalhe (depois do piloto).
+- Tracing distribuído “perfeito” (deixar “bom o suficiente” primeiro).
+
+---
+
+#### 2. Princípios (não negociáveis)
+
+1) **Sem payload bruto em logs** (request body, webhook JSON, mensagens do WhatsApp).  
+2) **Sem PII** em logs/metrics/traces (telefone, nome, conteúdo de mensagem, e-mail).  
+3) **Logs estruturados (JSON)** sempre, com campos canônicos.  
+4) **Correlation ID end-to-end**: request → task → DB txn → outbound.  
+5) **Idempotência observável**: todo dedupe/no-op deve ser medido.  
+6) **Alertas acionáveis**: todo alerta deve ter runbook e owner.
+
+---
+
+#### 3. Identificadores e correlação
+
+##### 3.1 IDs canônicos (sempre que existirem)
+- `correlation_id` (string, obrigatório): gerado no primeiro contato (inbound) e propagado.
+- `request_id` (string): do Cloud Run (se disponível) ou gerado.
+- `property_id` (string): pousada/estabelecimento.
+- `conversation_id` (string)
+- `hold_id` (string)
+- `payment_id` (string) e `provider_object_id` (Stripe checkout.session.id)
+- `reservation_id` (string)
+- `idempotency_key` (string) + `idempotency_scope` (string)
+- `event_source` (enum): `whatsapp_meta`, `whatsapp_evolution`, `stripe`, `tasks`, `admin`, `system`
+- `external_id` (string): message_id / stripe_event_id / task_id
+
+##### 3.2 Propagação obrigatória
+- Inbound HTTP: se houver header `X-Correlation-Id`, validar e reutilizar; senão gerar.
+- Cloud Tasks: setar `X-Correlation-Id` e `X-Event-Source=tasks` na task.
+- Stripe webhooks: correlacionar via `metadata` (hold_id/property_id/conversation_id) e registrar `stripe_event_id` como `external_id`.
+
+---
+
+#### 4. Logs
+
+##### 4.1 Formato
+- **JSON por linha** (structured logging).
+- Campos mínimos em *todas* as linhas:
+  - `severity` (DEBUG/INFO/WARNING/ERROR)
+  - `timestamp` (ISO8601)
+  - `service` (ex.: `api`, `worker`)
+  - `env` (`dev|staging|prod`)
+  - `correlation_id`
+  - `event_name` (ver catálogo abaixo)
+  - `property_id` (quando aplicável)
+  - `duration_ms` (quando aplicável)
+  - `status` (`success|no_op|failed|retrying`)
+  - `error_code` (quando falha; enum)
+  - `error_class` (ex.: `ValidationError`, `DBError`, `StripeError`)
+
+##### 4.2 Catálogo mínimo de eventos (pilot)
+**Ingressos**
+- `whatsapp.inbound.received`
+- `stripe.webhook.received`
+- `tasks.received`
+
+**Dedupe / idempotência**
+- `dedupe.hit` (no-op por processed_events)
+- `idempotency.hit` (no-op por idempotency_keys)
+- `outbox.appended`
+
+**Transações críticas**
+- `hold.create.started` / `hold.create.committed` / `hold.create.rejected` (inventory guard)
+- `hold.expire.started` / `hold.expire.committed` / `hold.expire.no_op`
+- `hold.cancel.started` / `hold.cancel.committed` / `hold.cancel.no_op`
+- `hold.convert.started` / `hold.convert.committed` / `hold.convert.no_op` / `hold.convert.expired`
+
+**Pagamentos / reservas**
+- `payment.upserted`
+- `reservation.created`
+
+**Outbound**
+- `whatsapp.outbound.sent`
+- `whatsapp.outbound.retry`
+- `whatsapp.outbound.failed`
+
+##### 4.3 Redação (redaction)
+Campos proibidos em logs:
+- conteúdo de mensagem
+- números de telefone
+- emails
+- payload completo de webhooks
+- nomes de hóspedes
+
+Se precisar depurar, usar:
+- **hash** (ex.: `phone_hash`)
+- **prefixo parcial** (ex.: últimos 4 dígitos, se aprovado)
+- **tamanho do payload** (`payload_bytes`)
+- **lista de chaves** (`payload_keys`)
+
+##### 4.4 Níveis e volume
+- INFO: fluxo normal e eventos de domínio (1 linha por etapa).
+- WARNING: retries, no-op inesperado, degradação.
+- ERROR: falha de transação, inconsistência, exceções.
+- DEBUG: somente em dev/staging (bloquear em prod por padrão).
+
+---
+
+#### 5. Métricas
+
+##### 5.1 Convenções
+- Nome em `snake_case`.
+- Labels (cuidado com cardinalidade):
+  - permitido: `env`, `service`, `event_source`, `provider`, `status`, `error_code`
+  - proibido: `phone`, `message_id`, `hold_id` (alta cardinalidade)
+
+##### 5.2 RED (API e Workers)
+**API**
+- `http_requests_total{route,method,status}`
+- `http_request_duration_ms_bucket{route,method}`
+
+**Workers/Tasks**
+- `tasks_processed_total{queue,status}`
+- `tasks_duration_ms_bucket{queue}`
+
+##### 5.3 Domínio (o que importa)
+**Holds**
+- `holds_created_total`
+- `holds_expired_total`
+- `holds_cancelled_total`
+- `holds_converted_total`
+- `holds_active_gauge` (por property_id só se cardinalidade controlada; caso contrário global)
+
+**Inventário**
+- `inventory_guard_rejections_total` (quando o `WHERE` falha)
+- `inventory_invariant_violations_total` (detectado por checks/reconcile)
+
+**Pagamentos/Reservas**
+- `payments_received_total{provider}`
+- `payments_succeeded_total{provider}`
+- `payments_late_total{provider}` (pagou após expirar)
+- `reservations_created_total`
+
+**Idempotência / Dedupe**
+- `processed_events_dedupe_hits_total{source}`
+- `idempotency_hits_total{scope}`
+
+**Outbox**
+- `outbox_events_appended_total{event_type}`
+- `outbox_lag_seconds` (tempo do evento mais antigo não processado, se houver consumidor)
+  - No piloto, se não houver consumidor, registrar apenas appended.
+
+##### 5.4 SLOs recomendados (pilot)
+Alinhar ao `docs/strategy/06_success_metrics.md`. Sugestão inicial:
+- **Overbooking**: 0 (SLO absoluto; qualquer violação = incidente).
+- **Webhook Stripe**: 99% ACK < 2s; erro 5xx < 0.5%.
+- **Tasks**: backlog < 1 min (p95) em horário comercial do piloto.
+- **Conversão hold→reserva**: p50 < 2 min em sandbox (depende do pagamento humano).
+
+---
+
+#### 6. Tracing
+
+##### 6.1 Objetivo mínimo
+Não é “full tracing”. É:
+- rastrear **um fluxo** do início ao fim pelo `correlation_id`
+- medir **latência** por etapa
+- identificar **pontos de falha** (DB, Stripe, WhatsApp)
+
+##### 6.2 Implementação recomendada (GCP)
+- Cloud Run + Cloud Logging já permite correlacionar por `trace` quando configurado.
+- Se usar OpenTelemetry, manter **mínimo**:
+  - spans: `inbound`, `db_txn`, `task_enqueue`, `outbound`
+  - atributos: `correlation_id`, `event_source`, `status`, `error_code`
+
+##### 6.3 Anti-padrões
+- colocar payload no span
+- tags de alta cardinalidade (IDs únicos por evento) em prod
+
+---
+
+#### 7. Dashboards (Cloud Monitoring)
+
+##### 7.1 Dashboard “Piloto — Funil”
+- Inbound WhatsApp (volume, erro)
+- Holds created / converted / expired (por janela)
+- Payments succeeded
+- Reservations created
+- Conversion rate (holds_converted_total / holds_created_total)
+
+##### 7.2 Dashboard “Confiabilidade”
+- Stripe webhook 2xx/5xx
+- Tasks processed, retries, backlog
+- Error rate por `error_code`
+- Latência p50/p95 API e worker
+
+##### 7.3 Dashboard “Integridade”
+- inventory_guard_rejections_total (esperado em alta demanda)
+- inventory_invariant_violations_total (**deve ser 0**)
+- payments_late_total
+- holds_active_gauge (tendência)
+
+---
+
+#### 8. Alertas (com severidade e ação)
+
+##### 8.1 Stop-ship (SEV-1)
+Dispara e exige ação imediata:
+1) `inventory_invariant_violations_total > 0` (janela 5m)
+2) `reservations_created_total` aumenta sem `payments_succeeded_total` correspondente (janela 15m) *quando o fluxo exigir pagamento prévio*
+3) Stripe webhook 5xx sustentado > 2% por 10m
+4) Tasks backlog > 10m por 15m (fila crítica)
+
+**Obrigatório:** linkar para o `docs/operations/05_runbook.md` (procedimentos) e registrar incidente.
+
+##### 8.2 Operacional (SEV-2/SEV-3)
+- `payments_late_total` > limiar (ex.: 3/dia)
+- `holds_active_gauge` crescendo sem conversão (sugere falha de outbound ou UX)
+- `whatsapp.outbound.failed` acima de limiar
+
+##### 8.3 Observações práticas
+- Cada alerta tem:
+  - sintoma
+  - hipótese provável
+  - passo 1–3 (rápido)
+  - queries SQL de confirmação
+  - ação de mitigação (reprocess/expire/retry)
+
+---
+
+#### 9. Pontos de instrumentação (checklist por componente)
+
+##### 9.1 Webhook WhatsApp (inbound)
+- Log: `whatsapp.inbound.received` com `external_id`, `event_source`, `payload_bytes`
+- Métrica: `http_requests_total` + `processed_events_dedupe_hits_total{source=whatsapp_*}`
+- Task: log `tasks.enqueued` com queue e attempt = 0
+
+##### 9.2 Webhook Stripe
+- Log: `stripe.webhook.received` com `stripe_event_id`
+- Receipt durável: `dedupe.hit` / `processed_events.inserted`
+- Métrica: 2xx/5xx, latência, dedupe hits
+
+##### 9.3 Transações críticas (DB)
+Para cada transação:
+- Log started + committed + (failed/no_op)
+- `duration_ms` obrigatório
+- Métrica de sucesso/falha e `error_code`
+
+Erros com `error_code` padronizado:
+- `INVENTORY_GUARD_FAILED`
+- `HOLD_NOT_ACTIVE`
+- `HOLD_EXPIRED`
+- `PROCESSED_EVENT_DUPLICATE`
+- `IDEMPOTENCY_KEY_REPLAY`
+- `DB_SERIALIZATION_FAILURE`
+- `DB_DEADLOCK_DETECTED`
+- `STRIPE_SIGNATURE_INVALID`
+- `WHATSAPP_PROVIDER_ERROR`
+
+##### 9.4 Outbound WhatsApp
+- Log: sent/retry/failed
+- Métrica: retries e falhas por provider
+
+---
+
+#### 10. Segurança e compliance (operacional)
+
+##### 10.1 Redução de risco de PII
+- Regex/linters de CI (gate) para `print(` e padrões de logging proibidos.
+- Revisão obrigatória em alterações de logging em endpoints externos.
+- Retenção de logs em prod: definir janela compatível com piloto (curta) e ampliar depois.
+
+##### 10.2 Segredos
+- Nunca logar:
+  - tokens WhatsApp
+  - Stripe secrets
+  - connection strings
+- Se houver exceção, substituir por `***`.
+
+---
+
+#### 11. Apêndice A — Dicionário de campos de log
+
+| Campo | Tipo | Obrigatório | Observação |
+|---|---:|---:|---|
+| correlation_id | string | sim | propagado por headers/tasks |
+| event_name | string | sim | catálogo do item 4.2 |
+| event_source | string | sim | whatsapp/stripe/tasks/... |
+| external_id | string | não | message_id / stripe_event_id / task_id |
+| property_id | string | não | evitar alta cardinalidade em métricas, ok em log |
+| hold_id/payment_id/reservation_id | string | não | apenas em log/tracing, não em métrica |
+| duration_ms | int | não | obrigatório em transações |
+| status | string | sim | success/no_op/failed/retrying |
+| error_code | string | não | enum padronizado |
+| payload_bytes | int | não | sempre preferir isso ao payload |
+
+---
+
+#### 12. Apêndice B — Conjunto mínimo de alertas do piloto (checklist)
+- [ ] Overbooking/invariante de inventário (SEV-1)
+- [ ] Stripe webhook 5xx sustentado (SEV-1)
+- [ ] Tasks backlog crítico (SEV-1)
+- [ ] Payments late acima do limiar (SEV-2)
+- [ ] Falha de outbound WhatsApp (SEV-2)
+- [ ] Aumento de errors por `DB_SERIALIZATION_FAILURE` (SEV-2)
+
+---
+
+#### 13. Referências internas
+- docs/strategy/06_success_metrics.md
+- docs/operations/07_quality_gates.md
+- docs/operations/05_runbook.md
+- docs/data/01_sql_schema_core.sql
+
+### D.6 Runbook
+
+### Runbook — Hotelly V2 (Operações)
+
+> Documento operacional. Objetivo: manter o sistema funcional no piloto, com **zero overbooking**, **idempotência real**, e **resposta rápida a incidentes**.
+
+#### 1. Escopo
+
+#### Estado atual do repo (importante)
+No momento, o serviço FastAPI expõe apenas `/health` e ainda não possui rotas implementadas para:
+- `/webhooks/*`
+- `/tasks/*`
+
+Portanto, qualquer passo que mencione "reenfileirar task", "chamar handler /tasks/..." ou "endpoint interno"
+deve ser tratado como **TARGET** até que as rotas/infra de Cloud Tasks estejam implementadas.
+
+Este runbook cobre:
+
+- Incidentes em **inventário/ARI**, **holds**, **pagamentos/Stripe**, **WhatsApp**, **Cloud Tasks**, **Cloud Run**, **Cloud SQL**.
+- Rotinas operacionais (diárias/semanais) e ações de mitigação.
+- Procedimentos de reprocessamento e reconciliação, priorizando **segurança transacional** e **não duplicidade**.
+
+Fora de escopo: suporte ao cliente final (mensagens de atendimento), melhorias de produto, otimizações não urgentes.
+
+---
+
+#### 2. Princípios (não negociáveis)
+
+1) **Overbooking = SEV0.** Se houver qualquer evidência de inventário negativo, reserva duplicada, ou `inv_booked` incoerente: parar tudo e conter.
+2) **Webhook não pode “mentir”.** Não retornar 2xx se não houve receipt durável (dedupe/outbox/task).
+3) **Idempotência sempre.** Reprocessar só quando os dedupes estão em vigor (`processed_events`, `idempotency_keys`, uniques).
+4) **Sem PII em logs.** Não logar payload bruto (WhatsApp/Stripe) nem texto de usuário.
+5) **Mudança em produção só com rastreabilidade.** Toda correção deve virar commit/migração/registro.
+
+---
+
+#### 3. Definições rápidas
+
+- **correlation_id**: identificador para amarrar logs de webhook → task → transação.
+- **property_id**: pousada.
+- **hold_id**: bloqueio de inventário temporário.
+- **provider_object_id**: id externo do provedor (Stripe `checkout.session.id`, evento do Stripe, message_id do WhatsApp).
+- **processed_events**: dedupe de eventos externos/Tasks.
+- **idempotency_keys**: dedupe de chamadas internas por chave.
+- **outbox_events**: eventos append-only emitidos na mesma transação (rastreabilidade e reprocessamento).
+
+---
+
+#### 4. Severidade e resposta
+
+##### SEV0 (stop-ship)
+- Overbooking confirmado ou inventário negativo
+- Reserva duplicada (mesmo hold ou mesmo pagamento)
+- Stripe confirmado mas sistema “perde” reserva (sem trilha de reprocess)
+- Vazamento de PII em logs
+- Endpoint interno exposto publicamente
+
+**Ação imediata (SEV0):**
+1) **Conter**: pausar entrada (desabilitar webhook WhatsApp e/ou Stripe temporariamente ou apontar para “maintenance”).
+2) **Preservar evidência**: capturar logs e métricas do intervalo.
+3) **Mitigar**: corrigir o estado (com transação segura) e só então retomar.
+4) **Postmortem curto**: causa raiz + fix definitivo.
+
+##### SEV1
+- Backlog grande de tasks, erros 5xx sustentados, falha de webhook com retries sem convergir
+- Holds presos aumentando (stuck holds) sem liberar inventário
+
+##### SEV2
+- Erros intermitentes, degradação de latência, alertas de custo/DB
+
+---
+
+#### 5. Checklist de triagem (primeiros 10 minutos)
+
+1) **O que disparou?** (alerta, reclamação, dashboard)
+2) **Impacto:** quantos properties afetados? inventário/pagamento?
+3) **Último deploy:** houve revisão nova no Cloud Run?
+4) **Cloud Tasks:** fila acumulando? quantas falhas/retries?
+5) **Cloud SQL:** conexões saturadas? CPU/IO alto?
+6) **Stripe/WhatsApp:** falha de assinatura, 5xx no endpoint, timeout?
+7) **Correlacionar:** pegue um `correlation_id` (ou `hold_id`/`payment_id`) e siga o rastro.
+
+---
+
+#### 6. Ferramentas e comandos (referência)
+
+> Ajuste nomes de projeto/serviço/filas conforme seu `gcloud config` e padrões do repo.
+
+##### 6.1 Cloud Run
+- Listar revisões / verificar status:
+  - `gcloud run services describe <SERVICE> --region us-central1`
+  - `gcloud run revisions list --service <SERVICE> --region us-central1`
+- Rollback rápido (apontar tráfego para revisão anterior):
+  - `gcloud run services update-traffic <SERVICE> --region us-central1 --to-revisions <REVISION>=100`
+
+##### 6.2 Logs (Cloud Logging)
+- Filtrar por severity e correlation_id:
+  - Ex.: `resource.type="cloud_run_revision" AND jsonPayload.correlation_id="<ID>"`
+
+##### 6.3 Cloud Tasks
+- Ver filas:
+  - `gcloud tasks queues list --location us-central1`
+- Tamanho/estatísticas:
+  - `gcloud tasks queues describe <QUEUE> --location us-central1`
+
+##### 6.4 Cloud SQL
+- Conectar (para diagnóstico):
+  - `gcloud sql connect <INSTANCE> --user=<USER> --database=<DB>`
+- Ver instância:
+  - `gcloud sql instances describe <INSTANCE>`
+
+---
+
+#### 7. Playbooks (por sintoma)
+
+##### 7.1 Pagamento confirmado no Stripe, mas sem reserva (payments_without_reservation)
+
+**Sintomas:**
+- Cliente pagou, mas não recebeu confirmação.
+- Registro de payment existe, reservation não.
+
+**Causas comuns:**
+- Webhook recebido mas task não foi enfileirada.
+- Task falhou e ficou em retry.
+- Convert falhou por hold expirado; sistema marcou para manual.
+
+**Passos:**
+1) Confirmar no Stripe o `checkout.session.id` e o evento associado.
+2) Buscar `processed_events`:
+   - Se **não existe**: falha de receipt (SEV1/SEV0 dependendo do volume).
+3) Rodar SQL de diagnóstico (repo):
+   - `docs/operations/sql/payments_without_reservation.sql`
+4) Determinar a ação:
+   - Se hold ainda **active** e dentro do prazo: **TARGET** — reprocessar convert via fila/endpoint interno quando `/tasks/*` existir.
+   - Se hold **expired**: não criar reserva automaticamente. Aplicar política “pagamento após expiração” (manual/reacomodação/reembolso).
+
+**Mitigação rápida:**
+- **TARGET** — reenfileirar convert para um payment/hold específico (sempre idempotente) quando tasks existirem.
+- Se falha recorrente: pausar webhook Stripe e corrigir receipt.
+
+---
+
+##### 7.2 Holds presos (active com expires_at no passado)
+
+**Sintomas:**
+- `holds.active` crescendo.
+- Inventário “some” (inv_held alto) sem conversão.
+
+**Passos:**
+1) Verificar backlog/falhas da fila de expire.
+2) Rodar SQL:
+   - `docs/operations/sql/find_stuck_holds.sql`
+3) Para cada hold:
+   - Confirmar que está `active` e `expires_at < now()`.
+   - **TARGET** — enfileirar task de expire para o hold (quando tasks existirem).
+4) Se tasks estiverem quebradas:
+   - Executar um job manual de expire em lote (controlado, com limite) usando o mesmo código do worker.
+5) Validar ARI pós-expiração.
+
+**Mitigação:**
+- Se a fila de expire estiver parada: reiniciar worker / revisar permissões / ajustar rate.
+
+---
+
+##### 7.3 Falha de webhook Stripe (assinatura/5xx/timeouts)
+
+**Sintomas:**
+- Stripe mostra webhooks falhando e re-tentando.
+- Aumenta “payment sem reservation”.
+
+**Passos:**
+1) Verificar se o secret de webhook no Secret Manager bate com o configurado no Stripe.
+2) Checar logs do endpoint:
+   - Erro de assinatura (400) → secret errado / payload alterado.
+   - 5xx → erro interno (corrigir e deixar Stripe re-tentar).
+3) Confirmar “receipt durável”:
+   - Em sucesso, deve existir `processed_events` e/ou task enfileirada.
+4) Se houver risco de duplicidade:
+   - Garantir UNIQUEs e dedupe antes de reprocessar/replay.
+
+**Mitigação:**
+- Se instabilidade do serviço: rollback para revisão anterior.
+- Se secret errado: corrigir secret e reprocessar eventos pendentes.
+
+---
+
+##### 7.4 Falha WhatsApp inbound (mensagens não chegam / duplicam / fora de ordem)
+
+**Sintomas:**
+- Queda repentina de conversas novas.
+- Duplicidade de mensagens gerando múltiplas ações.
+
+**Passos:**
+1) Verificar status do provedor (Meta/Evolution) e logs de webhook.
+2) Confirmar dedupe:
+   - message_id deve virar `processed_events(source='whatsapp', external_id=message_id)`.
+3) Se duplicidade estiver passando:
+   - Contenção: pausar inbound (responder 503) temporariamente.
+   - Validar se UNIQUE de processed_events está aplicado.
+4) Se message_id ausente/inconsistente no provedor:
+   - Aplicar fallback determinístico (ex.: hash de campos + timestamp arredondado) **apenas como mitigação** e registrar issue.
+
+---
+
+##### 7.5 Inventário inconsistente (ARI divergente de holds/reservations)
+
+**Sintomas:**
+- `inv_held` ou `inv_booked` não bate com fatos.
+- Overbooking ou disponibilidade errada no quote.
+
+**Ação:** tratar como SEV0 se houver overbooking.
+
+**Passos:**
+1) Rodar reconciliação:
+   - `docs/operations/sql/reconcile_ari_vs_holds.sql`
+2) Congelar mutações (se necessário):
+   - pausar create_hold e convert temporariamente.
+3) Identificar causa:
+   - transação parcialmente aplicada (não deveria acontecer se atomicidade correta)
+   - correção manual anterior sem rastreio
+   - bug em expire/cancel/convert (ordem/WHERE/locks)
+4) Corrigir estado:
+   - Preferir re-execução idempotente de transação (expire/cancel/convert).
+   - Ajuste direto em ARI só como último recurso, com registro e validação.
+5) Validar:
+   - `inv_total >= inv_booked + inv_held` em todas as noites afetadas
+   - sem valores negativos
+6) Postmortem: criar bug/patch com teste que reproduz.
+
+---
+
+##### 7.6 Backlog alto de Cloud Tasks (fila não escoa)
+
+**Sintomas:**
+- `queue_depth` cresce.
+- Latência de confirmação aumenta.
+
+**Passos:**
+1) Ver taxa de erro do worker e logs de failures.
+2) Verificar limites:
+   - rate, max concurrent dispatches, max attempts.
+3) Verificar Cloud Run:
+   - instâncias suficientes? CPU/mem? timeouts?
+4) Mitigação:
+   - aumentar capacidade (scale) temporariamente
+   - reduzir trabalho no handler (sempre enfileirar e fazer pesado no worker)
+5) Se há poison messages:
+   - identificar padrão de falha, corrigir código, reprocessar.
+
+---
+
+##### 7.7 Cloud SQL saturado (conexões/CPU/IO)
+
+**Sintomas:**
+- Erros de conexão/pool.
+- Lentidão generalizada.
+
+**Passos:**
+1) Checar métricas da instância (CPU, connections, disk IO).
+2) Checar pool do app (limites de conexões por instância).
+3) Mitigação:
+   - reduzir concorrência (Cloud Run max instances / tasks rate)
+   - ajustar pool (menor) + aumentar instância do Cloud SQL se necessário
+   - rollback se começou após deploy
+4) Longo prazo:
+   - índices faltando; queries sem filtro; N+1; falta de batch.
+
+---
+
+#### 8. Reprocessamento seguro (reprocess_candidates)
+
+**Quando usar:**
+- Após correção de bug (receipt/task) para “pegar” eventos perdidos.
+
+**Passos:**
+1) Rodar:
+   - `docs/operations/sql/reprocess_candidates.sql`
+2) Reenfileirar em lotes pequenos (ex.: 50 por vez), monitorando erro/latência.
+3) Validar dedupe:
+   - nenhum efeito deve duplicar reserva/payment/hold.
+
+---
+
+#### 9. Rotinas operacionais
+
+##### Diário (piloto)
+- Ver `payments_without_reservation` (deve ser ~0)
+- Ver `stuck_holds` (deve ser ~0)
+- Ver backlog de tasks (deve voltar a ~0 após picos)
+- Ver taxa de erro 5xx do webhook Stripe/WhatsApp
+- Amostra de logs para garantir ausência de PII
+
+##### Semanal
+- Revisar métricas do funil (WhatsApp → reserva)
+- Revisar custo (Cloud Run/Tasks/SQL)
+- Revisar índices e queries lentas
+- Exercitar rollback (simulado) e reprocess em staging
+
+---
+
+#### 10. Pós-incidente (sempre)
+
+1) Linha do tempo (deploys, alertas, impacto).
+2) Causa raiz (técnica e de processo).
+3) Ação corretiva:
+   - patch + teste que falhava antes
+   - ajuste em gate/alerta/runbook
+4) Ação preventiva:
+   - reduzir complexidade, eliminar caminho duplicado, endurecer constraints
+
+---
+
+#### Apêndice A — Artefatos úteis no repo
+
+- SQL de operação:
+  - `docs/operations/sql/reconcile_ari_vs_holds.sql`
+  - `docs/operations/sql/find_stuck_holds.sql`
+  - `docs/operations/sql/payments_without_reservation.sql`
+  - `docs/operations/sql/reprocess_candidates.sql`
+
+- Documentos relacionados:
+  - `docs/strategy/06_success_metrics.md`
+  - `docs/operations/04_observability.md`
+  - `docs/operations/03_test_plan.md`
+
+### D.7 Retenção/limpeza
+
+### Política de Retenção e Limpeza (MVP/Piloto)
+
+#### Objetivo
+
+Evitar crescimento indefinido de tabelas e manter custo/performance estáveis no piloto.
+
+**Regra:** nada de PII em tabelas operacionais (ver `docs/domain/04_message_persistence.md`).
+
+#### Diretrizes
+
+- Preferir retenções simples (dias) e limpeza periódica.
+- Limpeza deve ser **idempotente** e segura.
+- Execução recomendada: **Cloud Scheduler + Cloud Run Job** (ou worker interno).
+
+#### Retenção por tabela (MVP)
+
+##### `processed_events`
+- **Retenção:** 90 dias
+- **Motivo:** dedupe de retries e auditoria operacional curta
+- **Query:**
 ```sql
--- Apaga refs de contato do WhatsApp para uma property (staging).
--- Isso remove ciphertext antigo (incompatível) e força regravação no próximo inbound.
-delete from contact_refs
-where property_id = 'pousada-staging'
-  and channel = 'whatsapp';
+DELETE FROM processed_events
+WHERE processed_at < now() - interval '90 days';
 ```
 
-### Opção B — Limpar somente refs expiradas (menos agressivo)
-
+##### `outbox_events`
+- **Retenção:** 180 dias (piloto)
+- **Motivo:** métricas e auditoria leve
+- **Query:**
 ```sql
--- Útil se você suspeita que só parte está “podre” e quer reduzir impacto.
-delete from contact_refs
-where property_id = 'pousada-staging'
-  and channel = 'whatsapp'
-  and expires_at <= now();
+DELETE FROM outbox_events
+WHERE occurred_at < now() - interval '180 days';
 ```
 
-### Verificação (antes/depois)
-
+##### `idempotency_keys`
+- **Retenção:** 30 dias (se `expires_at` preenchido) ou 30 dias por `created_at`
+- **Query (preferida):**
 ```sql
-select count(*) as contact_refs_count
-from contact_refs
-where property_id = 'pousada-staging'
-  and channel = 'whatsapp';
+DELETE FROM idempotency_keys
+WHERE expires_at IS NOT NULL
+  AND expires_at < now();
+```
+**Fallback:**
+```sql
+DELETE FROM idempotency_keys
+WHERE created_at < now() - interval '30 days';
 ```
 
-**Impacto esperado**
+##### `payments`
+- **Retenção:** manter (entidade de negócio)
 
-* Após limpar, `send-response` pode retornar `contact_ref_not_found` até chegar **novo inbound** (que recria o `contact_ref` com a chave correta).
-* No próximo inbound válido, o `store_contact_ref` vai repopular `contact_refs` e o decrypt volta a funcionar.
+##### `holds`
+- **Retenção:** manter (entidade de negócio)
+- Obs: status `expired` pode ser filtrado por período em queries; não deletar no MVP.
 
-**Observação**
+##### `reservations`
+- **Retenção:** manter (entidade de negócio)
 
-* A limpeza não expõe PII; só remove ciphertext e metadados de referência.
+#### Frequência recomendada
 
+- **Diária** (madrugada) para `processed_events`, `outbox_events`, `idempotency_keys`.
 
----
+#### Observabilidade mínima
 
-### ✅ FASE 17: Configurações
-- Endpoint de políticas (criança, cancelamento)
-- UI de configuração da property
+- Emitir log por tabela: contagem deletada por execução.
+- Nunca logar payload de registros.
 
-### Atualização — 2026-02-09 — S17 Políticas (crianças + cancelamento)
+#### Segurança
 
-**Fonte da verdade (DB)**
+- Job/worker deve operar com credenciais mínimas.
+- Queries devem ser executadas em transação curta.
 
-* **Crianças:** `property_child_age_buckets` (migration `011`). 3 buckets cobrindo **0..17** sem gap/overlap.
-* **Cancelamento:** `property_cancellation_policy` (migration `fe5db8079aad`). 1 linha por `property_id`.
+## Apêndice E — WhatsApp Outbound: Retry & Idempotência (AS-IS audit — 2026-02-08)
 
-**Endpoints (dashboard)**
+> **Escopo:** retrato do que está no código (AS-IS), para registrar evidência e apontar deltas contra o contrato normativo do Doc Unificado.  
+> **Repo:** `hotelly-v2`  
+> **Data do audit:** 2026-02-08
 
-* **GET `/child-policies?property_id=...`** (RBAC: `viewer`)
-  Retorna os 3 buckets. Se não existir configuração, retorna default **sem persistir**:
+### E.1 Semântica HTTP atual em falhas (impacto direto em Cloud Tasks retry)
 
-  * bucket 1: 0..3
-  * bucket 2: 4..12
-  * bucket 3: 13..17
+No código atual, existem **dois** handlers relacionados a envio:
 
-* **PUT `/child-policies?property_id=...`** (RBAC: `staff`)
-  Body: `{ "buckets": [{bucket,min_age,max_age} x3] }`
-  Valida cobertura 0..17 sem gap/overlap e substitui (delete+insert) transacionalmente.
+- `POST /tasks/whatsapp/send-response` (`send_response`)
+- `POST /tasks/whatsapp/send-message` (`send_message`, legacy/manual)
 
-* **GET `/cancellation-policy?property_id=...`** (RBAC: `viewer`)
-  Retorna a policy. Se não existir configuração, retorna default **sem persistir**:
+**Fato (AS-IS):** `send-response` retorna **HTTP 200** em falhas relevantes e, portanto, **mata retry do Cloud Tasks** (Cloud Tasks não retry em 2xx).
 
-  ```json
-  {
-    "policy_type": "flexible",
-    "free_until_days_before_checkin": 7,
-    "penalty_percent": 100,
-    "notes": null
-  }
-  ```
+Casos levantados no audit:
+- `contact_ref` ausente/expirado → **200** `{"ok": false, "error": "contact_ref_not_found"}`
+- falha do provider (Evolution 401/403/5xx/timeout/rede, RuntimeError etc.) → **200** `{"ok": false, "error": "send_failed"}`
 
-* **PUT `/cancellation-policy?property_id=...`** (RBAC: `staff`)
-  Body:
+**Fato (AS-IS):** `send-message` retorna **não-2xx** em falhas equivalentes, portanto **habilita retry**:
+- `contact_ref` ausente → **404**
+- falha do provider → **500**
 
-  ```json
-  {
-    "policy_type": "free|flexible|non_refundable",
-    "free_until_days_before_checkin": 0,
-    "penalty_percent": 0,
-    "notes": "texto opcional"
-  }
-  ```
+### E.2 Provider Evolution: retry interno limitado
 
-  Validações (400 em inválido):
+No outbound Evolution, o código faz retry interno **no máximo 1 vez** (MAX_RETRIES = 1) apenas para:
+- **5xx**
+- **timeout/rede**
 
-  * `free`: `penalty_percent = 0`, `free_until_days_before_checkin` 0..365
-  * `non_refundable`: `penalty_percent = 100` **e** `free_until_days_before_checkin = 0`
-  * `flexible`: `penalty_percent` 1..100 **e** `free_until_days_before_checkin` 0..365
-    Persistência: upsert (INSERT … ON CONFLICT(property_id) DO UPDATE).
+E não faz retry para:
+- **401/403 (4xx)** → falha imediata (raise)
 
-**Tabela `property_cancellation_policy`**
+### E.3 Dedupe / idempotência durável no outbound (o que não existe hoje)
 
-* `property_id TEXT PK FK properties(id) ON DELETE CASCADE`
-* `policy_type TEXT CHECK IN ('free','flexible','non_refundable')`
-* `free_until_days_before_checkin SMALLINT CHECK 0..365`
-* `penalty_percent SMALLINT CHECK 0..100`
-* `notes TEXT NULL`
-* `updated_at TIMESTAMPTZ DEFAULT now()`
-* CHECK de consistência por tipo (free/non_refundable/flexible) conforme regras acima.
+Levantamento do audit (AS-IS):
+- `outbox_events` não tem `status`, `sent_at`, `attempt_count`, `last_error` e **não é atualizado** pós-envio.
+- `processed_events` **não** é escrito no outbound send (não há receipt/dedupe de entrega por `outbox_event_id`).
+- Request para Evolution **não** carrega idempotency key (nem header, nem campo no payload): vai apenas `number`, `text`, `apikey`.
 
-**Admin (`hotelly-admin`)**
+### E.4 Delta contra o contrato normativo do Doc Unificado
 
-* Nova página: `/p/[propertyId]/settings` com duas seções (Crianças + Cancelamento).
-* Proxies:
+O Doc Unificado define semântica para `send-response` onde:
+- **falha transiente** → **5xx** (para permitir retry do Cloud Tasks)
+- **falha permanente** → **200** com `terminal=true`
 
-  * `/api/p/[propertyId]/child-policies` → backend `/child-policies?property_id=...`
-  * `/api/p/[propertyId]/cancellation-policy` → backend `/cancellation-policy?property_id=...`
-* Nav: item “Configurações” no `PropertyHeader`.
+**Estado AS-IS:** `send-response` não segue isso (200 em erro transiente).  
+**Risco:** perda silenciosa de entrega outbound quando houver instabilidade (sem retry).
 
 ---
 
-## Próximo Passo
+## Apêndice F — WhatsApp: Staging/Infra (AS-IS audit — 2026-02-08)
 
-### ✅ FASE 18: Edição em Lote de Rates
-- Bulk edit: selecionar múltiplas datas
-- Copiar rates de um período para outro
-- Aplicar ajuste percentual
----
+> **Escopo:** evidência do que está configurado (ou faltando) em staging e no código.  
+> **Data do audit:** 2026-02-08
 
-Correção crítica no save do RatesGrid: payload de PUT /rates agora faz merge com o RateDay “base” vindo do GET (não reconstrói com defaults), evitando zerar min_nights/flags/buckets quando o usuário edita só preço.
+### F.1 Contrato real de env vars (Evolution outbound) no código
 
-Room types com nome via GET /occupancy (janela 1 dia) para montar {room_type_id,name} (não via /rooms).
+Env vars **obrigatórias** lidas pelo código para Evolution:
+- `EVOLUTION_BASE_URL`
+- `EVOLUTION_INSTANCE`
+- `EVOLUTION_API_KEY`
 
-Seleção multi-data no header (toggle + shift-range), com highlight em todas as tabelas e filtragem da seleção para datas visíveis.
+Env var **opcional**:
+- `EVOLUTION_SEND_PATH` (default: `"/message/sendText/{instance}"`)
 
-Modal de bulk edit: set value (R$) por pax; ajuste percentual com regra “vazio permanece vazio” e toggle “criar quando vazio” (vazio→0).
+### F.2 Precedência provider vs credenciais (importante)
 
-Copiar período: limita a ≤366 dias, copia somente dias existentes do source e persiste com PUT; faz refresh após concluir.
+- O **provider** (Meta vs Evolution) é escolhido por **property** via DB (`properties.whatsapp_config` JSONB, campo `outbound_provider`, default `"evolution"`).
+- As **credenciais/endpoint Evolution** são **env-only globais** (`EVOLUTION_*`) — não há override por property no DB.
 
-Se você registrar também a nota de infra (fora do escopo da S18): CI do backend foi ajustado para alembic upgrade heads por “multiple heads” e isso vira follow-up de merge revision.
+### F.3 Gaps observados no `hotelly-worker-staging`
 
----
+O audit aponta ausência (no YAML observado do Cloud Run do worker staging) de:
+- `CONTACT_REFS_KEY`
+- `CONTACT_HASH_SECRET`
+- `EVOLUTION_BASE_URL`
+- `EVOLUTION_INSTANCE`
+- `EVOLUTION_API_KEY`
+- `EVOLUTION_SEND_PATH`
 
-## Troubleshooting Rápido
+Implicação operacional: qualquer task/handler que dependa disso falha por `RuntimeError: Missing ...`.
 
-| Problema | Causa | Solução |
-|----------|-------|---------|
-| API retorna 202 mas nada acontece | `TASKS_BACKEND=inline` | Setar `TASKS_BACKEND=cloud_tasks` |
-| Cloud Tasks não retry no `send-response` | Handler retorna 200 mesmo em erro | Ajustar semântica HTTP (5xx em falha transitória) + guard durável (`outbox_deliveries`) — Fase 16 |
-| `send-response` retorna `contact_ref_not_found` | `contact_refs` expirado ou `CONTACT_REFS_KEY` ausente/incorreta | Garantir `CONTACT_REFS_KEY` no worker e validar TTL/fluxo inbound→outbound |
-| Cloud Tasks 401 no worker | OIDC audience errado | Ajustar `TASKS_OIDC_AUDIENCE` (usar `*.a.run.app`) |
-| Worker 500 `/cloudsql/...` | Cloud SQL não anexado | `--add-cloudsql-instances ...` |
-| Worker `UndefinedColumn` | Imagem Docker desatualizada | Rebuild + redeploy |
-| CORS no Admin | Chamada direta ao backend | Usar proxy server-side no Next |
-| assign-room 422 | reservation sem room_type_id | COALESCE preenche; corrigir seed |
-| Teste timezone | `date.today()` vs `CURRENT_DATE` | Usar `CURRENT_DATE` do banco |
-| password authentication failed | Senha do DB alterada mas secret não atualizado | Atualizar secret no Secret Manager |
-| Repository not found (build) | Nome errado do Artifact Registry | Usar `hotelly` (não `hotelly-repo`) |
-| Migration staging falha | Job com DATABASE_URL mal formatado | Usar cloud-sql-proxy manualmente |
+### F.4 IAM/Secret Manager — assimetria observada
 
----
+No audit:
+- Worker tem acesso ao secret `contact-refs-key`
+- Worker **não** tem acesso ao secret `contact-hash-secret` (binding presente apenas para o public SA)
 
-## ADICIONADO PARA COBERTURA (origem v3): Itens que existiam no v3 e não estavam explicitamente cobertos no v4
-
-### Detalhes operacionais / técnicos (pós-S13) que orientam implementação e debug
-- **ADICIONADO PARA COBERTURA (origem v3):** Worker/tasks: existe fallback de autenticação local para tasks via header `X-Internal-Task-Secret` (uso excepcional para debug/ambientes controlados).
-- **ADICIONADO PARA COBERTURA (origem v3):** JWKS cache: em falha de assinatura/validação, fazer **refetch** do JWKS antes de falhar definitivamente (evita incidentes durante rotação de chaves).
-- **ADICIONADO PARA COBERTURA (origem v3):** Ocupação: quando `available < 0`, logar WARN **PII-safe** (sinaliza inconsistência de inventário/overbooking sem vazar dados).
-
-### Admin: páginas de debug que existiam como referência
-- **ADICIONADO PARA COBERTURA (origem v3):** Debug Outbox: `/p/[propertyId]/debug/outbox` (visualiza eventos do `GET /outbox`).
-- **ADICIONADO PARA COBERTURA (origem v3):** Debug Ocupação: `/p/[propertyId]/debug/occupancy`.
-- **ADICIONADO PARA COBERTURA (origem v3):** Grid de ocupação: `/p/[propertyId]/frontdesk/occupancy` com navegação de janela (Hoje / ±14 dias) e modos `?view=types` e `?view=rooms` (quando aplicável).
-
-### Documentos relacionados (referências internas do projeto)
-- **ADICIONADO PARA COBERTURA (origem v3):**
-  - `hotelly-admin-mvp-prompt.md` — especificação de telas do Admin
-  - `spec-pack-tecnico.md` — regras técnicas backend (v1 + v2 consolidado)
-  - `hotelly-admin-pos-mvp.md` — roadmap pós-MVP (Extras, CRM, Pensões, etc.)
-  - `runbook-ambientes.md` — configuração staging vs prod
-
-### Troubleshooting: casos específicos removidos do v4
-- **ADICIONADO PARA COBERTURA (origem v3):** **Tag não promove código (staging usa `:latest`)** → fazer build da imagem `:latest` + forçar redeploy (ex.: `DEPLOY_SHA=$(date +%s)`).
-- **ADICIONADO PARA COBERTURA (origem v3):** **`/outbox` retorna 400 (missing `property_id`)** → contrato exige `property_id=<propertyId>` na query.
+Se o worker precisar montar `CONTACT_HASH_SECRET` (ex.: para hashing) isso quebra em staging.
 
 ---
 
-## 4. Relatório — Migração `hotelly-admin` (Next.js 16 SSR) de Cloudflare Pages para GCP Cloud Run
+## Apêndice G — WhatsApp Inbound/Outbound: mapa factual do fluxo e vault (AS-IS — 2026-02-08)
 
-**Objetivo**
+> **Escopo:** registrar o fluxo AS-IS com nomes de rotas, tabelas tocadas e regras do vault (contact_refs).  
+> **Uso:** referência de debug/runbook.
 
-- Migrar o deploy do Admin (`hotelly-admin`, Next.js 16 SSR em Node.js) de Cloudflare Pages para **GCP Cloud Run**, com build reprodutível via **Docker** + **Cloud Build**, sem alterar lógica de negócio, rotas, Clerk flows ou UI.
-- Padronizar deploy oficial via scripts no repo, com **Secret Manager** para `CLERK_SECRET_KEY`.
-- Garantir funcionamento local via Docker e em Cloud Run.
-- Node **20.9+**.
+### G.1 Diagrama factual (AS-IS)
 
----
+Inbound (Evolution ou Meta) → normalização/parse → `hash_contact` → `store_contact_ref` (vault) → `processed_events` (dedupe) → enqueue `/tasks/whatsapp/handle-message` → `handle_message` → `outbox_events` → enqueue `/tasks/whatsapp/send-response` → `send_response` → `get_remote_jid` (vault) → provider (Meta/Evolution).
 
-### 2) Next.js “standalone” para produção
+### G.2 Rotas e handlers (nomes exatos)
 
-**Ação**
+Webhooks inbound:
+- `POST /webhooks/whatsapp/evolution` → `src/hotelly/api/routes/webhooks_whatsapp.py:evolution_webhook`
+- `POST /webhooks/whatsapp/meta` → `src/hotelly/api/routes/webhooks_whatsapp_meta.py:meta_webhook`
+- `GET /webhooks/whatsapp/meta` (verify) → `meta_webhook_verify`
 
-- Alterado `next.config.ts`:
-  - Adicionado `output: "standalone"`.
+Tasks internas:
+- `POST /tasks/whatsapp/handle-message` → `src/hotelly/api/routes/tasks_whatsapp.py:handle_message`
+- `POST /tasks/whatsapp/send-response` → `src/hotelly/api/routes/tasks_whatsapp_send.py:send_response`
+- `POST /tasks/whatsapp/send-message` (legacy/manual) → `src/hotelly/api/routes/tasks_whatsapp_send.py:send_message`
 
-**Validação**
+Admin/debug:
+- `GET /outbox` → `src/hotelly/api/routes/outbox.py:list_outbox` (requer `require_property_role("viewer")`)
 
-- `npm run build` executou com sucesso.
-- Confirmado que gerou `.next/standalone`:
-  - `ls -la .next/standalone` mostrou `server.js` e artefatos.
+### G.3 Vault `contact_refs`: criptografia e TTL (nomes exatos)
 
-**Resultado**
+- Env var: `CONTACT_REFS_KEY`  
+  - deve ser **hex 64 chars** (= 32 bytes).  
+  - geração sugerida no código: `openssl rand -hex 32`
+- Algoritmo: **AES-256-GCM**  
+  - nonce 12 bytes; storage como base64(nonce + ciphertext)
+- Persistência inbound: UPSERT em `contact_refs(property_id, channel, contact_hash)`
+- Lookup outbound: `SELECT ... WHERE expires_at > now()` e decrypt em memória
 
-- Build gera bundle “standalone” (adequado para container runtime no Cloud Run).
+### G.4 Hash de contato `contact_hash` (nomes exatos)
 
----
+- Env var: `CONTACT_HASH_SECRET`
+  - geração sugerida: `openssl rand -hex 32`
+- Função: HMAC-SHA256 de `"{property_id}|{channel}|{sender_id}"`, output base64url sem padding, truncado para 32 chars.
 
-### 3) Containerização (Docker)
+### G.5 Tabelas tocadas (AS-IS)
 
-#### 3.1 Dockerfile (multi-stage)
-
-Criado `Dockerfile` com:
-
-- **builder** (Node 20-alpine):
-  - `npm ci`
-  - `npm run build`
-  - suporte a build com Clerk:
-    - `ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
-    - `ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
-- **runner** (Node 20-alpine):
-  - `ENV NODE_ENV=production`
-  - `ENV PORT=8080`
-  - `EXPOSE 8080`
-  - copia:
-    - `/app/.next/standalone` → `/app`
-    - `/app/.next/static` → `/app/.next/static`
-    - `/app/public` → `/app/public`
-  - start: `node server.js`
-
-#### 3.2 .dockerignore
-
-Criado/atualizado `.dockerignore`:
-
-- `node_modules`, `.next`, `.git`, `.vercel`, `.env*`, `npm-debug.log*`, `.DS_Store`
-- adicionais: `coverage`, `dist`, `*.log`, `*.tsbuildinfo`, `.github`, `.claude`, `.vscode`
-
-#### 3.3 Problema encontrado e correção (Clerk)
-
-**Erro no build Docker/Cloud Build**
-
-- Falha no `next build` por Clerk:
-  - `Missing publishableKey` / prerender `/_not-found`.
-- Causa: Docker build não recebia env do `.env.local`.
-
-**Correção**
-
-- Passar `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` como build-arg no Dockerfile (builder).
-
----
-
-### 4) Scripts operacionais (repo)
-
-Criado diretório `ops/cloudrun/` com:
-
-- `ops/cloudrun/deploy-staging.sh`
-- `ops/cloudrun/deploy-prod.sh`
-- `ops/cloudrun/env.example`
-- `cloudbuild.yaml` (raiz)
-
-Comportamento:
-
-- Scripts criam Artifact Registry repo (idempotente), fazem build via Cloud Build (com build-arg Clerk publishable) e fazem deploy no Cloud Run.
-- Secrets (ex.: `CLERK_SECRET_KEY`) via Secret Manager com `--set-secrets`.
-
----
-
-### 5) Deploy e domínios
-
-- **Staging service:** `hotelly-admin-staging`  
-  - URL canônica: `https://hotelly-admin-staging-dzsg3axcqq-uc.a.run.app`
-  - Domínio: `dash.hotelly.ia.br` (CNAME `ghs.googlehosted.com.`)
-  - Secret: `clerk-secret-key-staging`
-- **Prod service:** `hotelly-admin`  
-  - URL canônica: `https://hotelly-admin-dzsg3axcqq-uc.a.run.app`
-  - Domínio: `adm.hotelly.ia.br` (CNAME `ghs.googlehosted.com.`)
-  - Secret: `clerk-secret-key`
-
----
-
-### 6) Root técnico: `hotelly.ia.br` → `hotelly.com.br`
-
-- Criado serviço `hotelly-redirect` (fora do repo) no Cloud Run para redirecionar 308 para `https://hotelly.com.br{path}`.
-- Domain mapping de `hotelly.ia.br` para `hotelly-redirect`.
-- DNS no Registro.br conforme exigido pelo mapeamento (A/AAAA Google).
-
----
-
-### 7) Nota registrada (pendente de consolidar no relatório)
-
-- Variáveis `NEXT_PUBLIC_*` (ex.: API/debug/base URL) precisam estar disponíveis no **build** (Next embute no bundle). Portanto, quando forem usadas no client, devem ser passadas via **Cloud Build (`cloudbuild.yaml` + build-args)**, não apenas no `gcloud run deploy` (runtime).
-
----
-
-## 5. Anexos de Execução
-
-### 5.1 Prompt de execução — Migrar `quote.py` para `room_type_rates` (PAX pricing)
-
-(Referência histórica: tarefa já concluída; ver seção 6 para evidências e lacunas.)
-
-**Objetivo**: migrar `quote.py` para buscar preços em `room_type_rates` por noite, com fallback para `ari_days.base_rate_cents`.
-
-### 5.2 Nota registrada para próxima revisão do documento
-
-- Documentar no relatório que variáveis `NEXT_PUBLIC_*` (API/debug/base URL) precisam estar no build e por isso foram passadas via `cloudbuild.yaml` + `--build-arg`, não só no `gcloud run deploy`.
-
----
-
-## 6. Registro — Quote PAX (room_type_rates) concluído e lacunas para crianças
-
-### 6.1 O que foi feito (evidências objetivas)
-
-- `quote_minimum` agora calcula por noite usando `room_type_rates` (PAX) com fallback para `ari_days.base_rate_cents` quando não tem rate (ou quando a coluna do pax está `NULL`).
-- DB access: entrou `fetch_room_type_rates_by_date()` em `src/hotelly/infra/db.py`, buscando por intervalo `[checkin, checkout)` e retornando `date -> preços`.
-- Integração: `tasks_whatsapp.py` passou `guest_count` pra `quote_minimum`.
-- Validação: limites implementados (`guest_count` 1..4, `child_count` 0..3 → `ValueError`).
-- Testes: cenários PAX + fallback + `NULL` em child; `./scripts/verify.sh` verde (295 passed).
-- Commit: `feat: quote uses room_type_rates pax pricing` no `master` (hash `9b9652c`).
-
-### 6.2 O que falta (e por quê)
-
-Hoje o domínio/API só captura `guest_count` (um inteiro). Não existe `adult_count`/`child_count` vindo da API/WhatsApp, então em produção você não consegue informar crianças para o quote. Resultado:
-
-- Em produção, `guest_count` = PAX (adultos).
-- `child_count` ficou opcional com default 0 e só é exercitado nos testes por enquanto (retrocompat ok).
-
-### 6.3 Como os “motores bons” tratam crianças (diretriz)
-
-Padrão de mercado: separar **ocupação** e **categorias/idades**, com regras por quarto/rate plan.
-
-- Crianças com política baseada em **idade (faixas)** e regra de preço “free / percentual / fixo por criança”.  
-  Referência: Booking.com “child policies / child rates” (developer docs).
-- Em occupancy-based pricing, criança pode ser ocupante “normal” ou **sempre extra**, com fees por categoria de idade.  
-  Referência: Expedia Group “age categories” e “Always Extra”.
-
-### 6.4 Plano robusto para o Hotelly (mudança de contrato)
-
-- Entrada do fluxo:
-  - Novo payload: `adult_count` + `children_ages[]` (ou `children[]` com idade).
-  - Retrocompat: se vier só `guest_count`, mapear para `adult_count=guest_count` e `children_ages=[]`.
-
-- Modelo de dados:
-  - Evoluir além de `price_1chd_cents..price_3chd_cents` (quantidade) para regras por **faixa de idade** (infant/child/teen), com tipo de cobrança:
-    - grátis / percentual / fixo
-    - limites (ex.: 1 criança grátis até 5 anos)
-    - opcionais: berço/cama extra
-
-- Cálculo:
-  - Base adultos continua em `room_type_rates.price_{N}pax_cents`.
-  - Crianças: somar por noite por faixa/limite.
-  - Fallback preservado: sem regra/rate → `ari_days.base_rate_cents`.
-
-### 6.5 Referências externas (para embasar a modelagem)
-
-- Booking.com: child policies / child rates (faixas, grátis/percentual/fixo): https://developers.booking.com/demand/docs/accommodations/child-policies
-- Booking.com (connectivity): children policies and pricing: https://developers.booking.com/connectivity/docs/setting-up-children-policies-and-pricing
-- Expedia Group (best practices): occupancy + age categories e “Always Extra”:  
-  https://developers.expediagroup.com/supply/lodging/docs/property_mgmt_apis/product_mgmt/reference/createunit_mutation  
-  https://developers.expediagroup.com/supply/lodging/docs/property_mgmt_apis/product/getting_started/requirements-best-practices/
-
----
-
-## 7. Plano — Precificação de crianças por idade (5 stories)
-
-### 7.1 Decisões fechadas
-
-- Buckets por `property_id`: **sem sobreposição + cobertura completa 0..17**. Se houver gaps → indisponível com `reason_code=child_policy_incomplete`.
-- Quando **não existir** policy/buckets para a property:
-  - `GET /child-policies` retorna **default sugerido** (0–3 / 4–12 / 13–17) **sem persistir**.
-  - Em **staging/dev**, seeds são mandatórios; ausência é bug de ambiente (corrigir via seed).
-
-### 7.1.1 reason_codes mínimos do quote (reservado)
-
-Mesmo que o retorno público do quote não mude agora, padronizar (log/diagnóstico interno):
-
-- Dados/política: `child_policy_missing`, `child_policy_incomplete`
-- Tarifas: `rate_missing`, `pax_rate_missing`, `child_rate_missing`
-- Ocupação: `occupancy_exceeded`
-- Datas/ARI: `invalid_dates`, `no_ari_record`, `no_inventory`, `base_rate_missing` (apenas enquanto houver caminho legado)
-- Genérico: `unexpected_error`
-
-- Implementação prática: levantar `QuoteUnavailable(reason_code=..., meta=...)` internamente; no call-site, manter retorno `None` e logar `reason_code` + contexto **normalizado** (sem PII).
-
-### 7.2 Story 1 — DB + endpoints (escopo fechado)
-
-Decisão operacional (migração room_type_rates): Como o sistema ainda não está em produção, o padrão é Opção A (RENAME): renomear no banco price_{1..3}chd_cents para price_bucket{1..3}_chd_cents no mesmo deploy, mantendo retrocompatibilidade apenas na API /rates (aliases de leitura/escrita por tempo limitado) para não quebrar o Admin. Opção B (ADD colunas) fica removida deste plano e só pode voltar mediante mudança explícita de decisão no documento (ex.: descoberta de dependência inevitável fora da API).
-
-- `property_child_age_buckets`:
-  - `bucket` ∈ {1,2,3}
-  - `min_age/max_age` 0..17, `min_age <= max_age`
-  - Sem sobreposição garantida **no DB** via **EXCLUDE constraint** usando range (incluir extensão `btree_gist` na migration).
-- `room_type_rates` (migração de `room_type_rates`, decisão explícita):
-  - **Opção A (RENAME — somente após confirmação)**: *rename* dos campos legados para buckets (zero duplicação):
-    - `price_1chd_cents` → `price_bucket1_chd_cents`
-    - `price_2chd_cents` → `price_bucket2_chd_cents`
-    - `price_3chd_cents` → `price_bucket3_chd_cents` (**atenção ao underscore**)
-  - **Opção B (ADD — default, não quebra Admin)**: adicionar `price_bucket{1..3}_chd_cents` mantendo `price_{1..3}chd_cents` **temporariamente**.
-- `/child-policies`:
-  - `GET /child-policies` e `PUT /child-policies` (dashboard) exigem `?property_id=` e validam com `require_property_role(...)`.
-  - **Não aceitar `property_id` em path/query alternativo/body** (somente `?property_id=` conforme padrão do repo).
-  - `PUT` valida **cobertura completa 0..17** e **sem overlap**.
-- `/rates` compat (legado ↔ bucket; sem inventar rota nova):
-  - `GET`: retorna **novos + legados (alias temporário)**.
-  - `PUT`: aceita **novos OU legados**; se vierem **ambos** e divergirem → **400**.
-  - Persistência sempre **normalizada** nos buckets (ou nas novas colunas, se Opção B). Campos legados são **alias** para compat.
-property_id via `?property_id=` validado por RBAC
-#### Seeds (dev/staging)
-- Onde: `src/hotelly/operations/seed_staging.py` (mecanismo do repo; ex.: job `hotelly-seed-staging`).
-- Requisito: **idempotente** (upsert por PK) para permitir re-execução sem duplicar dados.
-- Defaults fixos: **0–3 / 4–12 / 13–17**.
-
-#### Testes mínimos
-- Aceitar default; rejeitar overlap; rejeitar gap; rejeitar fora de 0..17; e compat do `/rates`.
-
-### 7.3 Story 2 — Quote engine (sem fallback)
-
-- Entrada: `adult_count` + `children_ages[]` (idade obrigatória).
-- Sem fallback para `ari_days.base_rate_cents`: ausência de rate/policy → indisponível com `reason_code`.
-- Validar ocupação com `room_types.max_adults/max_children/max_total` (adicionar leitura em DB access).
-- Emitir `QuoteUnavailable(reason_code, meta)` e log estruturado.
-
-### 7.4 Story 3 — WhatsApp multi-turn + context
-
-- Persistir contexto em `conversations.context` **somente com campos normalizados** (`checkin`, `checkout`, `room_type_id`, `adult_count`, `children_ages`, etc.), sem texto cru.
-- Parsing inicial estrito: suportar poucos formatos (“3 e 7”, “3,7”, “3 7”); se não parsear com confiança, pedir idades.
-- Prompts novos: adultos, quantidade de crianças, idades.
-
-### 7.5 Story 4 — Admin UI
-
-- Tela/config de buckets por property.
-- Edição de rates por bucket (mesmo que simples) para não virar feature morta.
-
-### 7.6 Story 5 — Persistência e limpeza de legado
-
-- Persistir `adult_count` + `children_ages` onde fizer sentido (holds/reservations/quote_options).
-- Remover `guest_count` do domínio/DB.
-- Remover colunas legadas `price_{1..3}chd_cents` e aliases do `/rates` quando o Admin já estiver migrado.
-
-
----
-
-
-## (B) doc_unificado_hotelly_v10.md
-
-
-# Hotelly — Documento Unificado (Spec + Runbook + Roadmap) (v8 — 2026-02-05)
-
-> Documento vivo. Consolida decisões técnicas, estado atual (repos/infra/domínios) e o plano de execução para fechar pricing de crianças de forma robusta.
->
-> Princípios não negociáveis: **zero overbooking**, **idempotência real**, **sem PII em logs**, **rastreabilidade**.
-
----
-
-## 0. Estado atual (snapshot)
-
-### Repositórios
-- **Backend:** `hotelly-v2`
-- **Admin/Dashboard:** `hotelly-admin`
-
-### Serviços e URLs (Cloud Run / us-central1)
-- **hotelly-public** (já existente): atende `app.hotelly.ia.br`
-- **hotelly-admin** (prod): URL do serviço Cloud Run (gerada pelo Cloud Run) + domínio custom `adm.hotelly.ia.br`
-- **hotelly-admin-staging** (staging): URL do serviço Cloud Run + domínio custom (usado durante setup) `dash.hotelly.ia.br`
-- **hotelly-redirect** (infra utilitária): redireciona `hotelly.ia.br` (domínio raiz) para o destino comercial (ex.: landing em `hotelly.com.br`)
-
-### Domínios e DNS (Cloud Run Domain Mapping)
-- `app.hotelly.ia.br` → `hotelly-public` (CNAME para `ghs.googlehosted.com.` via Domain Mapping)
-- `adm.hotelly.ia.br` → `hotelly-admin` (CNAME `adm` → `ghs.googlehosted.com.`)
-- `dash.hotelly.ia.br` → `hotelly-admin-staging` (CNAME `dash` → `ghs.googlehosted.com.`)
-- `hotelly.ia.br` (root/apex) → `hotelly-redirect` (A/AAAA conforme instruído pelo `gcloud run domain-mappings create`)
-
-Observação:
-- Para subdomínios, o Domain Mapping usa **CNAME** (ex.: `adm` / `dash`).
-- Para domínio raiz/apex (`hotelly.ia.br`), normalmente o provedor DNS exige **A/AAAA** (não CNAME). Foi configurado com os IPs retornados pelo `gcloud`.
-
----
-
-## 1. Spec técnico (base)
-
-### 1.1 Stack
-- Python + FastAPI (backend `hotelly-v2`)
-- Postgres (migrations via Alembic/SQL do repo)
-- Cloud Run (serviços)
-- Cloud Tasks (tarefas assíncronas em staging/prod; em dev pode rodar local/inline conforme docs)
-- Secret Manager (segredos, ex.: Clerk secret key)
-- Admin: Next.js (Cloud Run)
-
-### 1.2 Princípios operacionais
-- **Idempotência sempre**: qualquer ação externa (Stripe/WhatsApp/Tasks) precisa de dedupe durável.
-- **PII**: não logar payload bruto (WhatsApp/Stripe) nem texto do usuário.
-- **Inventário/ARI é transacional**: sem “ajuste manual” sem trilha (outbox/log/commit).
-
----
-
-## 2. Pricing (estado atual no backend)
-
-### 2.1 Modelo atual (já implementado): PAX em `room_type_rates` com fallback em `ari_days`
-A função de quote mínima (`src/hotelly/domain/quote.py: quote_minimum`) agora calcula por noite:
-
-Para cada noite do intervalo `[checkin, checkout)`:
-1) valida disponibilidade via `ari_days` (inv_total - inv_booked - inv_held >= 1) e currency `BRL`.
-2) tenta rate PAX em `room_type_rates` para a data.
-3) se existir rate PAX:
-   - `adult_base = price_{N}pax_cents` (N=1..4)
-   - `child_add = price_{M}chd_cents` (M=1..3), quando `child_count>0`
-     - se coluna for `NULL`, trata como **0**
-   - `nightly = adult_base + child_add`
-4) se não existir rate PAX para a noite, faz fallback para `ari_days.base_rate_cents` (comportamento legado)
-
-Restrições aplicadas:
-- `guest_count` (adultos) suportado: **1..4** (fora disso → `ValueError`)
-- `child_count` suportado: **0..3** (fora disso → `ValueError`)
-- Preços sempre em **centavos (int)**.
-
-### 2.2 Limitação atual (por design)
-Hoje o fluxo WhatsApp usa apenas `guest_count` (total), sem separar adultos/crianças e sem idades.
-Então:
-- **dá para precificar adultos (PAX)**
-- **crianças com idade (robusto) ainda não é possível** no fluxo atual
-- existe suporte técnico no quote para `child_count`, mas **a coleta/validação** (idades/política) ainda não existe.
-
----
-
-## 3. Admin (hotelly-admin) — deploy e configuração
-
-### 3.1 Build/Deploy (Cloud Build → Artifact Registry → Cloud Run)
-Arquivos adicionados no repo `hotelly-admin`:
-- `Dockerfile` (multi-stage, Next standalone)
-- `cloudbuild.yaml` (build + push com build args)
-- `ops/cloudrun/deploy-staging.sh`
-- `ops/cloudrun/deploy-prod.sh`
-- `.dockerignore`
-
-Decisão importante:
-- variáveis `NEXT_PUBLIC_*` precisam estar **baked no build** do Next (build args → ENV no Dockerfile) para evitar inconsistências de runtime.
-
-Variáveis públicas usadas:
-- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
-- `NEXT_PUBLIC_ENABLE_API`
-- `NEXT_PUBLIC_ENABLE_DEBUG_TOKEN`
-- `NEXT_PUBLIC_HOTELLY_API_BASE_URL`
-
-Segredo (não público):
-- `CLERK_SECRET_KEY` via Secret Manager (env var com `valueFrom.secretKeyRef` no Cloud Run).
-
-### 3.2 Clerk (Admin)
-- Build-time: `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` **precisa ser `pk_*`** (publishable). `sk_*` quebra build/prerender.
-- Runtime: `CLERK_SECRET_KEY` (Secret Manager).
-
-Permissão obrigatória:
-- Service Account do revision precisa de `roles/secretmanager.secretAccessor` no secret.
-  - no setup atual foi concedido para `678865413529-compute@developer.gserviceaccount.com`.
-
-### 3.3 Domínio do Admin (produção)
-Escolhido: `adm.hotelly.ia.br` → serviço `hotelly-admin`.
-
-Status esperado do Domain Mapping:
-- `Ready=True`
-- `CertificateProvisioned=True`
-- `DomainRoutable=True`
-
----
-
-## 4. Domínio raiz `hotelly.ia.br` (infra)
-
-Contexto:
-- O endereço comercial (landing page) será `hotelly.com.br`.
-- O domínio `hotelly.ia.br` foi mantido como domínio técnico (ambientes/infra).
-
-Decisão operacional:
-- `hotelly.ia.br` (root) deve **redirecionar** para o domínio comercial, para evitar “domínio morto” e reduzir confusão.
-
-Implementação:
-- Serviço Cloud Run `hotelly-redirect` (Node simples) fazendo redirect 301/302.
-- Domain Mapping para `hotelly.ia.br` exige registros **A/AAAA** (não CNAME).
-- Após propagação + provisionamento do certificado, `curl -I https://hotelly.ia.br` deve retornar redirect e não erro TLS.
-
----
-
-## 5. Runbook (Operações) — correção de alinhamento repo x docs
-
-### 5.1 Divergência detectada e corrigida
-Havia a afirmação de que o FastAPI expunha apenas `/health` e não possuía rotas `/tasks/*`.
-Isso **não reflete o estado atual do repo**.
-
-Rotas presentes no backend (exemplos):
-- `/tasks/whatsapp/*`
-- `/tasks/stripe/*`
-- `/tasks/holds/*`
-- `/tasks/conversations/*`
-- `/rates`
-- `/payments/*`
-- `/reservations/*`
-- `/rbac/check`
-- `/me`
-
-Implicação:
-- Itens do runbook que tratavam tasks como “TARGET” precisam ser convertidos para “ATUAL” (com os devidos nomes/serviços/filas do ambiente).
-
-### 5.2 Procedimento de triagem (mantido)
-Mantém os passos de triagem, mas com ajuste:
-- além de “último deploy”, validar também **fila Cloud Tasks** e **erros 5xx por rota**.
-
-### 5.3 Comandos úteis (Cloud Run / Tasks / SQL)
-Mantido conforme docs, com a regra: sempre fixar `--region us-central1`.
-
----
-
-## 6. Roadmap: “Child pricing robusto” em 5 stories (ordem fechada)
-
-Motivação:
-- O prompt original era grande demais (misturava: modelo de dados + contratos + WhatsApp multi-turn + persistência + admin).
-- Execução em stories reduz quebra de staging/tests e cria checkpoints claros.
-
-### Reason codes (mínimo) para diagnóstico de quote
-Mesmo mantendo `None` no retorno público (por enquanto), internamente (log estruturado) o quote deve emitir um `reason_code` quando indisponível.
-
-Enum mínima sugerida (pode evoluir, mas começar com isso):
-- `invalid_dates`
-- `currency_not_supported`
-- `ari_missing`
-- `inventory_unavailable`
-- `rate_missing_adult_base`
-- `rate_missing_child_price`
-- `child_policy_missing`
-- `child_policy_incomplete`
-- `occupancy_exceeded`
-- `unexpected_error`
-
----
-
-
----
-
-## Backlog / Security P0 (fora do Story 1)
-
-### WhatsApp Webhooks — Segurança (Meta + Evolution)
-
-Comportamento atual:
-
-- **Meta (`/webhooks/whatsapp/meta`)**
-  - Fora de local: `META_APP_SECRET` é obrigatório. Se ausente, o endpoint **não processa** o payload (fail-closed) e responde **200 OK** para evitar retry.
-  - Local dev (`TASKS_OIDC_AUDIENCE == "hotelly-tasks-local"`): pode haver bypass, mas deve logar **warning**.
-
-- **Evolution (`/webhooks/whatsapp/evolution`)**
-  - Exigir `EVOLUTION_WEBHOOK_SECRET` e header `X-Webhook-Secret` com match.
-  - Fora de local: se ausente/errado → **401**.
-
-### Tasks Auth / OIDC Audience (ajustes)
-
-- Cloud Tasks → Worker: exigir OIDC (service account invoker).
-- `TASKS_OIDC_AUDIENCE` deve estar alinhado com o `status.url` do worker (por ambiente).
-
-
-# Story 1 — DB + `/rates` + `/child-policies` (buckets 0..17)
-
-> ⚠️ **Security P0 (webhooks/tasks auth) é fora do escopo do Story 1.**
-
-## Objetivo
-Introduzir política de crianças por idade (0–17) com até **3 buckets por property**, e permitir cadastrar preços por bucket por dia via API, sem mexer ainda em quote/WhatsApp.
-
-## 1) Migrações (Postgres)
-
-### 1.1 Tabela `property_child_age_buckets`
-- PK `(property_id, bucket)` onde `bucket ∈ {1,2,3}`
-- `min_age` / `max_age` com `0..17` e `min_age <= max_age`
-
-### 1.2 Sem sobreposição (robusto no DB)
-Preferência:
-- `EXCLUDE` constraint usando range por property (requer `btree_gist`), impedindo ranges que se cruzem no mesmo `property_id`.
-
-Alternativa (se quiser evitar extensão):
-- validação no endpoint + constraint adicional simples (menos robusto contra race).
-
-### 1.3 Cobertura completa 0..17
-Regra fechada:
-- buckets precisam cobrir **todo** o intervalo `0..17` **sem gaps**.
-- Se policy incompleta → deve falhar (`400`) no endpoint e, no futuro, quote indisponível com `child_policy_incomplete`.
-
-Implementação:
-- Obrigatório: validação no endpoint.
-- Opcional (mais robusto): trigger AFTER INSERT/UPDATE/DELETE que impede estado inválido por `property_id`.
-
-### 1.4 `room_type_rates`: child pricing bucket-based com compat
-Decisão operacional (migração room_type_rates): Como o sistema ainda não está em produção, o padrão é Opção A (RENAME): renomear no banco price_{1..3}chd_cents para price_bucket{1..3}_chd_cents no mesmo deploy, mantendo retrocompatibilidade apenas na API /rates (aliases de leitura/escrita por tempo limitado) para não quebrar o Admin. Opção B (ADD colunas) fica removida deste plano e só pode voltar mediante mudança explícita de decisão no documento (ex.: descoberta de dependência inevitável fora da API)..
-
-Opção A (RENAME) só após confirmação explícita de dependências.
-- `price_1chd_cents` → `price_bucket1_chd_cents`
-- `price_2chd_cents` → `price_bucket2_chd_cents`
-- `price_3chd_cents` → `price_bucket3_chd_cents`
-
-Obs:
-- A API `/rates` precisa continuar aceitando/retornando os campos legados como alias **temporário**, para não quebrar o Admin imediatamente.
-
----
-
-## 2) Endpoint novo: `GET /child-policies` e `PUT /child-policies`
-
-> Tenancy/RBAC: `property_id` obrigatório via `?property_id=`; validar com `require_property_role(min_role)`; **não aceitar `property_id` no body**.
-
-### GET
-`GET /child-policies`
-- retorna os 3 buckets (`bucket`, `min_age`, `max_age`)
-- se não existir policy/buckets:
-  - retorna **default sugerido** (0–3 / 4–12 / 13–17) **sem persistir** (staging/dev dependem de seed)
-
-### PUT
-`PUT /child-policies`
-- payload: exatamente 3 buckets
-- validações:
-  - buckets 1..3 presentes
-  - `0 <= min_age <= max_age <= 17`
-  - **cobertura completa 0..17 sem gaps** (obrigatório no endpoint)
-- integridade:
-  - **sem overlap** garantido **no DB** via `btree_gist` + `EXCLUDE` (revalidar na API só para erro amigável)
-  - trigger de “cobertura completa” no DB é **opcional** (hardening)
-- persistência em transação:
-  - estratégia simples: delete por property + insert dos 3 buckets (ou upsert equivalente)
-
----
-
-## 3) Ajuste do endpoint existente: `/rates` (compat)
-
-property_id via `?property_id=` validado por RBAC
-
-### 3.1 GET /rates
-Ao ler:
-- retornar campos novos:
-  - `price_bucket1_chd_cents`, `price_bucket2_chd_cents`, `price_bucket3_chd_cents`
-- retornar também campos legados como alias temporário:
-  - `price_1chd_cents`, `price_2chd_cents`, `price_3chd_cents`
-  - mesmos valores dos buckets correspondentes
-
-### 3.2 PUT /rates
-Ao escrever:
-- aceitar payload com campos **novos** ou **legados**
-- se vierem **ambos** e divergirem → rejeitar `400` (evita ambiguidade)
-- persistência sempre **normalizada** nos buckets (ou nas novas colunas, se Opção B); legados são **alias** para compat
-
----
-
-## 4) Seeds (staging/dev)
-
-- Seed obrigatório via mecanismo do repo (job `hotelly-seed-staging`), com seed **idempotente** (upsert por PK).
-- Implementação esperada no repo: `src/hotelly/operations/seed_staging.py` (ou equivalente invocado pelo job).
-- Defaults fixos:
-  - bucket1: 0–3
-  - bucket2: 4–12
-  - bucket3: 13–17
-
----
-
-## 5) Testes (mínimos e completos)
-- `PUT /child-policies`:
-  - aceita 0–3 / 4–12 / 13–17
-  - rejeita overlap (DB + validação)
-  - rejeita gaps (cobertura incompleta)
-  - rejeita fora de 0..17
-- `/rates`:
-  - GET retorna novos + legados
-  - PUT aceita novos OU legados; ambos divergentes → 400
-  - limite 366 permanece
-  - query params/contrato permanecem
-
----
-
-## Critérios de aceite (Story 1)
-- Migrações sobem limpas.
-- `GET/PUT /child-policies` com regra “sem overlap + cobertura 0..17”.
-- `/rates` continua funcional para consumidores antigos (campos legados ainda entram/aparecem).
-- `./scripts/verify.sh` verde.
-
----
-
-## 7. Stories 2→5 (visão resumida)
-
-### Story 2 — Admin/API: edição de buckets e rates bucket-based (operável)
-- Admin consegue ler/editar buckets (via `/child-policies`)
-- Admin consegue ler/editar rates com buckets (UI pode inicialmente usar alias, mas deve suportar novos)
-
-### Story 3 — Parsing/WhatsApp: ocupação explícita e coleta de idades (multi-turn)
-- substituir `guest_count` por `adult_count` + `children_ages`
-- se crianças sem idades → fluxo pergunta idades
-- persistir contexto normalizado em `conversations.context` (sem texto cru)
-
-### Story 4 — Quote engine: pricing robusto sem fallback
-- precificação por bucket por criança e por noite
-- sem fallback para `ari_days.base_rate_cents`
-- `reason_code` sempre que indisponível (log estruturado)
-
-### Story 5 — Persistência transacional (holds/reservations) e E2E
-- persistir ocupação (adult_count + children_ages)
-- conversão hold→reservation carrega ocupação
-- E2E staging: WhatsApp → quote → hold → Stripe → reserva confirmada
-
----
-
-## 8. Anexos rápidos: comandos usados (referência operacional)
-
-### Domain Mapping (Cloud Run)
-- criar:
-  - `gcloud beta run domain-mappings create --service <SERVICE> --domain <DOMAIN> --region us-central1 --project <PROJECT>`
-- descrever:
-  - `gcloud beta run domain-mappings describe --domain <DOMAIN> --region us-central1 --project <PROJECT> --format="yaml(status.conditions)"`
-
-### Secrets (Secret Manager)
-- criar secret:
-  - `gcloud secrets create <NAME> --replication-policy="automatic" --project <PROJECT>`
-- adicionar versão:
-  - `echo -n "VALUE" | gcloud secrets versions add <NAME> --data-file=- --project <PROJECT>`
-- permissões (runtime SA precisa acessar):
-  - `gcloud secrets add-iam-policy-binding <NAME> --member="serviceAccount:<SA>" --role="roles/secretmanager.secretAccessor" --project <PROJECT>`
-
----
-
-## 9. Pendências de documentação (curto)
-- Atualizar runbook antigo: remover afirmação “só /health”, listar rotas reais.
-- Registrar decisão de domínios (app/adm/root redirect) e o porquê.
-- Fixar padrão de nomes de serviço e ambiente (staging/prod) e o caminho de deploy de cada repo.
----
-
-## 10. Controle de Andamento — Registro de Execução
-
-> **Regra:** este documento é **append-only** (não remover conteúdo). Correções devem ser registradas como *errata*.
-
-### Execução concluída — Story 1 (Child Policies + compat /rates)
-
-**Status:** CONCLUÍDO (staging + repos)  
-**Data do registro:** 2026-02-06
-
-#### Entregas (Banco — staging)
-- Criada tabela `property_child_age_buckets` com constraint **EXCLUDE anti-overlap** (intervalos por `property_id` não podem se sobrepor).
-- Renomeadas colunas (DB):  
-  - `price_1chd_cents` → `price_bucket1_chd_cents`  
-  - `price_2chd_cents` → `price_bucket2_chd_cents`  
-  - `price_3chd_cents` → `price_bucket3_chd_cents`
-
-#### Entregas (Backend — `hotelly-v2`)
-- **Novo endpoint** `GET /child-policies`  
-  - Quando não há buckets persistidos para a property: retorna **default** `[{1,0,3}, {2,4,12}, {3,13,17}]` **sem persistir**.
-- **Novo endpoint** `PUT /child-policies`  
-  - Validação completa: exatamente **3 buckets**, cobertura **0..17**, sem gaps/overlap; operação transacional (delete + insert).
-- **Compatibilidade `/rates` (legado)**
-  - `GET /rates`: retorna campos novos + aliases legados.
-  - `PUT /rates`: aceita payload com campos novos **ou** legados; se ambos presentes e divergentes → **HTTP 400**.
-- Atualizações internas: `db.py` e `test_quote.py` com as novas colunas.
-- Seed staging de buckets default: (0–3), (4–12), (13–17).
-  - Idempotência: `INSERT ... ON CONFLICT (property_id, bucket) DO NOTHING`.
-
-#### Entregas (Frontend — `hotelly-admin`)
-- Tipo `RateDay` atualizado: campos `price_bucket{1..3}_chd_cents` + legados opcionais.
-- `RatesGrid.tsx` atualizado para suportar os novos campos e compat.
-
-#### Verificações / Evidências (aceite técnico)
-- `GET /child-policies` default ok (sem persistência) — coberto por `test_get_child_policies_default` (mock `fetchall_result=[]` → retorna defaults).
-- RBAC/property_id ok:
-  - `property_id` exclusivamente via `?property_id=` (PropertyRoleContext).
-  - `GET /child-policies`: `require_property_role("viewer")`
-  - `PUT /child-policies`: `require_property_role("staff")`
-- Seed idempotente ok: `ON CONFLICT ... DO NOTHING`.
-- Pipeline local/staging ok:
-  - `uv run python -m compileall -q src tests` (sucesso)
-  - `uv run pytest -q` (**336 passed total**)
-  - `bash scripts/verify.sh` → “All checks passed!” (336 passed, 0 failed)
-
-#### Observações
-- Decisão implementada conforme Story 1 / Opção A (RENAME no DB; compat somente na API do `/rates`).
-
-
----
-
-# ✅ Story 2 — Concluída (Admin: Child Policies + Rates por Bucket) — 2026-02-06
-
-## Status
-- **Implementação concluída no repo `hotelly-admin`**
-- **Pendente:** checklist manual em staging (depende de deploy)
-
-## Entregas (Admin)
-
-### Novos arquivos
-- `src/app/api/p/[propertyId]/child-policies/route.ts` — proxy API (GET/PUT)
-- `src/lib/childPolicies.ts` — `getChildPolicies`, `putChildPolicies`, `validateBuckets`
-- `src/app/p/[propertyId]/child-policies/page.tsx` — página (server component)
-- `src/app/p/[propertyId]/child-policies/ChildPoliciesEditor.tsx` — editor (validação client-side + badge **“Sugestão”**)
-
-### Arquivos alterados
-- `PropertyHeader.tsx` — link “Crianças” na navegação
-- `RatesGrid.tsx` — 3 linhas de criança com labels dinâmicas (ex.: “Criança (0–3)”), **envia apenas campos `price_bucket*_chd_cents`**, sem legados
-
-## Regras atendidas (alinhadas ao doc_unificado)
-- `GET/PUT /child-policies` via `?property_id=` (no backend). No Admin, proxy usa `propertyId` só para montar query param.
-- Labels dos buckets derivadas da policy (ou fallback para “Bucket 1/2/3” se policy falhar).
-- Compat `/rates`: Admin **prioriza campos bucket** e **não envia** aliases legados.
-
-## Verificações técnicas (Admin)
-- TypeScript: ✅ sem erros
-- ESLint: ✅ limpo
-- Build: ✅ sucesso
-
-## Pendência obrigatória (antes de “done” definitivo)
-- Executar **Checklist manual em staging (Story 2, seção 7)** após deploy do `hotelly-admin` em staging.
-  - Evidência requerida: prints/IDs (property, requests) + confirmação de que nenhum request envia `price_1chd_cents..price_3chd_cents`.
-
-
-
----
-
-# ✅ PROGRESSO — Story 3 concluído (WhatsApp multi-turn: adult_count + children_ages) — 2026-02-06
-
-## Status
-- **Story 3: CONCLUÍDA**
-- `scripts/verify.sh`: **verde**
-- Suite de testes: **348 passed**
-
-## Entregas (conforme relatório de execução)
-
-### Banco (staging)
-- Migração aplicada: adicionada coluna `conversations.context` **JSONB** com default.
-
-### Backend (`hotelly-v2`)
-
-#### Domínio — `intents.py`
-- `ParsedIntent` agora inclui:
-  - `adult_count`
-  - `children_ages`
-- Adicionado `derived_guest_count()` para compatibilidade com fluxo legado (deriva `guest_count` de `adult_count + len(children_ages)`).
-
-#### Domínio — `parsing.py`
-- Novos patterns:
-  - `_ADULT_PATTERNS`
-  - `_CHILD_COUNT_PATTERNS`
-  - `_CHILDREN_AGES_PATTERN`
-  - `_STANDALONE_AGES_PATTERN`
-- Novas funções:
-  - `_extract_adults()`
-  - `_extract_children()`
-  - `_parse_age_list()`
-- `parse_intent()` agora:
-  - extrai `adult_count` + `children_ages`
-  - trata “X pessoas” como adultos (compat)
-  - calcula `missing` usando `adult_count` (em vez de `guest_count`)
-- Formatos suportados para idades (com/sem “anos”):
-  - “3 e 7”
-  - “3,7”
-  - “3 7”
-
-#### Handler — `tasks_whatsapp.py`
-- `_process_intent()` reescrito para **multi-turn**:
-  1) carrega `conversations.context`
-  2) merge de entidades da mensagem
-  3) persiste context
-  4) calcula `missing` no acumulado
-- Ordem de prompts:
-  - dates → room_type → adult_count → children_ages
-- Se crianças mencionadas sem idades:
-  - **pergunta idades**
-  - **não tenta cotar**
-- `guest_count` agora é **derivado internamente** (compat).
-
-#### Templates — `templates.py`
-- Novos templates:
-  - `prompt_adult_count`
-  - `prompt_child_count`
-  - `prompt_children_ages`
-
-### Testes
-- `tests/test_parsing_children.py` — 9 testes de parsing (adultos, crianças, idades, abreviações, standalone ages).
-- `tests/test_whatsapp_context.py` — 4 testes multi-turn (prompt de idades, acumulação de context, prompt de adulto, fluxo completo).
-- 3 testes existentes atualizados (troca `guest_count` → `adult_count` no `missing`).
-- Total: **348 passed**, `verify.sh` verde.
-
-## Commit
-- `feat: whatsapp collects adult_count and children ages (context)`
-
-## Observações operacionais
-- Persistência do contexto é **normalizada** (JSONB) para suportar multi-turn.
-- Compatibilidade de `guest_count` foi mantida **como derivação**, para permitir transição sem quebra até o story de remoção.
-
-
----
-
-# ✅ PROGRESSO — Story 4 concluído (Quote Engine: adult_count + children_ages, buckets, **sem fallback**) — 2026-02-06
-
-## Status
-- **Story 4: CONCLUÍDA**
-- `scripts/verify.sh`: **verde** (observação: 1 flaky pré-existente relacionado a JWKS, **não** relacionado ao Story 4)
-- Suite de testes: **348 passed**
-- `compileall`: ✅
-- `ruff`: ✅
-
-## Entregas (conforme relatório de execução)
-
-### Backend (`hotelly-v2`)
-
-#### Domínio — `quote.py` (reescrito)
-- Nova exceção: `QuoteUnavailable(reason_code, meta)` com **13 reason_codes padronizados**.
-- Helper `_bucket_for_age()`:
-  - mapeia idade (0..17) → bucket (1..3) via `property_child_age_buckets`.
-- `quote_minimum()`:
-  - nova assinatura com parâmetros primários: `adult_count` + `children_ages`.
-  - **Bridge legacy**: se apenas `guest_count` for fornecido no call-site, trata como:
-    - `adult_count = guest_count`
-    - `children_ages = []`
-- Validações fail-fast:
-  - datas inválidas → `invalid_dates`
-  - `adult_count` fora de 1..4 → `invalid_adult_count`
-  - idades fora de 0..17 → `invalid_child_age`
-- Child policy:
-  - busca buckets no DB
-  - valida cobertura completa 0..17 **sem gaps** (falhas com reason_code específico)
-- ARI checks:
-  - valida existência do registro ARI
-  - valida `currency == BRL`
-  - valida inventário disponível
-  - cada falha com `reason_code` específico
-- Pricing **sem fallback**:
-  - `price_{N}pax_cents` obrigatório
-  - `price_bucket{1..3}_chd_cents` por criança (por idade→bucket)
-  - **proibido** fallback para `ari_days.base_rate_cents`
-- Cálculo:
-  - `nightly = adult_base + sum(child_prices)`
-  - total = soma de nightly por noite
-
-#### Call-site — `tasks_whatsapp.py`
-- Import atualizado para `QuoteUnavailable`.
-- Chamada a `quote_minimum` envolvida em `try/except QuoteUnavailable`.
-- Log estruturado com `reason_code` (sem PII).
-- Removido bloco `if quote is None` (substituído pelo `except`).
-
-### Testes — `test_quote.py` (reescrito)
-- 14 testes cobrindo cenários:
-  - Adult-only (1 e 2 pax)
-  - Com crianças (bucket pricing)
-  - Child policy: missing / incomplete
-  - Rate: missing / pax rate NULL / child rate NULL
-  - ARI: no record / no inventory / wrong currency
-  - Validações: adult_count inválido / child age inválida
-  - Legacy bridge (guest_count → adult_count)
-- Helper `seed_child_age_buckets` adicionado.
-- Fixture `ensure_property` limpa `property_child_age_buckets` no teardown.
-
-## Commit
-- `feat: quote uses adult_count + children_ages with child buckets (no fallback)`
-
-## Observações operacionais
-- O quote agora falha com diagnóstico explícito (`reason_code`) em vez de fallback silencioso.
-- Mantém compat transitória apenas via bridge `guest_count` → `adult_count` até a remoção completa no Story 5.
-
-
----
-
-# ✅ PROGRESSO — Story 5 concluído (Persistência de ocupação + remoção de `guest_count`) — 2026-02-06
-
-## Status
-- **Story 5: CONCLUÍDA**
-- `scripts/verify.sh`: **verde** (observação: 2 flakys pré-existentes relacionados a JWKS, **não** relacionados ao Story 5)
-- Suite de testes: **347 passed**
-- Remoção completa: `rg guest_count -t py src/ tests/` → **vazio**
-
-## Entregas (conforme relatório de execução)
-
-### Banco (staging)
-- Migrações aplicadas:
-  - `holds`:
-    - adicionados `adult_count SMALLINT NOT NULL`
-    - adicionados `children_ages JSONB NOT NULL DEFAULT '[]'`
-    - backfill determinístico a partir de `guest_count`
-    - `guest_count` **dropado**
-  - `reservations`:
-    - mesma estratégia (adult_count + children_ages, backfill, drop `guest_count`)
-- Observação: `conversations.context` já havia sido adicionado no Story 3.
-
-### Backend (`hotelly-v2`)
-
-#### Repositórios
-- `holds_repository.py`:
-  - `insert_hold` persiste `adult_count` + `children_ages` (JSON).
-- `reservations_repository.py`:
-  - `insert_reservation` persiste `adult_count` + `children_ages`.
-
-#### Domínio
-- `holds.py`:
-  - `create_hold` recebe `adult_count` + `children_ages`.
-- `convert_hold.py`:
-  - lê ocupação do hold e copia para a reservation.
-- `quote.py`:
-  - `adult_count` obrigatório
-  - **removido bridge legacy** (`guest_count` → `adult_count`).
-- `intents.py`:
-  - removido `guest_count` e `derived_guest_count()`.
-- `parsing.py`:
-  - removido `_GUEST_PATTERNS` e `_extract_guest_count`
-  - patterns de “pessoas/hóspedes/pax” absorvidos por `_ADULT_PATTERNS`.
-
-#### Templates
-- removido `prompt_guest_count`.
-- `{guest_count}` → `{adult_count}` nos templates de quote.
-
-#### Handlers
-- `tasks_whatsapp.py`:
-  - fluxo completo agora usa `adult_count` + `children_ages` (context → quote → hold).
-- `webhooks_whatsapp.py` e `webhooks_whatsapp_meta.py`:
-  - entidades agora usam `adult_count` + `children_ages`.
-
-#### Seed (staging)
-- Atualizado para `adult_count` + `children_ages`.
-
-## Commit
-- `feat: persist occupancy and remove guest_count`
-
-## Resumo consolidado da branch
-- Branch: `feat/child-age-buckets-and-bucket-rates`
-- Stories 1..5 entregues e pushados:
-  - Story 1 — Backend: child age buckets + bucket rates (8 files, +796)
-  - Story 2 — Admin: child policies UI + bucket rates grid (6 files, +464)
-  - Story 3 — WhatsApp multi-turn parsing + context (7 files, +443)
-  - Story 4 — Quote engine com buckets (sem fallback) (3 files, +355)
-  - Story 5 — Persistência ocupação + remoção `guest_count` (17 files, +108/-161)
-
-## Observações operacionais
-- O sistema passa a operar com ocupação **explícita** (`adult_count`, `children_ages`) de ponta a ponta no backend.
-- A compat de `guest_count` foi removida conforme premissa de “não está live”.
-
-
----
-
-# ✅ FASE 19 — Precificação de crianças por idade (robusta) — **CONCLUÍDA** — 2026-02-06
-
-## Escopo da fase (plano em 5 stories — executado)
-Objetivo: habilitar precificação robusta de crianças por idade, ponta a ponta.
-
-### Decisões fechadas (implementadas)
-- Buckets por `property_id`:
-  - **sem sobreposição** + **cobertura completa 0..17**
-  - policy incompleta → quote indisponível (`reason_code=child_policy_incomplete`)
-- Quote indisponível:
-  - registra `reason_code` em **log estruturado**
-  - resposta pública continua `None` (por enquanto)
-
-## Stories (sequenciais) — status final
-- ✅ **Story 1 — DB + endpoints**
-  - `property_child_age_buckets` + EXCLUDE anti-overlap
-  - `/child-policies` (GET/PUT) com validação completa
-  - `/rates` com compat (GET novo+aliases; PUT aceita novo ou legado, conflito=400)
-- ✅ **Story 2 — Admin UI**
-  - configurar buckets por property
-  - editar rates por bucket com labels dinâmicas (envia só bucket fields)
-- ✅ **Story 3 — WhatsApp multi-turn**
-  - `conversations.context` JSONB
-  - parsing estrito de idades + prompts
-  - fluxo não cota sem idades
-- ✅ **Story 4 — Quote engine**
-  - `adult_count` + `children_ages[]`
-  - buckets por idade + `QuoteUnavailable(reason_code, meta)`
-  - **sem fallback** para `ari_days.base_rate_cents`
-  - call-site log estruturado por `reason_code`, retorno público `None`
-- ✅ **Story 5 — Persistência**
-  - `holds`/`reservations` com `adult_count` + `children_ages`
-  - remoção completa de `guest_count` (DB + código)
-  - seeds/handlers atualizados
-
-## Evidências de conclusão
-- Todos os 5 stories entregues e pushados na branch `feat/child-age-buckets-and-bucket-rates`.
-- Suite de testes e `scripts/verify.sh` verdes (flakys JWKS pré-existentes, sem relação com a fase).
-- Contratos e invariantes desta fase estão atendidos (policy 0..17, quote sem fallback, reason_code em logs, remoção de `guest_count`).
-
-## Próximos passos (fora desta fase)
-- Promover para ambientes seguintes (se aplicável) e rodar checklists de deploy/monitoramento.
-- (Opcional) Evoluir resposta pública para expor diagnóstico ao operador (sem vazar internals).
-
-
----
-
-# 🔧 ERRATA / ATUALIZAÇÃO DE STATUS — FASE 19 — 2026-02-06
-
-## Correção
-Na seção **“Próximos Passos”**, a linha **“⏳ FASE 19: Precificação de crianças por idade (robusta) — plano em 5 stories”** ficou **desatualizada**.
-
-## Status correto
-- ✅ **FASE 19: CONCLUÍDA**
-- Motivo: os **5 stories (1..5)** foram entregues e pushados na branch `feat/child-age-buckets-and-bucket-rates`, com `verify.sh` verde (flakys JWKS pré-existentes).
-
-## Como ler o documento a partir daqui
-- Considere a FASE 19 como **removida de “Próximos Passos”** e **encerrada**.
-- A seção **“✅ FASE 19 — ... — CONCLUÍDA”** adicionada ao final deste documento é a referência vigente.
+- `contact_refs` — vault (UPSERT + SELECT/decrypt)
+- `processed_events` — dedupe inbound
+- `conversations` — upsert/state machine no processamento de intent
+- `outbox_events` — persistência de resposta (e leitura no send-response)
