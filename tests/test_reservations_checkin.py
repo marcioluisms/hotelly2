@@ -9,7 +9,7 @@ Covers:
 - Check-in date validation with property timezone (400)
 - No room assigned (422)
 - Room conflict (409)
-- Happy path: 200 with check-in result (status → checked_in)
+- Happy path: 200 with check-in result (status → in_house)
 - Idempotency: replay returns cached response
 - No auth (401/403)
 """
@@ -67,15 +67,13 @@ def _reservation_row(
     checkin=None,
     checkout=None,
     room_id="room-101",
-    property_id="prop-1",
 ):
-    """Build a mock reservation row (status, checkin, checkout, room_id, property_id)."""
+    """Build a mock reservation row (status, checkin, checkout, room_id)."""
     return (
         status,
         checkin or date.today(),
         checkout or date.today(),
         room_id,
-        property_id,
     )
 
 
@@ -202,8 +200,8 @@ class TestCheckInWrongStatus:
                 assert resp.status_code == 409
                 assert "checked_out" in resp.json()["detail"]
 
-    def test_accepts_in_house(self, fake_user):
-        """in_house is an accepted status for check-in."""
+    def test_rejects_in_house(self, fake_user):
+        """in_house is already checked-in — re-check-in returns 409."""
         res_id = str(uuid4())
         with patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"):
             with patch("hotelly.infra.db.txn") as mock_txn:
@@ -211,21 +209,16 @@ class TestCheckInWrongStatus:
                 cur.fetchone.side_effect = [
                     None,            # idempotency check
                     _reservation_row(status="in_house"),
-                    _TZ_ROW,         # timezone
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
-                with patch(
-                    "hotelly.domain.room_conflict.check_room_conflict",
-                    return_value=None,
-                ):
-                    app = _make_app(fake_user)
-                    client = TestClient(app, raise_server_exceptions=False)
-                    resp = client.post(
-                        _checkin_url(res_id),
-                        headers={"Idempotency-Key": "key-in-house"},
-                    )
-                    assert resp.status_code == 200
-                    assert resp.json()["status"] == "checked_in"
+                app = _make_app(fake_user)
+                client = TestClient(app, raise_server_exceptions=False)
+                resp = client.post(
+                    _checkin_url(res_id),
+                    headers={"Idempotency-Key": "key-in-house"},
+                )
+                assert resp.status_code == 409
+                assert "already in-house" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -404,13 +397,13 @@ class TestCheckInHappyPath:
 
                     assert resp.status_code == 200
                     data = resp.json()
-                    assert data["status"] == "checked_in"
+                    assert data["status"] == "in_house"
                     assert data["reservation_id"] == res_id
 
                     # Verify outbox INSERT was issued
                     all_sql = " ".join(str(c) for c in cur.execute.call_args_list)
                     assert "INSERT INTO outbox_events" in all_sql
-                    assert "reservation.checked_in" in all_sql
+                    assert "reservation.in_house" in all_sql
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +415,7 @@ class TestCheckInIdempotency:
     def test_replay_returns_cached_response(self, fake_user):
         res_id = str(uuid4())
         cached_response = {
-            "status": "checked_in",
+            "status": "in_house",
             "reservation_id": res_id,
         }
 
@@ -440,7 +433,7 @@ class TestCheckInIdempotency:
                 )
                 assert resp.status_code == 200
                 data = resp.json()
-                assert data["status"] == "checked_in"
+                assert data["status"] == "in_house"
                 assert data["reservation_id"] == res_id
 
     def test_idempotency_key_recorded_after_checkin(self, fake_user):

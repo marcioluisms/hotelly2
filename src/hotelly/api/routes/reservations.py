@@ -1180,7 +1180,7 @@ def check_in_action(
     2. Lock reservation row (SELECT ... FOR UPDATE).
     3. Validate status in (confirmed, in_house), checkin == today, room assigned.
     4. ADR-008: check room conflict with lock.
-    5. Update status to checked_in.
+    5. Update status to in_house.
     6. Emit outbox event.
     7. Record idempotency key.
 
@@ -1221,31 +1221,38 @@ def check_in_action(
 
     # 2-7. Transactional check-in
     with txn() as cur:
-        # 2. Lock reservation
+        # 2. Lock reservation — scoped by property_id for multi-tenancy
         cur.execute(
             """
-            SELECT status, checkin, checkout, room_id, property_id
+            SELECT status, checkin, checkout, room_id
             FROM reservations
-            WHERE id = %s
+            WHERE property_id = %s AND id = %s
             FOR UPDATE
             """,
-            (reservation_id,),
+            (ctx.property_id, reservation_id),
         )
         row = cur.fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Reservation not found")
 
-        status, checkin, checkout, room_id, property_id = row
+        status, checkin, checkout, room_id = row
 
-        # 3a. Validate status
-        if status not in ("confirmed", "in_house"):
+        # 3a. Guard: guest is already in-house
+        if status == "in_house":
             raise HTTPException(
                 status_code=409,
-                detail=f"Reservation status is '{status}', expected 'confirmed' or 'in_house'",
+                detail="Guest is already in-house",
             )
 
-        # 3b. Validate checkin date vs property-local today
-        property_tz = _get_property_tz(cur, property_id)
+        # 3b. Validate status allows check-in
+        if status != "confirmed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Reservation status '{status}' does not allow check-in",
+            )
+
+        # 3c. Validate checkin date vs property-local today
+        property_tz = _get_property_tz(cur, ctx.property_id)
         today_local = datetime.now(timezone.utc).astimezone(property_tz).date()
         if today_local < checkin:
             raise HTTPException(
@@ -1253,7 +1260,7 @@ def check_in_action(
                 detail=f"Check-in date is {checkin.isoformat()}, today is {today_local.isoformat()} (too early)",
             )
 
-        # 3c. Validate room assigned
+        # 3d. Validate room assigned
         if room_id is None:
             raise HTTPException(
                 status_code=422,
@@ -1267,7 +1274,7 @@ def check_in_action(
             check_in=checkin,
             check_out=checkout,
             exclude_reservation_id=reservation_id,
-            property_id=property_id,
+            property_id=ctx.property_id,
             lock=True,
         )
         if conflicting_id is not None:
@@ -1276,24 +1283,29 @@ def check_in_action(
                 detail=f"Room conflict with reservation {conflicting_id}",
             )
 
-        # 5. Update status
+        # 5. Update status — scoped by property_id, guarded by status
         cur.execute(
             """
             UPDATE reservations
-            SET status = 'checked_in'::reservation_status, updated_at = now()
-            WHERE id = %s
+            SET status = 'in_house'::reservation_status, updated_at = now()
+            WHERE property_id = %s AND id = %s AND status = 'confirmed'
             """,
-            (reservation_id,),
+            (ctx.property_id, reservation_id),
         )
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Reservation status changed concurrently",
+            )
 
         # 6. Emit outbox event
         outbox_payload = json.dumps({
             "reservation_id": reservation_id,
-            "property_id": property_id,
+            "property_id": ctx.property_id,
             "room_id": room_id,
             "checkin": checkin.isoformat(),
             "checkout": checkout.isoformat(),
-            "checked_in_by": ctx.user.id,
+            "in_house_by": ctx.user.id,
         })
         cur.execute(
             """
@@ -1304,8 +1316,8 @@ def check_in_action(
             RETURNING id
             """,
             (
-                property_id,
-                "reservation.checked_in",
+                ctx.property_id,
+                "reservation.in_house",
                 "reservation",
                 reservation_id,
                 correlation_id,
@@ -1316,7 +1328,7 @@ def check_in_action(
 
         # 7. Record idempotency key
         response_body = {
-            "status": "checked_in",
+            "status": "in_house",
             "reservation_id": reservation_id,
         }
 
@@ -1361,12 +1373,12 @@ def check_out_action(
     ctx: PropertyRoleContext = Depends(require_property_role("staff")),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> dict:
-    """Check out a checked-in or in-house reservation.
+    """Check out an in-house reservation.
 
     Transactional flow:
     1. Check idempotency (skip if already processed).
     2. Lock reservation row (SELECT ... FOR UPDATE).
-    3. Validate status in (checked_in, in_house).
+    3. Validate status is in_house.
     4. Update status to checked_out.
     5. Emit outbox event.
     6. Record idempotency key.
@@ -1407,44 +1419,130 @@ def check_out_action(
 
     # 2-6. Transactional check-out
     with txn() as cur:
-        # 2. Lock reservation
+        # ── STEP 1: Lock reservation row ─────────────────────────
+        # Scoped by property_id for multi-tenancy.
+        # Fetches total_cents from the locked row — this is the
+        # single source of truth for balance calculation.
         cur.execute(
             """
-            SELECT status, property_id
+            SELECT status, total_cents, currency
             FROM reservations
-            WHERE id = %s
+            WHERE property_id = %s AND id = %s
             FOR UPDATE
             """,
-            (reservation_id,),
+            (ctx.property_id, reservation_id),
         )
         row = cur.fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Reservation not found")
 
-        status, property_id = row
+        status, total_cents, currency = row
 
-        # 3. Validate status
-        if status not in ("checked_in", "in_house"):
+        # ── STEP 2: Validate status ──────────────────────────────
+        if status != "in_house":
             raise HTTPException(
                 status_code=409,
-                detail=f"Reservation status is '{status}', expected 'checked_in' or 'in_house'",
+                detail=f"Reservation status is '{status}', expected 'in_house'",
             )
 
-        # 4. Update status
+        # ── STEP 3: Calculate balance (fail-closed) ─────────────
+        # total_cents already includes extras (add-extra updates it).
+        # We only need to subtract captured folio payments.
+        # CRITICAL: if folio_payments is unreachable (missing table,
+        # DB error), checkout MUST be blocked — never allow checkout
+        # when we cannot verify the financial state.
+        try:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(amount_cents), 0)
+                FROM folio_payments
+                WHERE property_id = %s
+                  AND reservation_id = %s
+                  AND status = 'captured'
+                """,
+                (ctx.property_id, reservation_id),
+            )
+            total_payments_row = cur.fetchone()
+            total_payments: int = total_payments_row[0] if total_payments_row else 0
+        except Exception as exc:
+            logger.error(
+                "checkout BLOCKED — folio query failed (fail-closed)",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=correlation_id,
+                        property_id=ctx.property_id,
+                        reservation_id=reservation_id,
+                        error=str(exc),
+                    )
+                },
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Cannot verify financial balance — checkout blocked",
+            )
+
+        balance_due: int = int(total_cents) - int(total_payments)
+
+        # ── DEBUG LOG (Architect directive) ───────────────────────
+        logger.info(
+            "checkout balance check",
+            extra={
+                "extra_fields": safe_log_context(
+                    correlationId=correlation_id,
+                    property_id=ctx.property_id,
+                    reservation_id=reservation_id,
+                    total_cents=total_cents,
+                    total_payments=total_payments,
+                    balance_due=balance_due,
+                    status=status,
+                    currency=currency,
+                )
+            },
+        )
+
+        # ── STEP 4: Reject if outstanding balance ────────────────
+        if balance_due > 0:
+            logger.warning(
+                "checkout BLOCKED — outstanding balance",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=correlation_id,
+                        property_id=ctx.property_id,
+                        reservation_id=reservation_id,
+                        balance_due=balance_due,
+                        total_cents=total_cents,
+                        total_payments=total_payments,
+                    )
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"Outstanding balance of {balance_due} cents prevents checkout",
+            )
+
+        # ── STEP 5: UPDATE status (only reachable if balance <= 0)
         cur.execute(
             """
             UPDATE reservations
             SET status = 'checked_out'::reservation_status, updated_at = now()
-            WHERE id = %s
+            WHERE property_id = %s AND id = %s AND status = 'in_house'
             """,
-            (reservation_id,),
+            (ctx.property_id, reservation_id),
         )
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Reservation status changed concurrently",
+            )
 
-        # 5. Emit outbox event
+        # ── STEP 6: Emit outbox event ────────────────────────────
         outbox_payload = json.dumps({
             "reservation_id": reservation_id,
-            "property_id": property_id,
+            "property_id": ctx.property_id,
             "checked_out_by": ctx.user.id,
+            "balance_due": balance_due,
+            "total_payments": total_payments,
+            "total_cents": total_cents,
         })
         cur.execute(
             """
@@ -1455,7 +1553,7 @@ def check_out_action(
             RETURNING id
             """,
             (
-                property_id,
+                ctx.property_id,
                 "reservation.checked_out",
                 "reservation",
                 reservation_id,
@@ -1465,10 +1563,11 @@ def check_out_action(
             ),
         )
 
-        # 6. Record idempotency key
+        # ── STEP 7: Record idempotency key ───────────────────────
         response_body = {
             "status": "checked_out",
             "reservation_id": reservation_id,
+            "balance_due": balance_due,
         }
 
         cur.execute(
@@ -1493,6 +1592,8 @@ def check_out_action(
                 correlationId=correlation_id,
                 property_id=ctx.property_id,
                 reservation_id=reservation_id,
+                balance_due=balance_due,
+                total_payments=total_payments,
             )
         },
     )
@@ -1556,7 +1657,7 @@ def add_extra(
             adult_count, children_ages_raw,
         ) = res_row
 
-        if status not in ("confirmed", "in_house", "checked_in"):
+        if status not in ("confirmed", "in_house"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Reservation status '{status}' does not allow adding extras",

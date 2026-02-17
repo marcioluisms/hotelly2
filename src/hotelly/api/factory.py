@@ -19,6 +19,7 @@ from .routes import (
     child_policies,
     conversations,
     extras,
+    folio,
     frontdesk,
     me,
     occupancy,
@@ -104,6 +105,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(cancellation_policy.router)
         app.include_router(child_policies.router)
         app.include_router(extras.router)
+        app.include_router(folio.router)
 
     # Mount worker routes only for worker role
     if role == "worker":

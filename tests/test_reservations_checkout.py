@@ -53,9 +53,14 @@ def _checkout_url(reservation_id: str) -> str:
     return f"/reservations/{reservation_id}/actions/check-out?property_id=prop-1"
 
 
-def _reservation_row(status="in_house", property_id="prop-1"):
-    """Build a mock reservation row (status, property_id)."""
-    return (status, property_id)
+def _reservation_row(status="in_house", total_cents=10000, currency="BRL"):
+    """Build a mock reservation row (status, total_cents, currency)."""
+    return (status, total_cents, currency)
+
+
+def _folio_payments_sum(total=10000):
+    """Build a mock folio_payments SUM row — COALESCE(SUM(amount_cents), 0)."""
+    return (total,)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +89,7 @@ class TestCheckOutRBAC:
                 cur.fetchone.side_effect = [
                     None,  # idempotency check
                     _reservation_row(),
+                    _folio_payments_sum(),
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 app = _make_app(fake_user)
@@ -194,25 +200,73 @@ class TestCheckOutWrongStatus:
                 assert resp.status_code == 409
                 assert "cancelled" in resp.json()["detail"]
 
-    def test_accepts_checked_in(self, fake_user):
-        """checked_in is an accepted status for check-out."""
+    def test_accepts_in_house(self, fake_user):
+        """in_house is the canonical accepted status for check-out."""
         res_id = str(uuid4())
         with patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"):
             with patch("hotelly.infra.db.txn") as mock_txn:
                 cur = MagicMock()
                 cur.fetchone.side_effect = [
                     None,  # idempotency check
-                    _reservation_row(status="checked_in"),
+                    _reservation_row(status="in_house"),
+                    _folio_payments_sum(),
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 app = _make_app(fake_user)
                 client = TestClient(app, raise_server_exceptions=False)
                 resp = client.post(
                     _checkout_url(res_id),
-                    headers={"Idempotency-Key": "key-checked-in"},
+                    headers={"Idempotency-Key": "key-in-house"},
                 )
                 assert resp.status_code == 200
                 assert resp.json()["status"] == "checked_out"
+
+    def test_folio_query_failure_blocks_checkout(self, fake_user):
+        """Fail-closed: if folio_payments query fails, checkout is blocked (500)."""
+        res_id = str(uuid4())
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"):
+            with patch("hotelly.infra.db.txn") as mock_txn:
+                cur = MagicMock()
+
+                def _side_effect_execute(sql, params=None):
+                    if "folio_payments" in str(sql):
+                        raise Exception("relation \"folio_payments\" does not exist")
+
+                cur.fetchone.side_effect = [
+                    None,  # idempotency check
+                    _reservation_row(status="in_house"),
+                ]
+                cur.execute.side_effect = _side_effect_execute
+                mock_txn.return_value.__enter__.return_value = cur
+                app = _make_app(fake_user)
+                client = TestClient(app, raise_server_exceptions=False)
+                resp = client.post(
+                    _checkout_url(res_id),
+                    headers={"Idempotency-Key": "key-folio-fail"},
+                )
+                assert resp.status_code == 500
+                assert "balance" in resp.json()["detail"].lower()
+
+    def test_outstanding_balance_blocks_checkout(self, fake_user):
+        """Checkout blocked when payments < total_cents (balance > 0)."""
+        res_id = str(uuid4())
+        with patch("hotelly.api.rbac._get_user_role_for_property", return_value="staff"):
+            with patch("hotelly.infra.db.txn") as mock_txn:
+                cur = MagicMock()
+                cur.fetchone.side_effect = [
+                    None,  # idempotency check
+                    _reservation_row(status="in_house", total_cents=50000),
+                    _folio_payments_sum(total=20000),  # underpaid
+                ]
+                mock_txn.return_value.__enter__.return_value = cur
+                app = _make_app(fake_user)
+                client = TestClient(app, raise_server_exceptions=False)
+                resp = client.post(
+                    _checkout_url(res_id),
+                    headers={"Idempotency-Key": "key-balance"},
+                )
+                assert resp.status_code == 409
+                assert "balance" in resp.json()["detail"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +284,7 @@ class TestCheckOutHappyPath:
                 cur.fetchone.side_effect = [
                     None,  # idempotency check
                     _reservation_row(),
+                    _folio_payments_sum(),
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 app = _make_app(fake_user)
@@ -289,6 +344,7 @@ class TestCheckOutIdempotency:
                 cur.fetchone.side_effect = [
                     None,  # idempotency check
                     _reservation_row(),
+                    _folio_payments_sum(),
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 app = _make_app(fake_user)
