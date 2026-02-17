@@ -715,6 +715,71 @@ Libs:
   src/lib/rates.ts - getRates, putRates, types ← NOVO
 ```
 
+### 12.4 Fluxo de Continuous Deployment (CI/CD)
+
+Ambos os repositórios usam Cloud Build com triggers automáticos no push para a branch de produção.
+Os `cloudbuild.yaml` são **environment-agnostic** — staging e produção compartilham o mesmo arquivo,
+diferenciados apenas por substitution variables configuradas no trigger do GCP Console.
+
+#### hotelly-v2 (Backend)
+
+- **Branch de produção:** `master`
+- **Arquivo:** `cloudbuild.yaml` (raiz do repositório)
+- **Pipeline:** build → push → migrate (Cloud SQL Auth Proxy) → deploy-public + deploy-worker (paralelo)
+
+Substitution variables:
+
+| Variável | Staging (default) | Produção |
+|---|---|---|
+| `_IMAGE_TAG` | `staging` | `latest` |
+| `_SERVICE_NAME_PUBLIC` | `hotelly-public-staging` | `hotelly-public` |
+| `_SERVICE_NAME_WORKER` | `hotelly-worker-staging` | `hotelly-worker` |
+| `_CLOUD_SQL_INSTANCE` | *(vazio)* | `hotelly--ia:us-central1:hotelly-sql` |
+| `_DB_SECRET_NAME` | `hotelly-staging-database-url` | `hotelly-database-url` |
+
+Secrets (Secret Manager, referenciados via `availableSecrets`):
+- `DATABASE_URL` → resolvido dinamicamente pelo `_DB_SECRET_NAME`
+
+#### hotelly-admin (Frontend)
+
+- **Branch de produção:** `main`
+- **Arquivo:** `cloudbuild.yaml` (raiz do repositório)
+- **Pipeline:** build (com build-args Next.js) → push → deploy
+
+Substitution variables:
+
+| Variável | Staging (default) | Produção |
+|---|---|---|
+| `_IMAGE_TAG` | `staging` | `latest` |
+| `_SERVICE_NAME` | `hotelly-admin-staging` | `hotelly-admin` |
+| `_API_URL` | `https://hotelly-public-staging-dzsg3axcqq-uc.a.run.app` | `https://app.hotelly.ia.br` |
+| `_ENABLE_API` | `true` | `true` |
+| `_APP_ENV` | `staging` | `production` |
+| `_CLERK_PUBLISHABLE_KEY` | `pk_live_...` | *(confirmar se produção usa chave diferente)* |
+| `_CLERK_SIGN_IN_URL` | `/sign-in` | `/sign-in` |
+| `_CLERK_SIGN_UP_URL` | `/sign-up` | `/sign-up` |
+| `_CLERK_SIGN_IN_FALLBACK` | `/select-property` | `/select-property` |
+| `_CLERK_SIGN_UP_FALLBACK` | `/select-property` | `/select-property` |
+| `_BUILD_DATE` | *(vazio — auto)* | *(vazio — auto)* |
+
+#### Configuração do Trigger no GCP Console
+
+Para cada trigger:
+- **Event:** Push to a branch
+- **Branch regex:** `^master$` (hotelly-v2) ou `^main$` (hotelly-admin)
+- **Configuration:** Cloud Build configuration file → `/cloudbuild.yaml`
+- **Service Account:** Default Cloud Build SA (`<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com`)
+- **Substitution variables:** preencher conforme tabelas acima (override dos defaults)
+
+#### Notas importantes
+
+1. **Variáveis `NEXT_PUBLIC_*`** são injetadas no bundle do Next.js em **build time** via `--build-arg`.
+   Configurá-las como env vars do Cloud Run não tem efeito no client-side.
+2. **Migrations** rodam automaticamente no pipeline do hotelly-v2 via Cloud SQL Auth Proxy
+   antes do deploy, garantindo que o schema está atualizado antes de servir tráfego.
+3. **O mesmo `cloudbuild.yaml`** é usado para staging e produção — nunca duplique o arquivo.
+   Toda diferença entre ambientes deve ser resolvida via substitution variables.
+
 ---
 
 ## SEÇÃO 13: QUALITY GATES
