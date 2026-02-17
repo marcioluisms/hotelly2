@@ -180,8 +180,8 @@ class TestCleanupExpired:
 class TestTTL:
     """Tests for TTL constant."""
 
-    def test_ttl_is_one_hour(self):
-        """CONTACT_REF_TTL is 1 hour."""
+    def test_ttl_is_24_hours(self):
+        """CONTACT_REF_TTL is 24 hours (covers async payment flows)."""
         from hotelly.infra.contact_refs import CONTACT_REF_TTL
 
-        assert CONTACT_REF_TTL == timedelta(hours=1)
+        assert CONTACT_REF_TTL == timedelta(hours=24)

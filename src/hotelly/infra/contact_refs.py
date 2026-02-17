@@ -20,8 +20,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from psycopg2.extensions import cursor as PgCursor
 
 
-# TTL for contact refs (1 hour is sufficient for booking flow)
-CONTACT_REF_TTL = timedelta(hours=1)
+# TTL for contact refs (24 hours to cover async payment flows)
+CONTACT_REF_TTL = timedelta(hours=24)
 
 
 def _get_encryption_key() -> bytes:

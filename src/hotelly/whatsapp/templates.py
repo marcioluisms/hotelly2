@@ -59,6 +59,13 @@ TEMPLATES: dict[str, dict[str, Any]] = {
             "checkout_url",
         ],
     },
+    "reservation_confirmed": {
+        "text": (
+            "Olá! Sua reserva em {property_name} está confirmada. "
+            "Check-in: {checkin}, Check-out: {checkout}. Obrigado!"
+        ),
+        "allowed_params": ["property_name", "checkin", "checkout"],
+    },
     "quote_available_no_checkout": {
         "text": (
             "Ótimo! Encontrei disponibilidade:\n"

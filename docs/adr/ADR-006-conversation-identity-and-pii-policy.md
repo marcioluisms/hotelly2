@@ -81,7 +81,7 @@ O **contact_refs vault** é um cache criptografado que mapeia:
 
 ### Requisitos obrigatórios
 1. **Criptografia**: DEVE usar AES-256-GCM (ou equivalente) com chave simétrica via Secret Manager/env (`CONTACT_REFS_KEY`).
-2. **TTL curto**: registros DEVEM expirar em no máximo **1 hora** (configurável, padrão 1h).
+2. **TTL curto**: registros DEVEM expirar em no máximo **24 horas** (configurável, padrão 24h).
 3. **Acesso restrito**: SOMENTE o componente `sender` (outbound) pode ler o vault; worker NÃO TEM acesso.
 4. **Nunca logar**: remote_jid descriptografado NUNCA pode aparecer em logs.
 5. **Limpeza**: registros expirados DEVEM ser removidos (TTL nativo ou job de limpeza).
@@ -107,4 +107,4 @@ O **contact_refs vault** é um cache criptografado que mapeia:
 - Armazenar sender_id raw: rejeitado pela política de PII.
 - Armazenar remote_jid no worker payload: rejeitado; worker deve ser PII-free.
 - Vault sem criptografia: rejeitado; PII em repouso deve ser criptografada.
-- TTL longo no vault: rejeitado; minimizar janela de exposição.
+- TTL muito longo no vault (>24h): rejeitado; minimizar janela de exposição. TTL de 24h equilibra usabilidade e segurança.

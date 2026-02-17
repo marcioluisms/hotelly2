@@ -169,7 +169,7 @@ O worker de mensagens (`handle-message`) é **PII-free**:
 - Resolução do destinatário outbound via “vault”:
   - Mapeamento conceitual: `(property_id, channel, contact_hash) → remote_jid` **criptografado**
   - Criptografia: **AES-256-GCM** com chave simétrica **`CONTACT_REFS_KEY`** (Secret Manager/env)
-  - TTL curto (recomendado ≤ 1h)
+  - TTL: **24 horas** (configurável via código; aumentado de 1h para melhor usabilidade sem comprometer segurança)
   - Apenas sender (envio) lê o vault; `handle-message` não lê; worker não escreve no vault
   - Nunca logar `remote_jid` descriptografado
 - Se vault não tiver entrada: **não envia** (comportamento intencional) e registra erro PII-safe.
@@ -3079,11 +3079,11 @@ WHERE created_at < now() - interval '30 days';
 - Job/worker deve operar com credenciais mínimas.
 - Queries devem ser executadas em transação curta.
 
-## Apêndice E — WhatsApp Outbound: Retry & Idempotência (AS-IS audit — 2026-02-08)
+## Apêndice E — WhatsApp Outbound: Retry & Idempotência (Sprint 1.8 — Compliant)
 
-> **Escopo:** retrato do que está no código (AS-IS), para registrar evidência e apontar deltas contra o contrato normativo do Doc Unificado.  
-> **Repo:** `hotelly-v2`  
-> **Data do audit:** 2026-02-08
+> **Escopo:** registro do comportamento de retry/idempotência outbound, validado e em conformidade com o contrato normativo.
+> **Repo:** `hotelly-v2`
+> **Última validação:** 2026-02-17 (Sprint 1.8)
 
 ### E.1 Semântica HTTP atual em falhas (impacto direto em Cloud Tasks retry)
 
@@ -3092,15 +3092,17 @@ No código atual, existem **dois** handlers relacionados a envio:
 - `POST /tasks/whatsapp/send-response` (`send_response`)
 - `POST /tasks/whatsapp/send-message` (`send_message`, legacy/manual)
 
-**Fato (AS-IS):** `send-response` retorna **HTTP 200** em falhas relevantes e, portanto, **mata retry do Cloud Tasks** (Cloud Tasks não retry em 2xx).
+**Confirmado (Sprint 1.8):** `send-response` segue corretamente o contrato normativo:
 
-Casos levantados no audit:
-- `contact_ref` ausente/expirado → **200** `{"ok": false, "error": "contact_ref_not_found"}`
-- falha do provider (Evolution 401/403/5xx/timeout/rede, RuntimeError etc.) → **200** `{"ok": false, "error": "send_failed"}`
+- **Falha transiente** (5xx do provider, timeout, rede, 429 rate-limit, RuntimeError genérico) → **HTTP 500** `{"ok": false, "error": "transient_failure"}` → Cloud Tasks **faz retry**. ✔
+- **Falha permanente** (4xx exceto 429, config ausente, `contact_ref` expirado, template inválido) → **HTTP 200** com `terminal=true` → Cloud Tasks **não retry**. ✔
+- **Já enviado** (`outbox_deliveries.status = 'sent'`) → **HTTP 200** `{"already_sent": true}` → idempotente. ✔
 
-**Fato (AS-IS):** `send-message` retorna **não-2xx** em falhas equivalentes, portanto **habilita retry**:
+Classificação feita por `_is_permanent_failure()` em `tasks_whatsapp_send.py`. Guard de idempotência via tabela `outbox_deliveries` com lease de 60s.
+
+**Nota:** `send-message` (legacy) retorna **não-2xx** em falhas equivalentes, portanto **habilita retry**:
 - `contact_ref` ausente → **404**
-- falha do provider → **500**
+- falha do provider → **500** (sem distinção permanente/transiente — retries ilimitados em erros permanentes)
 
 ### E.2 Provider Evolution: retry interno limitado
 
@@ -3118,21 +3120,21 @@ Levantamento do audit (AS-IS):
 - `processed_events` **não** é escrito no outbound send (não há receipt/dedupe de entrega por `outbox_event_id`).
 - Request para Evolution **não** carrega idempotency key (nem header, nem campo no payload): vai apenas `number`, `text`, `apikey`.
 
-### E.4 Delta contra o contrato normativo do Doc Unificado
+### E.4 Conformidade com o contrato normativo do Doc Unificado
 
 O Doc Unificado define semântica para `send-response` onde:
 - **falha transiente** → **5xx** (para permitir retry do Cloud Tasks)
 - **falha permanente** → **200** com `terminal=true`
 
-**Estado AS-IS:** `send-response` não segue isso (200 em erro transiente).  
-**Risco:** perda silenciosa de entrega outbound quando houver instabilidade (sem retry).
+**Status (Sprint 1.8): Compliant.** `send-response` **está em conformidade** com o contrato normativo.
+Implementação via `_is_permanent_failure()` + `outbox_deliveries` delivery guard. Nenhuma ação pendente.
 
 ---
 
-## Apêndice F — WhatsApp: Staging/Infra (AS-IS audit — 2026-02-08)
+## Apêndice F — WhatsApp: Staging/Infra (Sprint 1.8 — atualizado)
 
-> **Escopo:** evidência do que está configurado (ou faltando) em staging e no código.  
-> **Data do audit:** 2026-02-08
+> **Escopo:** estado de configuração de env vars e infra para WhatsApp.
+> **Última atualização:** 2026-02-17 (Sprint 1.8)
 
 ### F.1 Contrato real de env vars (Evolution outbound) no código
 
@@ -3149,17 +3151,19 @@ Env var **opcional**:
 - O **provider** (Meta vs Evolution) é escolhido por **property** via DB (`properties.whatsapp_config` JSONB, campo `outbound_provider`, default `"evolution"`).
 - As **credenciais/endpoint Evolution** são **env-only globais** (`EVOLUTION_*`) — não há override por property no DB.
 
-### F.3 Gaps observados no `hotelly-worker-staging`
+### F.3 Estado de env vars no `hotelly-worker-staging`
 
-O audit aponta ausência (no YAML observado do Cloud Run do worker staging) de:
+**Configuradas (Sprint 1.8):**
+- `EVOLUTION_BASE_URL` ✔
+- `EVOLUTION_INSTANCE` ✔
+- `EVOLUTION_API_KEY` ✔
+
+**Gaps remanescentes** (ausentes no YAML do Cloud Run do worker staging):
 - `CONTACT_REFS_KEY`
 - `CONTACT_HASH_SECRET`
-- `EVOLUTION_BASE_URL`
-- `EVOLUTION_INSTANCE`
-- `EVOLUTION_API_KEY`
-- `EVOLUTION_SEND_PATH`
+- `EVOLUTION_SEND_PATH` (opcional, usa default `"/message/sendText/{instance}"`)
 
-Implicação operacional: qualquer task/handler que dependa disso falha por `RuntimeError: Missing ...`.
+Implicação operacional: handlers que dependem das vars ausentes falham por `RuntimeError: Missing ...`.
 
 ### F.4 IAM/Secret Manager — assimetria observada
 

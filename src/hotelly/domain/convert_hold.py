@@ -5,8 +5,12 @@ All operations happen in a single transaction with guards.
 """
 
 from hotelly.infra.db import txn
+from hotelly.infra.outbox_sender import enqueue_send_response
 from hotelly.infra.repositories.outbox_repository import emit_event
 from hotelly.infra.repositories.reservations_repository import insert_reservation
+from hotelly.observability.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Source identifier for processed_events dedupe
 TASK_SOURCE = "tasks.stripe.convert_hold"
@@ -207,6 +211,59 @@ def convert_hold(
             aggregate_type="reservation",
             aggregate_id=reservation_id,
             payload={**common_payload, "hold_id": hold_id, "payment_id": payment_id},
+            correlation_id=correlation_id,
+        )
+
+        # Step 9: WhatsApp notification — reservation confirmed
+        # Fetch contact_hash (vault key) and property_name in same txn
+        notification_event_id = None
+        cur.execute(
+            "SELECT contact_hash FROM conversations WHERE id = %s",
+            (conversation_id,),
+        )
+        conv_row = cur.fetchone()
+
+        cur.execute(
+            "SELECT name FROM properties WHERE id = %s",
+            (property_id,),
+        )
+        prop_row = cur.fetchone()
+
+        if conv_row and prop_row:
+            contact_hash = conv_row[0]
+            property_name = prop_row[0]
+            notification_event_id = emit_event(
+                cur,
+                property_id=property_id,
+                event_type="whatsapp.send_message",
+                aggregate_type="contact",
+                aggregate_id=contact_hash,
+                payload={
+                    "template_key": "reservation_confirmed",
+                    "params": {
+                        "property_name": property_name,
+                        "checkin": checkin.isoformat() if checkin else "",
+                        "checkout": checkout.isoformat() if checkout else "",
+                    },
+                },
+                correlation_id=correlation_id,
+            )
+        else:
+            logger.warning(
+                "convert_hold: skipping notification, missing conversation or property",
+                extra={"extra_fields": {
+                    "property_id": property_id,
+                    "hold_id": hold_id,
+                    "has_conversation": conv_row is not None,
+                    "has_property": prop_row is not None,
+                }},
+            )
+
+    # Enqueue send-response outside txn (fire-and-forget to Cloud Tasks)
+    if notification_event_id:
+        enqueue_send_response(
+            property_id=property_id,
+            outbox_event_id=notification_event_id,
             correlation_id=correlation_id,
         )
 

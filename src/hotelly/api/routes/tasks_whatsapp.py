@@ -23,6 +23,7 @@ from hotelly.domain.holds import create_hold
 from hotelly.domain.payments import create_checkout_session, HoldNotActiveError
 from hotelly.domain.quote import quote_minimum, QuoteUnavailable
 from hotelly.infra.db import txn
+from hotelly.infra.outbox_sender import enqueue_send_response
 from hotelly.observability.correlation import get_correlation_id
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
@@ -246,7 +247,7 @@ async def handle_message(request: Request) -> Response:
     # 5. Enqueue send-response task (outside transaction)
     # Payload is PII-free: references outbox_event_id only
     if response_template and outbox_event_id:
-        _enqueue_send_response(
+        enqueue_send_response(
             property_id=property_id,
             outbox_event_id=outbox_event_id,
             correlation_id=correlation_id,
@@ -584,31 +585,3 @@ def _insert_outbox_event(
     return cur.fetchone()[0]
 
 
-def _enqueue_send_response(
-    property_id: str,
-    outbox_event_id: int,
-    correlation_id: str | None,
-) -> None:
-    """Enqueue send-response task (S05).
-
-    Payload is PII-free:
-    - property_id and outbox_event_id reference data
-    - Task handler (S06) will resolve to_ref via vault using contact_hash from outbox
-
-    Args:
-        property_id: Property identifier.
-        outbox_event_id: Outbox event ID containing response text.
-        correlation_id: Request correlation ID.
-    """
-    # Task ID per backlog: "send:{outbox_event_id}"
-    task_id = f"send:{outbox_event_id}"
-
-    _get_tasks_client().enqueue_http(
-        task_id=task_id,
-        url_path="/tasks/whatsapp/send-response",
-        payload={
-            "property_id": property_id,
-            "outbox_event_id": outbox_event_id,
-        },
-        correlation_id=correlation_id,
-    )
