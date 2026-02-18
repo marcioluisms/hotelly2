@@ -1,5 +1,6 @@
 from hotelly.infra.repositories.reservations_repository import insert_reservation
 from hotelly.infra.repositories.outbox_repository import emit_event
+from hotelly.infra.repositories.guests_repository import upsert_guest
 from hotelly.observability.logging import get_logger
 from hotelly.observability.redaction import safe_log_context
 
@@ -26,7 +27,19 @@ def convert_hold(cur, hold_id, property_id, payment_id=None):
     if status != 'active':
         raise ValueError(f"hold is not active (status: {status})")
 
-    # Step 2: Insert Reservation
+    # Step 2: Resolve guest identity (G7)
+    # email and phone are not yet captured on holds; they will be wired here
+    # once a migration adds holds.email / holds.phone. Until then, upsert_guest
+    # creates a name-only profile and guest_id is linked for future enrichment.
+    guest_id: str | None = None
+    if guest_name:
+        guest_id, _ = upsert_guest(
+            cur,
+            property_id=property_id,
+            full_name=guest_name,
+        )
+
+    # Step 3: Insert Reservation
     reservation_id, created = insert_reservation(
         cur,
         property_id=property_id,
@@ -37,17 +50,18 @@ def convert_hold(cur, hold_id, property_id, payment_id=None):
         total_cents=total_cents,
         currency=currency,
         guest_name=guest_name,
+        guest_id=guest_id,
         adult_count=adult_count,
         children_ages=children_ages
     )
 
-    # Step 3: Mark hold as converted
+    # Step 4: Mark hold as converted
     cur.execute(
         "UPDATE holds SET status = 'converted' WHERE id = %s",
         (hold_uuid,)
     )
 
-    # Step 4: Emit Notification Event (Only if we have all data)
+    # Step 5: Emit Notification Event (Only if we have all data)
     if conversation_id:
         cur.execute("SELECT contact_hash FROM conversations WHERE id = %s", (conversation_id,))
         conv_row = cur.fetchone()

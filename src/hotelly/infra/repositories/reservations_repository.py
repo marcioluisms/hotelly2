@@ -22,6 +22,8 @@ def insert_reservation(
     room_type_id: str | None = None,
     adult_count: int = 2,
     children_ages: list[int] | None = None,
+    guest_name: str | None = None,
+    guest_id: str | None = None,
 ) -> tuple[str | None, bool]:
     """Insert a reservation with idempotency via UNIQUE(property_id, hold_id).
 
@@ -50,9 +52,10 @@ def insert_reservation(
         INSERT INTO reservations (
             property_id, hold_id, conversation_id,
             checkin, checkout, total_cents, currency,
-            room_type_id, adult_count, children_ages
+            room_type_id, adult_count, children_ages,
+            guest_name, guest_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (property_id, hold_id) DO NOTHING
         RETURNING id
         """,
@@ -67,6 +70,8 @@ def insert_reservation(
             room_type_id,
             adult_count,
             json.dumps(children_ages or []),
+            guest_name,
+            guest_id,
         ),
     )
     row = cur.fetchone()
