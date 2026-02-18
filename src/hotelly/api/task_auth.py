@@ -5,6 +5,8 @@ Used by worker task handlers to verify OIDC tokens from Cloud Tasks.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 
 from fastapi import Request
@@ -18,6 +20,32 @@ logger = get_logger(__name__)
 
 # Local dev audience - enables X-Internal-Task-Secret fallback
 _LOCAL_DEV_AUDIENCE = "hotelly-tasks-local"
+
+
+def _extract_unverified_claim(token: str, claim: str) -> str | None:
+    """Decode a single claim from a JWT payload without verifying the signature.
+
+    Used exclusively for diagnostic logging after verification has already
+    failed. The returned value must never be trusted for any auth decision.
+
+    Args:
+        token: Raw JWT string (three base64url segments separated by ".").
+        claim: Claim key to extract (e.g. "aud", "iss").
+
+    Returns:
+        String representation of the claim value, or None if unavailable.
+    """
+    try:
+        payload_segment = token.split(".")[1]
+        # Re-add base64 padding that JWT encoding strips
+        padding = 4 - len(payload_segment) % 4
+        if padding != 4:
+            payload_segment += "=" * padding
+        payload = json.loads(base64.urlsafe_b64decode(payload_segment))
+        value = payload.get(claim)
+        return str(value) if value is not None else None
+    except Exception:
+        return None
 
 
 def extract_bearer_token(request: Request) -> str | None:
@@ -86,9 +114,16 @@ def verify_task_oidc(token: str) -> bool:
         return True
 
     except ValueError as e:
+        received_aud = _extract_unverified_claim(token, "aud")
         logger.warning(
             "OIDC token verification failed",
-            extra={"extra_fields": safe_log_context(error=str(e))},
+            extra={
+                "extra_fields": safe_log_context(
+                    error=str(e),
+                    expected_audience=audience,
+                    received_audience=received_aud,
+                )
+            },
         )
         return False
 
@@ -122,5 +157,9 @@ def verify_task_auth(request: Request) -> bool:
     # Standard OIDC verification
     token = extract_bearer_token(request)
     if not token:
+        logger.warning(
+            "task auth failed: missing Bearer token",
+            extra={"extra_fields": safe_log_context(reason="missing_bearer_token")},
+        )
         return False
     return verify_task_oidc(token)
