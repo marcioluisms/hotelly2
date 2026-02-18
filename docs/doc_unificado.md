@@ -213,6 +213,27 @@ Idempotência ponta a ponta combina:
 - Fonte da verdade do schema são as migrations em `migrations/` (Alembic).
 - Arquivos auxiliares (ex.: `docs/data/*.sql`) são referência humana, não execução.
 
+**Sprint 1.10 — tabela `guests` (identidade do hóspede, migration `024_guests_crm`):**
+
+| Coluna | Tipo | Constraints |
+|---|---|---|
+| `id` | UUID | PK, default `gen_random_uuid()` |
+| `property_id` | TEXT | NOT NULL, FK → `properties(id)` ON DELETE CASCADE |
+| `email` | TEXT | nullable |
+| `phone` | TEXT | nullable |
+| `full_name` | TEXT | NOT NULL |
+| `display_name` | TEXT | nullable |
+| `document_id` | TEXT | nullable |
+| `document_type` | TEXT | nullable |
+| `profile_data` | JSONB | NOT NULL, default `'{}'` |
+| `created_at` | TIMESTAMPTZ | NOT NULL, default `now()` |
+| `updated_at` | TIMESTAMPTZ | NOT NULL, default `now()` |
+| `last_stay_at` | TIMESTAMPTZ | nullable |
+
+Índices de unicidade (parciais, apenas quando o valor está presente):
+- `uq_guests_property_email` — UNIQUE `(property_id, email) WHERE email IS NOT NULL`
+- `uq_guests_property_phone` — UNIQUE `(property_id, phone) WHERE phone IS NOT NULL`
+
 ### 6.2 Constraints/guardrails (essenciais)
 - Dedupe eventos: `processed_events(source, external_id)` **UNIQUE**
 - 1 reserva por hold: `reservations(property_id, hold_id)` **UNIQUE**
@@ -260,8 +281,13 @@ Compatibilidade `/rates`:
 - `holds` e `reservations` persistem:
   - `adult_count` (SMALLINT)
   - `children_ages` (JSONB, default `[]`)
-  - `guest_name` (TEXT, nullable)
+  - `guest_name` (TEXT, nullable) — **snapshot histórico**: cópia do nome no momento da reserva, mantida para auditoria mesmo que o perfil do hóspede seja atualizado posteriormente.
 - `guest_count` foi removido (DB + código).
+
+**Identidade do hóspede (Sprint 1.10):**
+- `reservations.guest_id` (UUID, nullable, FK → `guests(id)`) — referência ao perfil normalizado. Populado por `upsert_guest()` no momento da conversão do hold.
+- `reservations.guest_name` e `reservations.guest_id` coexistem: `guest_name` é o snapshot imutável; `guest_id` é o vínculo vivo ao CRM.
+- Reservas anteriores ao Sprint 1.10 têm `guest_id = NULL`; isso é esperado e não constitui erro.
 
 ---
 
@@ -635,6 +661,7 @@ curl -X POST "https://edge.roda.ia.br/chat/findMessages/<instance>" \
 - **G2:** segurança/PII (lint simples) — falhar CI se houver logs/prints com payload/body/webhook sem redação, ou se rotas internas estiverem expostas no router público.
 - **G3–G5:** obrigatórios para mudanças em retry/idempotência/concorrência/race em transações críticas.
 - **G6 (Transação):** funções de domínio que afetam múltiplas tabelas (ex: `convert_hold`) DEVEM ser chamadas dentro de um bloco `with txn():`. Chamadas fora de transação são proibidas e devem ser rejeitadas em code review.
+- **G7 (Identidade do Hóspede):** toda conversão de hold em reserva DEVE chamar `guests_repository.upsert_guest()` na mesma transação para resolver ou criar o perfil do hóspede e preencher `reservations.guest_id`. Inserir em `reservations` sem resolver `guest_id` é proibido em código novo.
 
 17.1.1 Trava de Segurança RBAC (P0)
 - Proteção de Propriedade Órfã: O sistema impede a remoção de um usuário se ele for o único Owner restante da propriedade.
