@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 
 import requests
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.id_token import fetch_id_token
 
 from hotelly.observability.logging import get_logger
 
@@ -16,6 +18,32 @@ logger = get_logger(__name__)
 WORKER_BASE_URL = os.environ.get("WORKER_BASE_URL", "http://worker:8000")
 INTERNAL_TASK_SECRET = os.environ.get("INTERNAL_TASK_SECRET", "")
 HTTP_TIMEOUT = int(os.environ.get("TASKS_HTTP_TIMEOUT", "30"))
+
+# Must match task_auth._LOCAL_DEV_AUDIENCE
+_LOCAL_DEV_AUDIENCE = "hotelly-tasks-local"
+
+
+def _fetch_oidc_token(audience: str) -> str | None:
+    """Fetch a GCP ID token for the given audience.
+
+    Relies on the GCP metadata server (Cloud Run, GCE) or application
+    default credentials. Must not be called in local dev environments.
+
+    Args:
+        audience: Token audience — must equal TASKS_OIDC_AUDIENCE on the
+                  receiving worker (typically WORKER_BASE_URL).
+
+    Returns:
+        Signed ID token string, or None if fetching fails.
+    """
+    try:
+        return fetch_id_token(GoogleRequest(), audience)
+    except Exception as e:
+        logger.error(
+            "failed to fetch OIDC ID token",
+            extra={"audience": audience, "error": str(e)},
+        )
+        return None
 
 
 def enqueue_http(
@@ -53,9 +81,19 @@ def enqueue_http(
         "X-Task-Id": task_id,
     }
 
-    # Internal authentication (simulates OIDC for local dev)
-    if INTERNAL_TASK_SECRET:
-        headers["X-Internal-Task-Secret"] = INTERNAL_TASK_SECRET
+    # Authentication: shared secret for local dev, real OIDC token elsewhere
+    if os.environ.get("TASKS_OIDC_AUDIENCE", "") == _LOCAL_DEV_AUDIENCE:
+        if INTERNAL_TASK_SECRET:
+            headers["X-Internal-Task-Secret"] = INTERNAL_TASK_SECRET
+    else:
+        token = _fetch_oidc_token(WORKER_BASE_URL)
+        if not token:
+            logger.error(
+                "HTTP task enqueue aborted: OIDC token unavailable",
+                extra={"task_id": task_id, "url_path": url_path},
+            )
+            return False
+        headers["Authorization"] = f"Bearer {token}"
 
     try:
         response = requests.post(
