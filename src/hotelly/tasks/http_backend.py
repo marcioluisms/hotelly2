@@ -39,10 +39,6 @@ def _fetch_oidc_token(audience: str) -> str | None:
     try:
         return fetch_id_token(GoogleRequest(), audience)
     except Exception as e:
-        import traceback as _tb
-        # Raw print bypasses the logger to confirm whether hotelly.tasks.*
-        # log output is being suppressed. Remove once root cause is confirmed.
-        print(f"OIDC_PROBE audience={audience} error={e!r}\n{_tb.format_exc()}", flush=True)
         logger.error(
             "failed to fetch OIDC ID token",
             extra={"audience": audience, "error": str(e)},

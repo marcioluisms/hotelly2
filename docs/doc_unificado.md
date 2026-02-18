@@ -485,6 +485,22 @@ Regras operacionais críticas:
 
 ⚠️ Observação: job `hotelly-migrate-staging` estava quebrado (DATABASE_URL mal formatado). Preferir Cloud SQL Proxy manual.
 
+#### Regra de Ouro — Audience OIDC (validado em 2026-02-18, Sprint 1.9)
+
+> **`WORKER_BASE_URL` (emissor) deve ser uma string idêntica a `TASKS_OIDC_AUDIENCE` (receptor).**
+
+| Variável | Serviço onde é configurada | Papel |
+|---|---|---|
+| `WORKER_BASE_URL` | `hotelly-public-staging` | Define o `audience` do token OIDC gerado por `_fetch_oidc_token` |
+| `TASKS_OIDC_AUDIENCE` | `hotelly-worker-staging` | Define o `audience` esperado por `verify_task_oidc` |
+
+`google.oauth2.id_token.verify_oauth2_token` usa **igualdade exata de string**. Qualquer divergência de formato causa `ValueError: Token has wrong audience` e rejeição silenciosa da task.
+
+**Formato correto:** `https://<service>-<hash>-<abbrev>.a.run.app` (URL canônica do Cloud Run — `*.a.run.app`)
+**Formato proibido:** `https://<service>-<hash>.<region>.run.app` (URL regional — aponta para o mesmo serviço, mas a string é diferente)
+
+Causa raiz documentada: incidente de 2026-02-18 13:58 UTC — `WORKER_BASE_URL` estava no formato regional (`*.us-central1.run.app`) enquanto `TASKS_OIDC_AUDIENCE` usava o formato canônico (`*.a.run.app`). O token chegou ao worker, mas foi rejeitado no `verify_task_oidc`. Nenhuma lógica de negócio foi executada.
+
 ### 12.3 Ciclo Financeiro e Folio (v1.7)
 **Status:** Validado em Staging.
 
@@ -557,7 +573,7 @@ Caso staging esteja com schema “adiantado” e `alembic_version` atrasado:
 ## 14) Troubleshooting (rápido, prático)
 
 - “202 mas nada acontece”: `TASKS_BACKEND=inline` ou `TASKS_BACKEND` errado impede execução real.
-- `401` em tasks: audience OIDC errado (`TASKS_OIDC_AUDIENCE`) ou token emitido para host diferente.
+- `401` em tasks / `Token has wrong audience`: `WORKER_BASE_URL` e `TASKS_OIDC_AUDIENCE` divergem. Ambos devem usar o formato canônico `*.a.run.app` — ver Regra de Ouro em §12.2.
 - PermissionDenied `iam.serviceAccounts.actAs`: falta `roles/iam.serviceAccountUser` para o SA que cria tasks com OIDC usando `TASKS_OIDC_SERVICE_ACCOUNT`.
 - `InvalidTag` (AESGCM): `CONTACT_HASH_SECRET` / `CONTACT_REFS_KEY` divergentes entre public e worker. Após alinhar, limpar `contact_refs` para regenerar.
 - Provider WhatsApp 400/exists:false: número inexistente em teste; validar com número real.
@@ -1363,6 +1379,7 @@ COMMIT;
 > - **Async/Decoupling:** webhook persiste receipt e enfileira task (`/tasks/stripe/handle-event`) via `TasksClient.enqueue_http()`. Nenhuma lógica de domínio no handler. — ✔
 > - **Resposta rápida:** 200 OK retornado imediatamente após INSERT + enqueue. Sem chamadas Stripe API no webhook. — ✔
 > - **Teste DoD:** `tests/test_stripe_webhook_dod.py` — 5/5 cenários (assinatura real, idempotência, payload adulterado, secret errado, rollback em falha de enqueue).
+> - **Metadata Stripe (Sprint 1.9 fix):** `create_checkout_session` agora envia `metadata = {hold_id, property_id, conversation_id}` conforme contrato §3.2. Corrigido em `domain/payments.py` + `holds_repository.get_hold()` (adicionado `conversation_id` ao SELECT).
 
 Este documento descreve a transação crítica do Hotelly V2, com:
 - objetivo e invariantes
