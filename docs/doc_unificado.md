@@ -260,6 +260,7 @@ Compatibilidade `/rates`:
 - `holds` e `reservations` persistem:
   - `adult_count` (SMALLINT)
   - `children_ages` (JSONB, default `[]`)
+  - `guest_name` (TEXT, nullable)
 - `guest_count` foi removido (DB + código).
 
 ---
@@ -633,6 +634,7 @@ curl -X POST "https://edge.roda.ia.br/chat/findMessages/<instance>" \
 - **G1:** `migrate up` em DB vazio + `migrate up` idempotente + constraints críticas presentes.
 - **G2:** segurança/PII (lint simples) — falhar CI se houver logs/prints com payload/body/webhook sem redação, ou se rotas internas estiverem expostas no router público.
 - **G3–G5:** obrigatórios para mudanças em retry/idempotência/concorrência/race em transações críticas.
+- **G6 (Transação):** funções de domínio que afetam múltiplas tabelas (ex: `convert_hold`) DEVEM ser chamadas dentro de um bloco `with txn():`. Chamadas fora de transação são proibidas e devem ser rejeitadas em code review.
 
 17.1.1 Trava de Segurança RBAC (P0)
 - Proteção de Propriedade Órfã: O sistema impede a remoção de um usuário se ele for o único Owner restante da propriedade.

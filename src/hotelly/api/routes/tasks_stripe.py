@@ -243,16 +243,13 @@ async def handle_event(request: Request) -> Response:
 
     # Only convert hold if payment is successful
     if stripe_payment_status == "paid" and hold_id:
-        # Deterministic task_id for dedupe
-        task_id = f"stripe:{event_id}"
-
-        convert_result = convert_hold(
-            property_id=property_id,
-            hold_id=hold_id,
-            payment_id=payment_id,
-            task_id=task_id,
-            correlation_id=req_correlation_id,
-        )
+        with txn() as cur:
+            convert_result = convert_hold(
+                cur,
+                hold_id=hold_id,
+                property_id=property_id,
+                payment_id=payment_id,
+            )
 
         logger.info(
             "convert_hold completed",
