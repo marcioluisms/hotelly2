@@ -213,7 +213,7 @@ Idempotência ponta a ponta combina:
 - Fonte da verdade do schema são as migrations em `migrations/` (Alembic).
 - Arquivos auxiliares (ex.: `docs/data/*.sql`) são referência humana, não execução.
 
-**Sprint 1.10 — tabela `guests` (identidade do hóspede, migration `024_guests_crm`):**
+**`guests`: Entidade global de identidade (CRM). Campos normalizados (`email`, `phone` E.164) e preferências (`profile_data` JSONB). Sprint 1.10 — migration `024_guests_crm`.**
 
 | Coluna | Tipo | Constraints |
 |---|---|---|
@@ -3335,6 +3335,14 @@ Se o worker precisar montar `CONTACT_HASH_SECRET` (ex.: para hashing) isso quebr
 - Regra de Ouro OIDC documentada: `WORKER_BASE_URL` ≡ `TASKS_OIDC_AUDIENCE`
 - Migration `023_holds_guest_name`: `holds.guest_name TEXT` para snapshot do Worker
 - Testes DoD: `tests/test_stripe_webhook_dod.py` — 5/5 cenários
+
+**Sprint 1.10 — Entregas verificadas:**
+- Implementada tabela `guests` (Fonte da Verdade), vínculo com `reservations` e lógica de Upsert/Deduplicação por e-mail.
+- Migration `024_guests_crm`: tabela `guests` (12 colunas), índices parciais únicos por `(property_id, email)` e `(property_id, phone)`, FK `reservations.guest_id`.
+- Migration `025_holds_contact_fields`: `holds.email` e `holds.phone` como campos de entrada para resolução de identidade.
+- `guests_repository.upsert_guest()`: resolução email-first → phone → name-only; `FOR UPDATE` previne race condition entre reservas concorrentes.
+- `convert_hold` (Gate G7): chama `upsert_guest()` na mesma transação antes de inserir a reserva; `reservations.guest_id` populado em toda conversão nova.
+- CRM Bridge validado em staging: E2E com Cenário 1 (novo hóspede) e Cenário 2 (hóspede retornante — mesmo `guest_id`, nome atualizado, sem duplicata).
 
 ---
 
