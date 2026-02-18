@@ -915,8 +915,12 @@ gcloud builds submit --config cloudbuild.yaml \
 **Fonte da Verdade:** GitHub. Deploys manuais via CLI local estão descontinuados.
 
 **Triggers de Produção (Geração 2):**
-- **hotelly-admin:** Dispara em PUSH na branch `main`.
-- **hotelly-v2:** Dispara em PUSH na branch `master`.
+| Trigger GCP | Repositório | Branch | Config |
+| :--- | :--- | :--- | :--- |
+| `hotelly-admin-production` | `hotelly-admin` | `^main$` | `cloudbuild.yaml` |
+| `hotelly-v2-production` | `hotelly2` | `^master$` | `cloudbuild.yaml` |
+
+> ℹ️ Ambos os triggers já existem no GCP (`us-central1`). Não recrie — duplicar causa builds paralelos no mesmo push.
 
 **Variáveis de Substituição Críticas (GCP Console):**
 | Repositório | Variável | Valor Produção |
@@ -1851,7 +1855,7 @@ O que validar:
 ---
 
 #### Suite mínima local (TARGET: espelhar Quality Gates)
-**Nota:** os gates G0–G6 são TARGET (ver `02_cicd_environments.md`). Enquanto não houver script oficial/CI cobrindo,
+**Nota:** os gates G0–G8 são TARGET (ver `02_cicd_environments.md`). Enquanto não houver script oficial/CI cobrindo,
 use esta seção como checklist local.
 
 Rodar antes de fechar qualquer story relevante:
@@ -2044,7 +2048,7 @@ Enquanto isso, trate estas seções como especificação do sistema-alvo.
 
 ##### Estado atual (repo hoje)
 No momento, o CI no repositório cobre apenas o mínimo (ex.: `compileall` e `pytest`).
-Os **Quality Gates (G0–G6)** abaixo representam o **alvo normativo** do projeto.
+Os **Quality Gates (G0–G8)** abaixo representam o **alvo normativo** do projeto.
 Até estarem implementados no CI (ou em um script local padronizado), eles **não podem ser tratados como "aplicados"**.
 
 Regra: qualquer item descrito como gate e ainda não implementado deve virar tarefa explícita (story) antes de ser usado como critério de aceite.
@@ -2100,7 +2104,13 @@ Marque um gate como "aplicável" somente quando houver implementação real no C
   - sem inventário negativo
   - no máximo 1 reserva
 
-- **G6 — Pricing determinístico**
+- **G6 — Transaction Gate** *(domínio — ver §17.1)*
+  - funções de domínio que afetam múltiplas tabelas devem ser chamadas dentro de `with txn():`
+
+- **G7 — Guest Identity** *(domínio — ver §17.1)*
+  - toda conversão de hold em reserva deve chamar `upsert_guest()` na mesma transação
+
+- **G8 — Pricing determinístico**
   - golden tests para BPS/FIXED/PACKAGE* (quando pricing existir)
 
 ---
@@ -2302,7 +2312,7 @@ Os gates abaixo são obrigatórios e devem falhar o CI quando não cumpridos.
 **G5 — Race Expire vs Convert (MUST para pagamentos)**
 - simular expire e convert competindo → sem inventário negativo e no máximo 1 reserva
 
-**G6 — Pricing determinístico (MUST quando existir pricing)**
+**G8 — Pricing determinístico (MUST quando existir pricing)**
 - golden tests (BPS/FIXED/PACKAGE) para impedir regressão
 
 > Observação: a lista completa dos gates está em `docs/operations/07_quality_gates.md`.
@@ -2441,7 +2451,7 @@ Os gates abaixo são obrigatórios e devem falhar o CI quando não cumpridos.
 
 #### Critérios de aceite por story (regra prática)
 - Story que toca **inventário/pagamento/transação crítica**: **G3–G5 obrigatórios**.
-- Story que toca **pricing**: **G6 obrigatório**.
+- Story que toca **pricing**: **G8 obrigatório**.
 - Story qualquer: **G0–G2 obrigatórios**.
 
 ---
@@ -2451,7 +2461,7 @@ Os gates abaixo são obrigatórios e devem falhar o CI quando não cumpridos.
 2) Se tocar “dinheiro/inventário”: escrever caso de replay (idempotência) + caso de concorrência/race quando aplicável
 3) Fixar tempo (ex.: usar clock controlado) e usar fixture mínima
 4) Garantir que logs não incluem payload/PII
-5) Amarrar ao gate correspondente (G3–G6) se aplicável
+5) Amarrar ao gate correspondente (G3–G8) se aplicável
 
 ---
 
