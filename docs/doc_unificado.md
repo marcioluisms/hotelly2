@@ -288,6 +288,11 @@ Compatibilidade `/rates`:
   - `guest_name` (TEXT, nullable) — **snapshot histórico**: cópia do nome no momento da reserva, mantida para auditoria mesmo que o perfil do hóspede seja atualizado posteriormente.
 - `guest_count` foi removido (DB + código).
 
+**Campos de contato em `holds` (Sprint 1.10 — CRM Bridge, migration 025):**
+- `holds.email` (TEXT, nullable) — e-mail capturado pelo fluxo de booking; usado por `upsert_guest()` como chave primária de deduplicação.
+- `holds.phone` (TEXT, nullable) — telefone E.164; usado como chave secundária de deduplicação quando `email` é nulo.
+- Ambos são nullable: holds criados por fluxos que ainda não capturam contato terão `NULL`; nesse caso `upsert_guest()` cria um perfil name-only e a deduplicação passa a funcionar automaticamente assim que o upstream preencher esses campos.
+
 **Identidade do hóspede (Sprint 1.10):**
 - `reservations.guest_id` (UUID, nullable, FK → `guests(id)`) — referência ao perfil normalizado. Populado por `upsert_guest()` no momento da conversão do hold.
 - `reservations.guest_name` e `reservations.guest_id` coexistem: `guest_name` é o snapshot imutável; `guest_id` é o vínculo vivo ao CRM.

@@ -10,7 +10,7 @@ def convert_hold(cur, hold_id, property_id, payment_id=None):
     # Step 1: Lock hold for update
     cur.execute(
         """
-        SELECT id, status, checkin, checkout, total_cents, currency, conversation_id, adult_count, children_ages, guest_name
+        SELECT id, status, checkin, checkout, total_cents, currency, conversation_id, adult_count, children_ages, guest_name, email, phone
         FROM holds
         WHERE id = %s AND property_id = %s
         FOR UPDATE
@@ -18,25 +18,27 @@ def convert_hold(cur, hold_id, property_id, payment_id=None):
         (hold_id, property_id)
     )
     row = cur.fetchone()
-    
+
     if not row:
         return {"status": "noop"}
 
-    hold_uuid, status, checkin, checkout, total_cents, currency, conversation_id, adult_count, children_ages, guest_name = row
+    hold_uuid, status, checkin, checkout, total_cents, currency, conversation_id, adult_count, children_ages, guest_name, email, phone = row
 
     if status != 'active':
         raise ValueError(f"hold is not active (status: {status})")
 
     # Step 2: Resolve guest identity (G7)
-    # email and phone are not yet captured on holds; they will be wired here
-    # once a migration adds holds.email / holds.phone. Until then, upsert_guest
-    # creates a name-only profile and guest_id is linked for future enrichment.
+    # Use email-first, then phone for deduplication (Sprint 1.10 CRM Bridge).
+    # If neither contact field is available, a name-only profile is created;
+    # deduplication will activate once the upstream flow captures email/phone.
     guest_id: str | None = None
     if guest_name:
         guest_id, _ = upsert_guest(
             cur,
             property_id=property_id,
             full_name=guest_name,
+            email=email,
+            phone=phone,
         )
 
     # Step 3: Insert Reservation
