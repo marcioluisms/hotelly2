@@ -170,6 +170,7 @@ def create_checkout_session(
         property_id = hold["property_id"]
         amount_cents = hold["total_cents"]
         currency = hold["currency"]
+        conversation_id = hold.get("conversation_id")
 
         # 2. Check for existing payment
         existing_payment = _find_existing_payment(c, hold_id)
@@ -204,7 +205,11 @@ def create_checkout_session(
             amount_cents=amount_cents,
             currency=currency,
             idempotency_key=idempotency_key,
-            metadata={"hold_id": hold_id},
+            metadata={
+                "hold_id": hold_id,
+                "property_id": property_id,
+                "conversation_id": str(conversation_id) if conversation_id else "",
+            },
             correlation_id=correlation_id,
         )
 

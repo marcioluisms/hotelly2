@@ -18,6 +18,7 @@ from .routes import (
     cancellation_policy,
     child_policies,
     conversations,
+    debug,
     extras,
     folio,
     frontdesk,
@@ -88,6 +89,7 @@ def create_app(role: AppRole | None = None) -> FastAPI:
 
     # Mount auth routes only for public role (dashboard/API)
     if role == "public":
+        app.include_router(debug.router)
         app.include_router(auth.router)
         app.include_router(conversations.router)
         app.include_router(frontdesk.router)

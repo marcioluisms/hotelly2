@@ -239,7 +239,8 @@ def get_hold(cur: PgCursor, hold_id: str) -> dict | None:
     cur.execute(
         """
         SELECT id, property_id, status, checkin, checkout,
-               expires_at, total_cents, currency, create_idempotency_key
+               expires_at, total_cents, currency, create_idempotency_key,
+               conversation_id, guest_name
         FROM holds
         WHERE id = %s
         """,
@@ -259,4 +260,6 @@ def get_hold(cur: PgCursor, hold_id: str) -> dict | None:
         "total_cents": row[6],
         "currency": row[7],
         "create_idempotency_key": row[8],
+        "conversation_id": str(row[9]) if row[9] else None,
+        "guest_name": row[10],
     }

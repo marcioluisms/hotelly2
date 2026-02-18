@@ -55,6 +55,7 @@ class StripeClient:
         success_url: str | None = None,
         cancel_url: str | None = None,
         metadata: dict[str, str] | None = None,
+        client_reference_id: str | None = None,
         correlation_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a Stripe Checkout Session.
@@ -66,6 +67,7 @@ class StripeClient:
             success_url: Redirect URL on success (defaults to placeholder).
             cancel_url: Redirect URL on cancel (defaults to placeholder).
             metadata: Optional metadata to attach to session.
+            client_reference_id: Optional client reference ID for deduplication.
             correlation_id: Optional correlation ID for logging.
 
         Returns:
@@ -100,6 +102,9 @@ class StripeClient:
 
         if metadata:
             params["metadata"] = metadata
+
+        if client_reference_id:
+            params["client_reference_id"] = client_reference_id
 
         session = client.v1.checkout.sessions.create(
             params=params,

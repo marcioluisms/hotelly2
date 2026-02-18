@@ -562,8 +562,13 @@ python -m compileall -q src
 
 ### 13.2 Build (GCP)
 ```bash
-gcloud builds submit --project hotelly--ia   --tag us-central1-docker.pkg.dev/hotelly--ia/hotelly/hotelly:latest .
+# Padrão atual: usa cloudbuild.yaml (build → push → migrate → deploy em um passo)
+gcloud builds submit . --config cloudbuild.yaml
+
+# Submissão assíncrona (retorna Build ID imediatamente, não bloqueia o terminal)
+gcloud builds submit . --config cloudbuild.yaml --async
 ```
+> ⚠️ O comando legado `--tag` não executa migrations — usar apenas para builds de emergência sem mudança de schema.
 
 ### 13.3 Redeploy (forçar nova revisão)
 ```bash
@@ -926,6 +931,10 @@ gcloud builds submit --config cloudbuild.yaml \
 
 **Ordem de Execução do Build (v2):**
 `Docker Build` -> `Push Artifact Registry` -> `Database Migrate` (Alembic) -> `Cloud Run Deploy`.
+
+**Boas Práticas — step `migrate` (lição operacional):**
+- `_CLOUD_SQL_INSTANCE` **deve** ter valor padrão em `cloudbuild.yaml`. Se vazio, o proxy inicia sem instância e morre silenciosamente; o `alembic upgrade head` então falha com `Connection refused` sem mensagem clara.
+- Use **poll de prontidão** em vez de `sleep` fixo: o step inicia o proxy em background e tenta `python3 socket.connect(127.0.0.1:5432)` a cada 1 s (até 30 tentativas). Conectou → segue; esgotou → falha com `ERROR: Cloud SQL Proxy did not become ready within 30 s`. Isso torna falhas de proxy imediatamente visíveis nos logs do Cloud Build.
 
 ---
 
