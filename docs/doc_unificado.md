@@ -768,6 +768,7 @@ O backend não lê metadata.property_ids nem metadata.role do Clerk. Ele só usa
   * `hotelly-staging-database-url:3`
   * `contact-hash-secret-staging:1`
   * `contact-refs-key-staging:1`
+  * `stripe-webhook-secret-staging` — obrigatório (Sprint 1.9)
 * Env fixa:
 
   * `OIDC_AUDIENCE=hotelly-api`
@@ -1353,6 +1354,15 @@ COMMIT;
 - Se cancelamento acontece por “timeout do usuário”, considere usar o mesmo mecanismo de expiração (task) para simplificar.
 
 ### 04 — Stripe Confirm → Convert Hold → Create Reservation
+
+> **Status: Implementado e Verificado (Sprint 1.9)**
+>
+> O processamento de webhook (`checkout.session.completed`) foi auditado e testado em Sprint 1.9:
+> - **Signature validation:** `stripe.Webhook.construct_event` com `STRIPE_WEBHOOK_SECRET` — P0 ✔
+> - **Idempotência:** `INSERT INTO processed_events ... ON CONFLICT DO NOTHING` + `rowcount == 0` → 200 "duplicate" — ✔
+> - **Async/Decoupling:** webhook persiste receipt e enfileira task (`/tasks/stripe/handle-event`) via `TasksClient.enqueue_http()`. Nenhuma lógica de domínio no handler. — ✔
+> - **Resposta rápida:** 200 OK retornado imediatamente após INSERT + enqueue. Sem chamadas Stripe API no webhook. — ✔
+> - **Teste DoD:** `tests/test_stripe_webhook_dod.py` — 5/5 cenários (assinatura real, idempotência, payload adulterado, secret errado, rollback em falha de enqueue).
 
 Este documento descreve a transação crítica do Hotelly V2, com:
 - objetivo e invariantes
@@ -3131,10 +3141,10 @@ Implementação via `_is_permanent_failure()` + `outbox_deliveries` delivery gua
 
 ---
 
-## Apêndice F — WhatsApp: Staging/Infra (Sprint 1.8 — atualizado)
+## Apêndice F — Staging/Infra (Sprint 1.9 — atualizado)
 
-> **Escopo:** estado de configuração de env vars e infra para WhatsApp.
-> **Última atualização:** 2026-02-17 (Sprint 1.8)
+> **Escopo:** estado de configuração de env vars e infra para WhatsApp e Stripe.
+> **Última atualização:** 2026-02-18 (Sprint 1.9)
 
 ### F.1 Contrato real de env vars (Evolution outbound) no código
 
@@ -3172,6 +3182,20 @@ No audit:
 - Worker **não** tem acesso ao secret `contact-hash-secret` (binding presente apenas para o public SA)
 
 Se o worker precisar montar `CONTACT_HASH_SECRET` (ex.: para hashing) isso quebra em staging.
+
+### F.5 Stripe: env vars obrigatórias (Sprint 1.9)
+
+**`hotelly-public-staging`** — obrigatórias para webhook Stripe:
+- `STRIPE_WEBHOOK_SECRET` — secret do endpoint webhook Stripe (obrigatório; sem ele o serviço retorna 500 em qualquer evento). Deve ser provisionado no Secret Manager e vinculado à Service Account do Cloud Run public.
+
+**`hotelly-worker-staging`** — obrigatórias para task handler Stripe:
+- `STRIPE_SECRET_KEY` — API key Stripe (obrigatório para `stripe.checkout.Session.retrieve` no handler `handle-event`).
+
+**Status:**
+- [ ] `STRIPE_WEBHOOK_SECRET` — pendente configuração em `hotelly-public-staging`
+- [ ] `STRIPE_SECRET_KEY` — pendente configuração em `hotelly-worker-staging`
+
+> **Ação requerida antes do deploy de staging:** provisionar ambos secrets no Secret Manager e vincular as Service Accounts respectivas (public e worker).
 
 ---
 
