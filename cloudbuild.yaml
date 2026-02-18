@@ -46,14 +46,30 @@ steps:
       - |
         /workspace/cloud-sql-proxy ${_CLOUD_SQL_INSTANCE} --port 5432 &
         PROXY_PID=$$!
-        for i in 1 2 3 4 5; do sleep 1; echo "Waiting for proxy..."; done
+        READY=0
+        i=0
+        while [ $$i -lt 30 ]; do
+          i=$$((i + 1))
+          sleep 1
+          if python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 5432)); s.close()" 2>/dev/null; then
+            echo "Cloud SQL Proxy ready (attempt $$i)"
+            READY=1
+            break
+          fi
+          echo "Waiting for proxy... attempt $$i"
+        done
+        if [ $$READY -ne 1 ]; then
+          echo "ERROR: Cloud SQL Proxy did not become ready within 30 s"
+          kill $$PROXY_PID 2>/dev/null || true
+          exit 1
+        fi
         DB_NAME=$$(echo "$$DATABASE_URL" | cut -d'?' -f1 | rev | cut -d'/' -f1 | rev)
         DB_AUTH=$$(echo "$$DATABASE_URL" | cut -d'@' -f1)
         export DATABASE_URL="$${DB_AUTH}@127.0.0.1:5432/$${DB_NAME}"
         echo "DATABASE_URL host overridden to 127.0.0.1:5432"
         uv run alembic upgrade head
         EXIT_CODE=$$?
-        kill $$PROXY_PID || true
+        kill $$PROXY_PID 2>/dev/null || true
         exit $$EXIT_CODE
     secretEnv:
       - DATABASE_URL
@@ -97,7 +113,7 @@ substitutions:
   _IMAGE_TAG: "staging"
   _SERVICE_NAME_PUBLIC: "hotelly-public-staging"
   _SERVICE_NAME_WORKER: "hotelly-worker-staging"
-  _CLOUD_SQL_INSTANCE: ""
+  _CLOUD_SQL_INSTANCE: "hotelly--ia:us-central1:hotelly-sql"
   _DB_SECRET_NAME: "hotelly-staging-database-url"
 
 images:
