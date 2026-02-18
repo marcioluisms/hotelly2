@@ -240,6 +240,10 @@ Idempotência ponta a ponta combina:
 - Payment canonical: `payments(property_id, provider, provider_object_id)` **UNIQUE**
 - Idempotency keys: `idempotency_keys(property_id, scope, key)` **UNIQUE/PK**
 
+**Schema invariants (Sprint 1.9):**
+- `holds.guest_name` (TEXT, nullable) — snapshot imutável do nome do hóspede gravado no momento da criação do hold. O Worker lê este campo para montar a notificação WhatsApp sem precisar consultar `conversations`. Divergência entre `holds.guest_name` e `guests.full_name` é esperada e intencional (hold = snapshot; guests = perfil vivo).
+- Tabela `payments` — registra todos os pagamentos via Stripe (`provider = 'stripe'`, `provider_object_id` = checkout session ID canônico). É a fonte de verdade para reconciliação financeira; o status transita `created → succeeded | needs_manual`. Nenhuma lógica de negócio deve consultar Stripe diretamente para checar status — sempre ler `payments.status`.
+
 ### 6.3 Modelo de pricing por ocupação (PAX) — `room_type_rates`
 
 Tabela canônica: `room_type_rates` (PK `(property_id, room_type_id, date)`).
@@ -1503,6 +1507,50 @@ COMMIT;
 Recomendação:
 - registrar evento (outbox) e criar pendência operacional.
 - política decide: remarcar/estornar/reservar manualmente se ainda houver inventário.
+
+---
+
+### 05 — Pagamento Outbound (geração de link de checkout)
+
+> **Status: Implementado e Verificado (Sprint 1.9)**
+
+#### Fluxo
+
+```
+StripeService.create_checkout_session()
+  │
+  ├─ Entrada: hold_id, property_id, amount_cents, currency, idempotency_key
+  │
+  ├─ Metadata obrigatório injetado na sessão Stripe:
+  │    { hold_id, property_id, conversation_id }
+  │    (conversation_id vem de holds_repository.get_hold(), que inclui o campo desde Sprint 1.9)
+  │
+  ├─ Stripe retorna: checkout_session_id (cs_...), checkout_url
+  │
+  ├─ payments INSERT (status='created', provider='stripe', provider_object_id=cs_...)
+  │
+  └─ checkout_url retornado ao chamador (dashboard / WhatsApp reply)
+```
+
+#### Regras de negócio
+- O metadata `{ hold_id, property_id, conversation_id }` é **obrigatório**. Sem ele o Worker não consegue localizar o hold nem enviar a notificação WhatsApp pós-pagamento.
+- `guest_name` pode ser incluído no metadata para rastreabilidade, mas o Worker resolve o nome via `holds.guest_name` (não depende do metadata para isso).
+- O link de checkout é idempotente via `idempotency_key` no Stripe; reenvios não criam sessões duplicadas.
+
+#### Processamento pelo Worker (após Stripe callback)
+```
+Stripe webhook (checkout.session.completed)
+  → hotelly-public: valida assinatura (STRIPE_WEBHOOK_SECRET P0)
+  → persiste receipt + enfileira task /tasks/stripe/handle-event
+  → Worker: retrieve session → atualiza payments.status
+  → Se payment_status == 'paid':
+      convert_hold(cur, hold_id, property_id)
+        → INSERT reservations (com guest_name snapshot)
+        → UPDATE holds.status = 'converted'
+        → Se conversation_id e contact_hash presente:
+            emit_event(whatsapp.send_message) com guest_name no payload
+        → Senão: log WARNING, notificação suprimida (security guard)
+```
 
 ---
 
@@ -3231,17 +3279,38 @@ Se o worker precisar montar `CONTACT_HASH_SECRET` (ex.: para hashing) isso quebr
 
 ### F.5 Stripe: env vars obrigatórias (Sprint 1.9)
 
-**`hotelly-public-staging`** — obrigatórias para webhook Stripe:
-- `STRIPE_WEBHOOK_SECRET` — secret do endpoint webhook Stripe (obrigatório; sem ele o serviço retorna 500 em qualquer evento). Deve ser provisionado no Secret Manager e vinculado à Service Account do Cloud Run public.
+**`hotelly-public-staging`** — obrigatórias para geração de links e validação de webhook:
+- `STRIPE_SECRET_KEY` — API key Stripe (obrigatório para `StripeClient.create_checkout_session`). Provisionado no Secret Manager (`stripe-secret-key-staging`); montado na SA do Cloud Run public.
+- `STRIPE_WEBHOOK_SECRET` — secret do endpoint webhook Stripe (P0 de segurança; `stripe.Webhook.construct_event` rejeitará qualquer evento sem validação de assinatura). Provisionado no Secret Manager (`stripe-webhook-secret-staging`); montado na SA do Cloud Run public.
 
 **`hotelly-worker-staging`** — obrigatórias para task handler Stripe:
-- `STRIPE_SECRET_KEY` — API key Stripe (obrigatório para `stripe.checkout.Session.retrieve` no handler `handle-event`).
+- `STRIPE_SECRET_KEY` — API key Stripe (obrigatório para `stripe.checkout.Session.retrieve` no handler `handle-event`). Mesmo secret, SA do worker.
+
+> ⚠️ **Alerta — Regra de Ouro do Worker:** `WORKER_BASE_URL` deve coincidir **exatamente** com `TASKS_OIDC_AUDIENCE` configurado no Cloud Run worker. Qualquer divergência de formato (ex.: URL regional `*.us-central1.run.app` vs canônico `*.a.run.app`) resulta em falha silenciosa de autenticação (401/403) sem execução de lógica de negócio. Ver §12.2 para incidente documentado.
 
 **Status:**
-- [ ] `STRIPE_WEBHOOK_SECRET` — pendente configuração em `hotelly-public-staging`
-- [ ] `STRIPE_SECRET_KEY` — pendente configuração em `hotelly-worker-staging`
+- [x] `STRIPE_WEBHOOK_SECRET` — provisionado em `hotelly-public-staging` (Sprint 1.9)
+- [x] `STRIPE_SECRET_KEY` — provisionado em `hotelly-public-staging` e `hotelly-worker-staging` (Sprint 1.9)
 
-> **Ação requerida antes do deploy de staging:** provisionar ambos secrets no Secret Manager e vincular as Service Accounts respectivas (public e worker).
+### F.6 Roadmap — Histórico de Sprints
+
+| Sprint | Título | Status |
+|---|---|---|
+| 1.7 | Ciclo Financeiro (Folio) | ✅ CONCLUÍDO |
+| 1.8 | WhatsApp Outbound — Notificação de reserva confirmada | ✅ CONCLUÍDO |
+| **1.9** | **Gateway de Pagamento Digital (Stripe)** | ✅ **CONCLUÍDO** |
+| 1.10 | Guest Identity — CRM (tabela `guests`, `upsert_guest`) | ✅ CONCLUÍDO |
+
+**Sprint 1.9 — Entregas verificadas:**
+- Webhook Stripe (`checkout.session.completed`) com validação de assinatura P0 (`STRIPE_WEBHOOK_SECRET`)
+- `create_checkout_session` injeta metadata obrigatório `{ hold_id, property_id, conversation_id }`
+- Task handler `handle-event`: retrieve session → update `payments.status` → `convert_hold`
+- `convert_hold`: transação atômica hold → reserva → outbox `whatsapp.send_message`
+- Security guard: notificação suprimida com log WARNING se `contact_hash` ausente
+- Fix `TypeError` no call site (`cur` ausente, kwargs inválidos, fora de `with txn()`)
+- Regra de Ouro OIDC documentada: `WORKER_BASE_URL` ≡ `TASKS_OIDC_AUDIENCE`
+- Migration `023_holds_guest_name`: `holds.guest_name TEXT` para snapshot do Worker
+- Testes DoD: `tests/test_stripe_webhook_dod.py` — 5/5 cenários
 
 ---
 
