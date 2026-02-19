@@ -12,6 +12,7 @@ from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
+from hotelly.domain.room_conflict import OPERATIONAL_STATUSES
 from hotelly.observability.logging import get_logger
 
 router = APIRouter(prefix="/occupancy", tags=["occupancy"])
@@ -44,7 +45,8 @@ def _get_occupancy(
         # 2. Cross join with room_types to get all combinations
         # 3. Left join with ari_days for inv_total
         # 4. Left join with held aggregation (active holds not expired)
-        # 5. Left join with booked aggregation (confirmed reservations)
+        # 5. Left join with booked aggregation (operational reservations:
+        #    confirmed, in_house, checked_out — mirrors ADR-008 statuses)
         cur.execute(
             """
             WITH date_series AS (
@@ -82,7 +84,7 @@ def _get_occupancy(
                 FROM hold_nights hn
                 JOIN reservations r ON r.hold_id = hn.hold_id
                 WHERE r.property_id = %s
-                  AND r.status = 'confirmed'
+                  AND r.status = ANY(%s::reservation_status[])
                   AND hn.date >= %s
                   AND hn.date < %s
                 GROUP BY hn.room_type_id, hn.date
@@ -111,10 +113,11 @@ def _get_occupancy(
                 property_id,  # held_agg holds.property_id
                 start_date,  # held_agg date start
                 end_date,  # held_agg date end
-                property_id,  # booked_agg reservations.property_id
-                start_date,  # booked_agg date start
-                end_date,  # booked_agg date end
-                property_id,  # ari_days join
+                property_id,                 # booked_agg reservations.property_id
+                list(OPERATIONAL_STATUSES),  # booked_agg status filter
+                start_date,                  # booked_agg date start
+                end_date,                    # booked_agg date end
+                property_id,                 # ari_days join
             ),
         )
         rows = cur.fetchall()
@@ -224,8 +227,9 @@ def _get_room_occupancy(
     Note:
         The schema does not support "held" status per room. Holds are associated
         with room_type_id via hold_nights, not individual rooms. Therefore, status
-        can only be "available" or "booked". A room is "booked" when a confirmed
-        reservation with that room_id exists for that date.
+        can only be "available" or "booked". A room is "booked" when an operational
+        reservation (confirmed, in_house, or checked_out) with that room_id exists
+        for that date.
     """
     from hotelly.infra.db import txn
 
@@ -235,8 +239,9 @@ def _get_room_occupancy(
         # 2. Get all active rooms for the property
         # 3. Cross join to create a grid of room x date
         # 4. Left join with reservations to detect booked dates
-        #    - A room is booked on date D if a confirmed reservation exists where:
+        #    - A room is booked on date D if an operational reservation exists where:
         #      reservation.room_id = room.id AND reservation.checkin <= D < reservation.checkout
+        #      Operational statuses: confirmed, in_house, checked_out (mirrors ADR-008)
         cur.execute(
             """
             WITH date_series AS (
@@ -259,7 +264,7 @@ def _get_room_occupancy(
                 FROM reservations res
                 CROSS JOIN LATERAL generate_series(res.checkin, res.checkout - interval '1 day', '1 day'::interval) AS ds(date)
                 WHERE res.property_id = %s
-                  AND res.status = 'confirmed'
+                  AND res.status = ANY(%s::reservation_status[])
                   AND res.room_id IS NOT NULL
                   AND res.checkin < %s
                   AND res.checkout > %s
@@ -278,9 +283,10 @@ def _get_room_occupancy(
                 start_date,  # date_series start
                 end_date,  # date_series end
                 property_id,  # rooms_for_property
-                property_id,  # booked_dates reservations.property_id
-                end_date,  # reservation.checkin < end_date (overlaps range)
-                start_date,  # reservation.checkout > start_date (overlaps range)
+                property_id,                 # booked_dates reservations.property_id
+                list(OPERATIONAL_STATUSES),  # booked_dates status filter
+                end_date,                    # reservation.checkin < end_date (overlaps range)
+                start_date,                  # reservation.checkout > start_date (overlaps range)
             ),
         )
         rows = cur.fetchall()
@@ -310,6 +316,159 @@ def _get_room_occupancy(
         )
 
     return list(rooms_map.values())
+
+
+def _get_occupancy_grid(
+    property_id: str,
+    start_date: date,
+    end_date: date,
+) -> list[dict]:
+    """Get reservation spans per physical room for a Gantt-style occupancy grid.
+
+    Returns all active rooms with their overlapping reservations in operational
+    statuses (confirmed, in_house, checked_out).
+
+    Each reservation is returned as a single span (checkin, checkout, status,
+    guest_name) rather than being fanned out per day, so the frontend can render
+    it as a positioned Gantt block without any per-day reconstruction.
+
+    Rooms with no reservations in the range are included with an empty
+    reservations list — the frontend renders these rows as fully available.
+
+    Overlap condition (strict inequality, mirrors ADR-008):
+        reservation.checkin  < end_date   (reservation starts before grid ends)
+        reservation.checkout > start_date  (reservation ends after grid starts)
+    Same-day turnover is allowed: checkout_A == checkin_B is not a conflict.
+
+    Args:
+        property_id: Property ID.
+        start_date: Grid start date (inclusive).
+        end_date: Grid end date (exclusive).
+
+    Returns:
+        List of room dicts ordered by room_type_name, then room name.
+        Each dict contains: room_id, name, room_type_id, room_type_name,
+        reservations (list of span dicts).
+    """
+    from hotelly.infra.db import txn
+
+    with txn() as cur:
+        cur.execute(
+            """
+            SELECT
+                r.id           AS room_id,
+                r.name         AS room_name,
+                r.room_type_id,
+                rt.name        AS room_type_name,
+                res.id         AS reservation_id,
+                res.checkin    AS res_checkin,
+                res.checkout   AS res_checkout,
+                res.status     AS res_status,
+                res.guest_name AS res_guest_name
+            FROM rooms r
+            JOIN room_types rt
+                ON  rt.property_id = r.property_id
+                AND rt.id          = r.room_type_id
+            LEFT JOIN reservations res
+                ON  res.room_id     = r.id
+                AND res.property_id = r.property_id
+                AND res.status      = ANY(%s::reservation_status[])
+                AND res.checkin     < %s
+                AND res.checkout    > %s
+            WHERE r.property_id = %s
+              AND r.is_active   = true
+            ORDER BY rt.name, COALESCE(r.name, r.id), r.id, res.checkin NULLS LAST
+            """,
+            (
+                list(OPERATIONAL_STATUSES),  # res.status filter
+                end_date,                    # res.checkin < end_date
+                start_date,                  # res.checkout > start_date
+                property_id,                 # rooms.property_id
+            ),
+        )
+        rows = cur.fetchall()
+
+    # Group rows by room_id preserving ORDER BY room_type/name sort.
+    # A LEFT JOIN miss (no reservation in range) produces a single row with
+    # NULL reservation columns — include the room with an empty list.
+    rooms_map: dict[str, dict] = {}
+    for row in rows:
+        room_id        = row[0]
+        room_name      = row[1]
+        room_type_id   = row[2]
+        room_type_name = row[3]
+        reservation_id = row[4]
+        res_checkin    = row[5]
+        res_checkout   = row[6]
+        res_status     = row[7]
+        res_guest_name = row[8]
+
+        if room_id not in rooms_map:
+            rooms_map[room_id] = {
+                "room_id": room_id,
+                "name": room_name,
+                "room_type_id": room_type_id,
+                "room_type_name": room_type_name,
+                "reservations": [],
+            }
+
+        if reservation_id is not None:
+            rooms_map[room_id]["reservations"].append(
+                {
+                    "reservation_id": str(reservation_id),
+                    "checkin": res_checkin.isoformat(),
+                    "checkout": res_checkout.isoformat(),
+                    "status": res_status,
+                    "guest_name": res_guest_name,
+                }
+            )
+
+    return list(rooms_map.values())
+
+
+@router.get("/grid")
+def get_occupancy_grid(
+    ctx: PropertyRoleContext = Depends(require_property_role("viewer")),
+    start_date: date = Query(..., description="Start date (YYYY-MM-DD, inclusive)"),
+    end_date: date = Query(..., description="End date (YYYY-MM-DD, exclusive)"),
+) -> dict:
+    """Get reservation spans per physical room for a Gantt-style occupancy grid.
+
+    Returns all active rooms with their overlapping reservations as date spans.
+    Each span contains reservation_id, checkin, checkout, status, and guest_name,
+    enabling the frontend to render Gantt blocks without per-day processing.
+
+    Rooms with no reservations in the range appear with an empty reservations
+    list, so the frontend can render them as fully available rows.
+
+    Overlap condition: checkin < end_date AND checkout > start_date
+    (strict inequality — same-day turnover allowed).
+
+    Only operational statuses generate spans: confirmed, in_house, checked_out.
+
+    Requires viewer role or higher.
+    """
+    if end_date <= start_date:
+        raise HTTPException(
+            status_code=422,
+            detail="end_date must be greater than start_date",
+        )
+
+    range_days = (end_date - start_date).days
+    if range_days > MAX_RANGE_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Date range cannot exceed {MAX_RANGE_DAYS} days",
+        )
+
+    rooms = _get_occupancy_grid(ctx.property_id, start_date, end_date)
+
+    return {
+        "property_id": ctx.property_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "rooms": rooms,
+    }
 
 
 @router.get("/room-occupancy")
