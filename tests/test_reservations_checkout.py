@@ -53,9 +53,9 @@ def _checkout_url(reservation_id: str) -> str:
     return f"/reservations/{reservation_id}/actions/check-out?property_id=prop-1"
 
 
-def _reservation_row(status="in_house", total_cents=10000, currency="BRL"):
-    """Build a mock reservation row (status, total_cents, currency)."""
-    return (status, total_cents, currency)
+def _reservation_row(status="in_house", total_cents=10000, currency="BRL", room_id="room-101"):
+    """Build a mock reservation row (status, total_cents, currency, room_id)."""
+    return (status, total_cents, currency, room_id)
 
 
 def _folio_payments_sum(total=10000):

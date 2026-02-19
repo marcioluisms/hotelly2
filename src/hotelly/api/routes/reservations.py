@@ -1438,7 +1438,7 @@ def check_out_action(
         # single source of truth for balance calculation.
         cur.execute(
             """
-            SELECT status, total_cents, currency
+            SELECT status, total_cents, currency, room_id
             FROM reservations
             WHERE property_id = %s AND id = %s
             FOR UPDATE
@@ -1449,7 +1449,7 @@ def check_out_action(
         if row is None:
             raise HTTPException(status_code=404, detail="Reservation not found")
 
-        status, total_cents, currency = row
+        status, total_cents, currency, room_id = row
 
         # ── STEP 2: Validate status ──────────────────────────────
         if status != "in_house":
@@ -1548,10 +1548,25 @@ def check_out_action(
                 detail="Reservation status changed concurrently",
             )
 
+        # ── STEP 5b: Mark room dirty (housekeeping trigger) ──────
+        # Runs in the same transaction as the reservation UPDATE so the
+        # governance flag is always consistent with the checkout state.
+        # No-op for legacy reservations that have no physical room assigned.
+        if room_id is not None:
+            cur.execute(
+                """
+                UPDATE rooms
+                SET governance_status = 'dirty', updated_at = now()
+                WHERE property_id = %s AND id = %s
+                """,
+                (ctx.property_id, room_id),
+            )
+
         # ── STEP 6: Emit outbox event ────────────────────────────
         outbox_payload = json.dumps({
             "reservation_id": reservation_id,
             "property_id": ctx.property_id,
+            "room_id": room_id,
             "checked_out_by": ctx.user.id,
             "balance_due": balance_due,
             "total_payments": total_payments,
