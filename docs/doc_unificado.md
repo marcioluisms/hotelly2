@@ -570,6 +570,74 @@ Causa raiz documentada: incidente de 2026-02-18 13:58 UTC — `WORKER_BASE_URL` 
 **Infraestrutura:**
 - As migrações de banco (`folio_payments`) devem ser executadas via CI/CD (Cloud Build) para garantir paridade entre Staging e Produção.
 
+### 12.5 CI/CD — Fluxo de Dois Estágios (Cloud Build Gen 2)
+
+#### Mapeamento branch → ambiente
+
+| Branch    | Ambiente   | URL pública                | Config file                   |
+|-----------|------------|----------------------------|-------------------------------|
+| `develop` | Staging    | `dash.hotelly.ia.br`       | `cloudbuild-staging.yaml`     |
+| `master`  | Production | `admin.hotelly.ia.br`      | `cloudbuild-production.yaml`  |
+
+Cada repositório possui **dois arquivos de configuração Cloud Build** dedicados. O trigger Gen 2 aponta para o arquivo correspondente ao branch.
+
+#### Arquivos de configuração
+
+**hotelly-v2 (backend):**
+- `cloudbuild-staging.yaml` → deploys `hotelly-public-staging` + `hotelly-worker-staging`; migra `hotelly_staging` via secret `hotelly-staging-database-url`
+- `cloudbuild-production.yaml` → deploys `hotelly-public` + `hotelly-worker`; migra prod via secret `hotelly-database-url`
+
+**hotelly-admin (frontend):**
+- `cloudbuild-staging.yaml` → deploys `hotelly-admin-staging`; `NEXT_PUBLIC_APP_ENV=staging`; API URL aponta para `hotelly-public-staging`
+- `cloudbuild-production.yaml` → deploys `hotelly-admin`; `NEXT_PUBLIC_APP_ENV=production`; `_API_URL` deve ser o URL canônico `*.a.run.app` de `hotelly-public`
+
+#### Criação dos triggers (executar uma vez por repositório)
+
+```bash
+# hotelly-v2 — Staging
+gcloud builds triggers create github \
+  --name="hotelly-v2-staging" \
+  --repository=projects/hotelly--ia/locations/global/connections/github/repositories/hotelly-v2 \
+  --branch-pattern="^develop$" \
+  --build-config="cloudbuild-staging.yaml" \
+  --project=hotelly--ia \
+  --generation=2
+
+# hotelly-v2 — Production
+gcloud builds triggers create github \
+  --name="hotelly-v2-production" \
+  --repository=projects/hotelly--ia/locations/global/connections/github/repositories/hotelly-v2 \
+  --branch-pattern="^master$" \
+  --build-config="cloudbuild-production.yaml" \
+  --project=hotelly--ia \
+  --generation=2
+
+# hotelly-admin — Staging
+gcloud builds triggers create github \
+  --name="hotelly-admin-staging" \
+  --repository=projects/hotelly--ia/locations/global/connections/github/repositories/hotelly-admin \
+  --branch-pattern="^develop$" \
+  --build-config="cloudbuild-staging.yaml" \
+  --project=hotelly--ia \
+  --generation=2
+
+# hotelly-admin — Production
+gcloud builds triggers create github \
+  --name="hotelly-admin-production" \
+  --repository=projects/hotelly--ia/locations/global/connections/github/repositories/hotelly-admin \
+  --branch-pattern="^master$" \
+  --build-config="cloudbuild-production.yaml" \
+  --project=hotelly--ia \
+  --generation=2
+```
+
+#### Regras operacionais
+
+- **NEXT_PUBLIC_* são baked no bundle** no momento do `docker build`. Alterar env vars no Cloud Run após o deploy não tem efeito. Para mudar valores: atualizar a substitution no arquivo YAML e fazer push no branch correspondente.
+- **`_API_URL` em `cloudbuild-production.yaml` do admin** deve ser preenchida com o URL canônico `*.a.run.app` de `hotelly-public` antes de ativar o trigger de produção. Obter via: `gcloud run services describe hotelly-public --region=us-central1 --format="value(status.url)"`
+- **Ordem de deploy segura (backend):** o step `migrate` bloqueia os steps `deploy-public` e `deploy-worker` via `waitFor`. Migrations rodam antes de qualquer redeploy.
+- **OIDC audience:** ver §12.2 — `WORKER_BASE_URL` em staging e produção deve usar formato `*.a.run.app`.
+
 ---
 
 ## 13) Runbooks (operacional)
@@ -960,24 +1028,23 @@ gcloud builds submit --config cloudbuild.yaml \
 ### 12.4 Fluxo de Continuous Deployment (CI/CD)
 **Fonte da Verdade:** GitHub. Deploys manuais via CLI local estão descontinuados.
 
-**Triggers de Produção (Geração 2):**
-| Trigger GCP | Repositório | Branch | Config |
+**Triggers (Geração 2) — arquivo dedicado por ambiente:**
+| Trigger GCP | Repositório | Branch | Config file |
 | :--- | :--- | :--- | :--- |
-| `hotelly-admin-production` | `hotelly-admin` | `^main$` | `cloudbuild.yaml` |
-| `hotelly-v2-production` | `hotelly2` | `^master$` | `cloudbuild.yaml` |
+| `hotelly-admin-staging` | `hotelly-admin` | `^develop$` | `cloudbuild-staging.yaml` |
+| `hotelly-admin-production` | `hotelly-admin` | `^master$` | `cloudbuild-production.yaml` |
+| `hotelly-v2-staging` | `hotelly-v2` | `^develop$` | `cloudbuild-staging.yaml` |
+| `hotelly-v2-production` | `hotelly-v2` | `^master$` | `cloudbuild-production.yaml` |
 
-> ℹ️ Ambos os triggers já existem no GCP (`us-central1`). Não recrie — duplicar causa builds paralelos no mesmo push.
+> ℹ️ Ver §12.5 para os comandos de criação de triggers e regras operacionais completas.
 
-**Variáveis de Substituição Críticas (GCP Console):**
-| Repositório | Variável | Valor Produção |
-| :--- | :--- | :--- |
-| hotelly-admin | `_IMAGE_TAG` | `latest` |
-| hotelly-admin | `_SERVICE_NAME` | `hotelly-admin` |
-| hotelly-admin | `_API_URL` | `https://app.hotelly.ia.br` |
-| hotelly-v2 | `_SERVICE_NAME_PUBLIC` | `hotelly-public` |
-| hotelly-v2 | `_SERVICE_NAME_WORKER` | `hotelly-worker` |
-| hotelly-v2 | `_DB_SECRET_NAME` | `hotelly-database-url` |
-| hotelly-v2 | `_CLOUD_SQL_INSTANCE` | `hotelly--ia:us-central1:hotelly-sql` |
+**Variáveis de Substituição (embutidas nos arquivos de config — não requer GCP Console):**
+| Repositório | Arquivo | Variável-chave | Valor |
+| :--- | :--- | :--- | :--- |
+| hotelly-admin | `cloudbuild-staging.yaml` | `_SERVICE_NAME` | `hotelly-admin-staging` |
+| hotelly-admin | `cloudbuild-production.yaml` | `_SERVICE_NAME` | `hotelly-admin` |
+| hotelly-v2 | `cloudbuild-staging.yaml` | `_DB_SECRET_NAME` | `hotelly-staging-database-url` |
+| hotelly-v2 | `cloudbuild-production.yaml` | `_DB_SECRET_NAME` | `hotelly-database-url` |
 
 **Ordem de Execução do Build (v2):**
 `Docker Build` -> `Push Artifact Registry` -> `Database Migrate` (Alembic) -> `Cloud Run Deploy`.

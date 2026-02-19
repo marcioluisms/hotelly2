@@ -1,0 +1,138 @@
+# Cloud Build configuration — master branch → Production environment
+#
+# Target services : hotelly-public, hotelly-worker
+# DB secret       : hotelly-database-url
+# Image tag       : latest
+#
+# GCP Trigger setup (Cloud Build Gen 2 — run once):
+#   gcloud builds triggers create github \
+#     --name="hotelly-v2-production" \
+#     --repository=projects/hotelly--ia/locations/global/connections/github/repositories/hotelly-v2 \
+#     --branch-pattern="^master$" \
+#     --build-config="cloudbuild-production.yaml" \
+#     --project=hotelly--ia \
+#     --generation=2
+
+steps:
+  # 1. Build the Docker image
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
+      - .
+
+  # 2. Push the image to Container Registry
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
+    waitFor:
+      - build
+
+  # 3. Download Cloud SQL Auth Proxy
+  - id: download-proxy
+    name: gcr.io/cloud-builders/curl
+    args:
+      - -o
+      - /workspace/cloud-sql-proxy
+      - -L
+      - https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.3/cloud-sql-proxy.linux.amd64
+    waitFor:
+      - "-"
+
+  - id: chmod-proxy
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: chmod
+    args:
+      - +x
+      - /workspace/cloud-sql-proxy
+    waitFor:
+      - download-proxy
+
+  # 4. Run database migrations with Cloud SQL Auth Proxy
+  - id: migrate
+    name: gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        /workspace/cloud-sql-proxy ${_CLOUD_SQL_INSTANCE} --port 5432 &
+        PROXY_PID=$$!
+        READY=0
+        i=0
+        while [ $$i -lt 30 ]; do
+          i=$$((i + 1))
+          sleep 1
+          if python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 5432)); s.close()" 2>/dev/null; then
+            echo "Cloud SQL Proxy ready (attempt $$i)"
+            READY=1
+            break
+          fi
+          echo "Waiting for proxy... attempt $$i"
+        done
+        if [ $$READY -ne 1 ]; then
+          echo "ERROR: Cloud SQL Proxy did not become ready within 30 s"
+          kill $$PROXY_PID 2>/dev/null || true
+          exit 1
+        fi
+        DB_NAME=$$(echo "$$DATABASE_URL" | cut -d'?' -f1 | rev | cut -d'/' -f1 | rev)
+        DB_AUTH=$$(echo "$$DATABASE_URL" | cut -d'@' -f1)
+        export DATABASE_URL="$${DB_AUTH}@127.0.0.1:5432/$${DB_NAME}"
+        echo "DATABASE_URL host overridden to 127.0.0.1:5432"
+        uv run alembic upgrade head
+        EXIT_CODE=$$?
+        kill $$PROXY_PID 2>/dev/null || true
+        exit $$EXIT_CODE
+    secretEnv:
+      - DATABASE_URL
+    waitFor:
+      - push
+      - chmod-proxy
+
+  # 5. Deploy Cloud Run services (parallel after migrate)
+  - id: deploy-public
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME_PUBLIC}
+      - --image=gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
+      - --region=us-central1
+      - --project=hotelly--ia
+    waitFor:
+      - migrate
+
+  - id: deploy-worker
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME_WORKER}
+      - --image=gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
+      - --region=us-central1
+      - --project=hotelly--ia
+    waitFor:
+      - migrate
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/hotelly--ia/secrets/${_DB_SECRET_NAME}/versions/latest
+      env: DATABASE_URL
+
+substitutions:
+  _IMAGE_TAG: "latest"
+  _SERVICE_NAME_PUBLIC: "hotelly-public"
+  _SERVICE_NAME_WORKER: "hotelly-worker"
+  _CLOUD_SQL_INSTANCE: "hotelly--ia:us-central1:hotelly-sql"
+  _DB_SECRET_NAME: "hotelly-database-url"
+
+images:
+  - gcr.io/hotelly--ia/hotelly-v2:${_IMAGE_TAG}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
