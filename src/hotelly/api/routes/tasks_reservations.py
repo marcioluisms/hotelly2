@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from hotelly.api.task_auth import verify_task_auth
 from hotelly.domain.quote import calculate_total_cents
+from hotelly.domain.room_conflict import RoomConflictError, assert_no_room_conflict
 from hotelly.infra.db import txn
 from hotelly.infra.repositories.holds_repository import (
     decrement_inv_booked,
@@ -228,11 +229,14 @@ async def assign_room_task(request: Request) -> Response:
 
     # Execute in transaction
     with txn() as cur:
-        # Check reservation exists and get room_type_id
+        # Lock reservation row and fetch dates needed for conflict detection.
+        # FOR UPDATE prevents concurrent assign-room tasks from racing past
+        # the overlap check below.
         cur.execute(
             """
-            SELECT room_type_id FROM reservations
+            SELECT room_type_id, checkin, checkout FROM reservations
             WHERE property_id = %s AND id = %s
+            FOR UPDATE
             """,
             (property_id, reservation_id),
         )
@@ -250,7 +254,7 @@ async def assign_room_task(request: Request) -> Response:
             )
             return Response(status_code=404, content="reservation not found")
 
-        expected_room_type_id = res_row[0]
+        expected_room_type_id, res_checkin, res_checkout = res_row
 
         # Check room exists and is active, get room_type_id
         cur.execute(
@@ -303,6 +307,35 @@ async def assign_room_task(request: Request) -> Response:
                 },
             )
             return Response(status_code=409, content="room_type mismatch")
+
+        # ADR-008 / Sprint 1.11: assert no physical room collision before
+        # committing the assignment. lock=True issues FOR UPDATE on any
+        # conflicting row, closing the race window between concurrent tasks.
+        # exclude_reservation_id prevents self-conflict on re-assignments.
+        try:
+            assert_no_room_conflict(
+                cur,
+                room_id=room_id,
+                check_in=res_checkin,
+                check_out=res_checkout,
+                exclude_reservation_id=reservation_id,
+                property_id=property_id,
+                lock=True,
+            )
+        except RoomConflictError as exc:
+            logger.warning(
+                "assign-room 409: physical room conflict",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=req_correlation_id,
+                        property_id=property_id,
+                        reservation_id=reservation_id,
+                        room_id=room_id,
+                        conflicting_reservation_id=exc.conflicting_reservation_id,
+                    )
+                },
+            )
+            return Response(status_code=409, content="room_conflict")
 
         # Update reservation with room_id and fill room_type_id if missing
         cur.execute(

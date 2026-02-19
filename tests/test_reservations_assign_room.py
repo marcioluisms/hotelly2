@@ -8,6 +8,7 @@ V2-S13: Tests for:
 from __future__ import annotations
 
 import time
+from datetime import date
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -298,13 +299,15 @@ class TestWorkerAssignRoomSuccess:
         res_id = str(uuid4())
 
         mock_cursor = MagicMock()
-        # Sequence of fetchone calls:
-        # 1. reservation lookup -> (room_type_id,)
+        # Sequence of fetchone calls (Sprint 1.11: includes conflict check):
+        # 1. reservation lookup -> (room_type_id, checkin, checkout)
         # 2. room lookup -> (room_type_id,)
-        # 3. outbox insert -> (outbox_id,)
+        # 3. conflict check -> None (no conflict)
+        # 4. outbox insert -> (outbox_id,)
         mock_cursor.fetchone.side_effect = [
-            ("standard",),  # reservation room_type_id
+            ("standard", date(2025, 6, 1), date(2025, 6, 5)),  # reservation
             ("standard",),  # room room_type_id
+            None,  # conflict check: no overlap
             (456,),  # outbox id
         ]
 
@@ -325,18 +328,18 @@ class TestWorkerAssignRoomSuccess:
                 assert response.status_code == 200
                 assert response.json()["ok"] is True
 
-                # Verify UPDATE and INSERT were called
+                # Verify all SQL calls: reservation select, room select,
+                # conflict check, UPDATE, INSERT outbox
                 calls = mock_cursor.execute.call_args_list
-                # Should have: reservation select, room select, update, insert
-                assert len(calls) == 4
+                assert len(calls) == 5
 
-                # Check UPDATE call
-                update_call = calls[2][0]
+                # Check UPDATE call (index 3 after new conflict check)
+                update_call = calls[3][0]
                 assert "UPDATE reservations" in update_call[0]
                 assert "room_id" in update_call[0]
 
                 # Check INSERT outbox call
-                insert_call = calls[3][0]
+                insert_call = calls[4][0]
                 assert "INSERT INTO outbox_events" in insert_call[0]
                 # Validate params: (property_id, event_type, aggregate_type, aggregate_id, ...)
                 insert_params = insert_call[1]
@@ -361,9 +364,10 @@ class TestWorkerAssignRoomMismatch:
         res_id = str(uuid4())
 
         mock_cursor = MagicMock()
+        # room_type mismatch is detected before the conflict check
         mock_cursor.fetchone.side_effect = [
-            ("standard",),  # reservation room_type_id = "standard"
-            ("deluxe",),  # room has room_type_id = "deluxe"
+            ("standard", date(2025, 6, 1), date(2025, 6, 5)),  # reservation
+            ("deluxe",),  # room has room_type_id = "deluxe" — mismatch
         ]
 
         with patch("hotelly.api.routes.tasks_reservations.verify_task_auth", return_value=True):
@@ -394,8 +398,9 @@ class TestWorkerAssignRoomNullRoomType:
 
         mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
-            (None,),  # reservation room_type_id is NULL
+            (None, date(2025, 6, 1), date(2025, 6, 5)),  # reservation: NULL room_type_id
             ("standard",),  # room has room_type_id = "standard"
+            None,  # conflict check: no overlap
             (456,),  # outbox id
         ]
 
@@ -416,12 +421,12 @@ class TestWorkerAssignRoomNullRoomType:
                 assert response.status_code == 200
                 assert response.json()["ok"] is True
 
-                # Verify UPDATE fills room_type_id via COALESCE
+                # Verify: reservation select, room select, conflict check, UPDATE, INSERT outbox
                 calls = mock_cursor.execute.call_args_list
-                assert len(calls) == 4
+                assert len(calls) == 5
 
-                # Check UPDATE call includes room_type_id
-                update_call = calls[2][0]
+                # Check UPDATE call (now at index 3)
+                update_call = calls[3][0]
                 assert "UPDATE reservations" in update_call[0]
                 assert "room_type_id = COALESCE" in update_call[0]
                 # Params: (room_id, actual_room_type_id, property_id, reservation_id)
@@ -441,8 +446,9 @@ class TestWorkerAssignRoomExistingRoomType:
 
         mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
-            ("deluxe",),  # reservation already has room_type_id = "deluxe"
+            ("deluxe", date(2025, 6, 1), date(2025, 6, 5)),  # reservation
             ("deluxe",),  # room also has room_type_id = "deluxe" (compatible)
+            None,  # conflict check: no overlap
             (789,),  # outbox id
         ]
 
@@ -462,10 +468,10 @@ class TestWorkerAssignRoomExistingRoomType:
                 assert response.status_code == 200
                 assert response.json()["ok"] is True
 
-                # Verify UPDATE uses COALESCE (existing value preserved by DB)
+                # Verify: reservation select, room select, conflict check, UPDATE, INSERT
                 calls = mock_cursor.execute.call_args_list
-                assert len(calls) == 4
+                assert len(calls) == 5
 
-                update_call = calls[2][0]
+                update_call = calls[3][0]
                 assert "COALESCE(room_type_id" in update_call[0]
                 # The COALESCE will keep existing "deluxe" since it's not NULL

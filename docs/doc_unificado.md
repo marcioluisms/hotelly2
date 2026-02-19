@@ -869,10 +869,10 @@ DATABASE_URL: String de conexão (via Cloud SQL Auth Proxy ou Unix Sockets no Cl
 Integridade de Reserva e Prevenção de Conflitos de Quarto
 
 ## Status
-Proposto
+Implementado (Sprint 1.11 — Availability Engine)
 
 ## Contexto
-É inaceitável para a operação hoteleira que o mesmo quarto físico () seja atribuído a duas reservas distintas no mesmo período. Precisamos de um algoritmo padronizado e centralizado para validar colisões.
+É inaceitável para a operação hoteleira que o mesmo quarto físico seja atribuído a duas reservas distintas no mesmo período. Precisamos de um algoritmo padronizado e centralizado para validar colisões.
 
 ## Decisão
 Utilizaremos o algoritmo de interseção de intervalos para identificar conflitos:
@@ -880,13 +880,31 @@ Um conflito existe se: `(NovoInicio < FimExistente) AND (NovoFim > InicioExisten
 
 ## Regras de Negócio
 1. **Exclusividade de Check-out**: O check-out é considerado um momento de saída (manhã/meio-dia) e o novo check-in de entrada (tarde). Portanto, a comparação é estrita (`<` e `>`), permitindo que uma reserva comece no mesmo dia em que outra termina.
-2. **Status Operacional**: Apenas reservas com status `confirmed`, `in_house` ou `checked_out` geram conflito. Reservas canceladas são ignoradas.
+2. **Status Operacional**: Apenas reservas com status `confirmed`, `in_house` ou `checked_out` geram conflito. Reservas canceladas e pendentes são ignoradas.
 3. **Ignorar Auto-Conflito**: Ao editar datas de uma reserva já existente, o sistema deve ignorar o próprio ID da reserva para evitar falsos positivos.
 
+## Implementação (Sprint 1.11) — Proteção em Duas Camadas
+
+### Camada 1 — Guarda de Aplicação (`domain/room_conflict.py`)
+- Função central: `assert_no_room_conflict(cur, room_id, check_in, check_out, exclude_reservation_id, lock)`.
+- Chamada com `lock=True` (emite `FOR UPDATE`) nos fluxos transacionais:
+  - `POST /tasks/reservations/assign-room` — **adicionado no Sprint 1.11** (gap anterior: nenhuma verificação antes do `UPDATE reservations SET room_id`).
+  - `POST /{reservation_id}/actions/modify-apply` — já existia.
+  - `POST /{reservation_id}/actions/check-in` — já existia.
+- `exclude_reservation_id` previne auto-conflito em reatribuições e edições de data.
+
+### Camada 2 — Restrição de Banco de Dados (Migration `026_no_room_overlap_constraint`)
+- **Constraint**: `no_physical_room_overlap` na tabela `reservations`.
+- **DDL**: `EXCLUDE USING GIST (room_id WITH =, daterange(checkin, checkout, '[)') WITH &&) WHERE (room_id IS NOT NULL AND status IN ('confirmed'::reservation_status, 'in_house'::reservation_status, 'checked_out'::reservation_status))`.
+- **Extensão**: `btree_gist` (disponível no Cloud SQL PostgreSQL 14+; `CREATE EXTENSION IF NOT EXISTS btree_gist`).
+- **Semântica de intervalo**: bound `'[)'` (half-open) → `checkout_A == checkin_B` **não** é sobreposição → virada de quarto no mesmo dia é permitida.
+- **Garantia absoluta**: mesmo que código de aplicação, script direto ou retry bypass passe pela Camada 1, o PostgreSQL rejeitará o `INSERT`/`UPDATE` com `ExclusionViolation`. Nenhuma colisão física pode persistir no banco.
+
 ## Consequências
-- Garantia de integridade física dos quartos.
-- Centralização da lógica de colisão no Core do domínio.
+- Garantia absoluta de integridade física dos quartos (Zero Overbooking).
+- Centralização da lógica de colisão no Core do domínio; banco de dados como safety gate final.
 - Conformidade com a ADR-006 (PII), proibindo o log de dados de hóspedes em caso de erro de colisão.
+- `ExclusionViolation` do PostgreSQL deve ser tratada como **SEV0** se ocorrer em produção (indica falha na Camada 1 que precisa de investigação imediata).
 
 ---
 
@@ -3315,34 +3333,6 @@ Se o worker precisar montar `CONTACT_HASH_SECRET` (ex.: para hashing) isso quebr
 **Status:**
 - [x] `STRIPE_WEBHOOK_SECRET` — provisionado em `hotelly-public-staging` (Sprint 1.9)
 - [x] `STRIPE_SECRET_KEY` — provisionado em `hotelly-public-staging` e `hotelly-worker-staging` (Sprint 1.9)
-
-### F.6 Roadmap — Histórico de Sprints
-
-| Sprint | Título | Status |
-|---|---|---|
-| 1.7 | Ciclo Financeiro (Folio) | ✅ CONCLUÍDO |
-| 1.8 | WhatsApp Outbound — Notificação de reserva confirmada | ✅ CONCLUÍDO |
-| **1.9** | **Gateway de Pagamento Digital (Stripe)** | ✅ **CONCLUÍDO** |
-| 1.10 | Guest Identity — CRM (tabela `guests`, `upsert_guest`) | ✅ CONCLUÍDO |
-
-**Sprint 1.9 — Entregas verificadas:**
-- Webhook Stripe (`checkout.session.completed`) com validação de assinatura P0 (`STRIPE_WEBHOOK_SECRET`)
-- `create_checkout_session` injeta metadata obrigatório `{ hold_id, property_id, conversation_id }`
-- Task handler `handle-event`: retrieve session → update `payments.status` → `convert_hold`
-- `convert_hold`: transação atômica hold → reserva → outbox `whatsapp.send_message`
-- Security guard: notificação suprimida com log WARNING se `contact_hash` ausente
-- Fix `TypeError` no call site (`cur` ausente, kwargs inválidos, fora de `with txn()`)
-- Regra de Ouro OIDC documentada: `WORKER_BASE_URL` ≡ `TASKS_OIDC_AUDIENCE`
-- Migration `023_holds_guest_name`: `holds.guest_name TEXT` para snapshot do Worker
-- Testes DoD: `tests/test_stripe_webhook_dod.py` — 5/5 cenários
-
-**Sprint 1.10 — Entregas verificadas:**
-- Implementada tabela `guests` (Fonte da Verdade), vínculo com `reservations` e lógica de Upsert/Deduplicação por e-mail.
-- Migration `024_guests_crm`: tabela `guests` (12 colunas), índices parciais únicos por `(property_id, email)` e `(property_id, phone)`, FK `reservations.guest_id`.
-- Migration `025_holds_contact_fields`: `holds.email` e `holds.phone` como campos de entrada para resolução de identidade.
-- `guests_repository.upsert_guest()`: resolução email-first → phone → name-only; `FOR UPDATE` previne race condition entre reservas concorrentes.
-- `convert_hold` (Gate G7): chama `upsert_guest()` na mesma transação antes de inserir a reserva; `reservations.guest_id` populado em toda conversão nova.
-- CRM Bridge validado em staging: E2E com Cenário 1 (novo hóspede) e Cenário 2 (hóspede retornante — mesmo `guest_id`, nome atualizado, sem duplicata).
 
 ---
 
