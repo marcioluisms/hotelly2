@@ -22,6 +22,7 @@ from .routes import (
     extras,
     folio,
     frontdesk,
+    guests,
     me,
     occupancy,
     outbox,
@@ -32,6 +33,7 @@ from .routes import (
     rbac,
     reports,
     reservations,
+    room_types,
     rooms,
     tasks_conversations,
     tasks_holds,
@@ -102,6 +104,8 @@ def create_app(role: AppRole | None = None) -> FastAPI:
         app.include_router(reports.router)
         app.include_router(reservations.router)
         app.include_router(occupancy.router)
+        app.include_router(guests.router)
+        app.include_router(room_types.router)
         app.include_router(rooms.router)
         app.include_router(rates.router)
         app.include_router(cancellation_policy.router)
