@@ -356,15 +356,16 @@ def _get_occupancy_grid(
         cur.execute(
             """
             SELECT
-                r.id           AS room_id,
-                r.name         AS room_name,
+                r.id                AS room_id,
+                r.name              AS room_name,
                 r.room_type_id,
-                rt.name        AS room_type_name,
-                res.id         AS reservation_id,
-                res.checkin    AS res_checkin,
-                res.checkout   AS res_checkout,
-                res.status     AS res_status,
-                res.guest_name AS res_guest_name
+                rt.name             AS room_type_name,
+                r.governance_status,
+                res.id              AS reservation_id,
+                res.checkin         AS res_checkin,
+                res.checkout        AS res_checkout,
+                res.status          AS res_status,
+                res.guest_name      AS res_guest_name
             FROM rooms r
             JOIN room_types rt
                 ON  rt.property_id = r.property_id
@@ -393,15 +394,16 @@ def _get_occupancy_grid(
     # NULL reservation columns — include the room with an empty list.
     rooms_map: dict[str, dict] = {}
     for row in rows:
-        room_id        = row[0]
-        room_name      = row[1]
-        room_type_id   = row[2]
-        room_type_name = row[3]
-        reservation_id = row[4]
-        res_checkin    = row[5]
-        res_checkout   = row[6]
-        res_status     = row[7]
-        res_guest_name = row[8]
+        room_id           = row[0]
+        room_name         = row[1]
+        room_type_id      = row[2]
+        room_type_name    = row[3]
+        governance_status = row[4]
+        reservation_id    = row[5]
+        res_checkin       = row[6]
+        res_checkout      = row[7]
+        res_status        = row[8]
+        res_guest_name    = row[9]
 
         if room_id not in rooms_map:
             rooms_map[room_id] = {
@@ -409,6 +411,7 @@ def _get_occupancy_grid(
                 "name": room_name,
                 "room_type_id": room_type_id,
                 "room_type_name": room_type_name,
+                "governance_status": governance_status,
                 "reservations": [],
             }
 
