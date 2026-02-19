@@ -15,8 +15,10 @@ from fastapi import Depends, HTTPException, Path, Query
 
 from hotelly.api.auth import CurrentUser, get_current_user
 
-# Role hierarchy: lower index = less privilege
-ROLE_HIERARCHY = ["viewer", "staff", "manager", "owner"]
+# Role hierarchy: lower index = less privilege.
+# 'governance' sits between 'viewer' and 'staff': can access read-only room
+# data but cannot reach reservation/guest PII or finance endpoints.
+ROLE_HIERARCHY = ["viewer", "governance", "staff", "manager", "owner"]
 
 
 @dataclass

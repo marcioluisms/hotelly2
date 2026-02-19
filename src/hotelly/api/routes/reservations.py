@@ -1267,6 +1267,19 @@ def check_in_action(
                 detail="Room must be assigned before check-in",
             )
 
+        # 3e. Governance guard: room must be clean before check-in
+        cur.execute(
+            "SELECT governance_status FROM rooms WHERE property_id = %s AND id = %s",
+            (ctx.property_id, room_id),
+        )
+        room_row = cur.fetchone()
+        if room_row is None or room_row[0] != "clean":
+            governance_status = room_row[0] if room_row else "unknown"
+            raise HTTPException(
+                status_code=409,
+                detail=f"Room '{room_id}' is not ready for check-in (governance_status: {governance_status})",
+            )
+
         # 4. ADR-008: room conflict check with lock
         conflicting_id = check_room_conflict(
             cur,

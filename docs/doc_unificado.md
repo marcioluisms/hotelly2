@@ -136,6 +136,27 @@ O Clerk é utilizado apenas para Autenticação (identidade do usuário).
 
 Metadados do Clerk (property_ids, role) não são consultados pelo backend para controle de acesso; a fonte da verdade são as tabelas users e user_property_roles.
 
+### 2.5 Hierarquia de roles (RBAC) — Sprint 1.13
+
+Definida em `src/hotelly/api/rbac.py` (`ROLE_HIERARCHY`):
+
+| Nível | Role | Descrição |
+|---|---|---|
+| 0 | `viewer` | Leitura básica (reservas, quartos, ocupação). |
+| 1 | `governance` | **Governança de quartos** — pode atualizar `governance_status` via `PATCH /rooms/{id}/governance`. Não pode criar/alterar reservas nem acessar endpoints financeiros. **Restrição PII:** endpoints de listagem de reservas que exigem apenas `viewer` também são acessíveis ao `governance`; isolamento total de PII nesses endpoints requer guards por endpoint (work item aberto). |
+| 2 | `staff` | Operações de front-desk: check-in, check-out, atribuição de quarto. |
+| 3 | `manager` | Gestão completa: tarifas, inventário, configurações. |
+| 4 | `owner` | Acesso irrestrito + gerenciamento de equipe (RBAC UI). |
+
+**Regra de autorização:** `require_property_role(min_role)` aceita qualquer role com nível ≥ `min_role`.
+Exemplo: `require_property_role("governance")` aceita `governance`, `staff`, `manager` e `owner`.
+
+**Constraint DB (`user_property_roles`):**
+```sql
+CHECK (role IN ('owner', 'manager', 'staff', 'viewer', 'governance'))
+```
+*(migração `027_governance` — Sprint 1.13)*
+
 ---
 
 
@@ -457,7 +478,8 @@ Proibidos como label: phone, message_id, hold_id.
 - `POST /reservations/{id}/actions/resend-payment-link` → 202 (task)
 - `POST /reservations/{id}/actions/assign-room` → 202 (task)
 - `GET /occupancy` (`start_date`, `end_date` exclusivo; max 90 dias)
-- `GET /rooms`
+- `GET /rooms` (retorna `governance_status` em cada quarto — Sprint 1.13)
+- `PATCH /rooms/{room_id}/governance` — atualiza `governance_status` (`dirty`→`cleaning`→`clean`). Requer role `governance` ou superior. Emite `room.governance_status_changed` no outbox. *(Sprint 1.13)*
 - `GET /rates` / `PUT /rates` (contrato na seção 6.3)
 - `GET /outbox` (PII-safe)
 - `GET /payments`
@@ -783,6 +805,12 @@ O backend não lê metadata.property_ids nem metadata.role do Clerk. Ele só usa
 
   * `JWT.sub` → `users.external_subject` → `user_property_roles`
 * **Clerk user metadata (`property_ids`, `role`) não é usado** para autorização no backend (não adianta ajustar metadata esperando liberar property).
+* Hierarquia de roles (nível crescente de privilégio):
+
+  ```
+  viewer (0) < governance (1) < staff (2) < manager (3) < owner (4)
+  ```
+* O role `governance` é **lateral** — desenhado para equipe de governança/housekeeping. Pode atualizar o status de limpeza dos quartos mas não pode realizar check-in, check-out ou acessar dados financeiros (veja §18).
 
 ---
 
@@ -3382,3 +3410,130 @@ Admin/debug:
 - `processed_events` — dedupe inbound
 - `conversations` — upsert/state machine no processamento de intent
 - `outbox_events` — persistência de resposta (e leitura no send-response)
+
+---
+
+## 18) Housekeeping / Governança de Quartos (Sprint 1.13)
+
+### 18.1 Visão geral
+
+O módulo de housekeeping controla o ciclo de limpeza dos quartos físicos e impõe que **nenhum check-in seja realizado em quarto não limpo**. O controle é feito via campo `governance_status` na tabela `rooms` e exposto por um endpoint dedicado com role `governance`.
+
+### 18.2 Campo `governance_status` (tabela `rooms`)
+
+Adicionado pela migração `027_governance` (Sprint 1.13):
+
+```sql
+ALTER TABLE rooms
+  ADD COLUMN governance_status TEXT NOT NULL DEFAULT 'clean'
+  CHECK (governance_status IN ('dirty', 'cleaning', 'clean'));
+```
+
+| Valor | Significado |
+|---|---|
+| `dirty` | Quarto ocupado / saiu hóspede — aguarda limpeza. |
+| `cleaning` | Limpeza em andamento. |
+| `clean` | Quarto limpo e disponível para check-in. |
+
+**Default:** `'clean'` — todos os quartos existentes permanecem elegíveis para check-in sem necessidade de backfill.
+
+### 18.3 Guard de check-in (guard 3e)
+
+Localização: `src/hotelly/api/routes/reservations.py`, `POST /{reservation_id}/actions/check-in`, **passo 3e** (após validar room atribuído, antes do ADR-008 conflict check).
+
+```python
+# 3e. Governance guard: room must be clean before check-in
+cur.execute(
+    "SELECT governance_status FROM rooms WHERE property_id = %s AND id = %s",
+    (ctx.property_id, room_id),
+)
+room_row = cur.fetchone()
+if room_row is None or room_row[0] != "clean":
+    governance_status = room_row[0] if room_row else "unknown"
+    raise HTTPException(
+        status_code=409,
+        detail=f"Room '{room_id}' is not ready for check-in (governance_status: {governance_status})",
+    )
+```
+
+**Comportamento:**
+- `governance_status == 'clean'` → guard passa, check-in prossegue.
+- `governance_status == 'dirty'` ou `'cleaning'` → **409 Conflict** com detalhe do status atual.
+- Room não encontrada na tabela `rooms` → **409 Conflict** (`governance_status: unknown`).
+
+**Posição no fluxo do check-in:**
+
+| Passo | Descrição | Erro |
+|---|---|---|
+| 1 | Idempotency check | — |
+| 2 | Lock reservation `FOR UPDATE` | 404 |
+| 3a | Guard: já em `in_house` | 409 |
+| 3b | Guard: status ≠ `confirmed` | 409 |
+| 3c | Guard: data de check-in vs hoje (timezone) | 400 |
+| 3d | Guard: `room_id` atribuído | 422 |
+| **3e** | **Guard: `governance_status == 'clean'`** | **409** |
+| 4 | ADR-008 room conflict check | 409 |
+| 5 | UPDATE status → `in_house` | 409 |
+| 6 | Outbox event `reservation.in_house` | — |
+| 7 | Registro idempotency key | — |
+
+### 18.4 Endpoint `PATCH /rooms/{room_id}/governance`
+
+**Arquivo:** `src/hotelly/api/routes/rooms.py`
+
+```
+PATCH /rooms/{room_id}/governance?property_id={property_id}
+Authorization: Bearer <token>   (min role: governance)
+Content-Type: application/json
+
+Body:   { "governance_status": "dirty" | "cleaning" | "clean" }
+200:    { "id": "...", "governance_status": "..." }
+403:    role insuficiente (< governance)
+404:    quarto não encontrado na property
+422:    valor inválido para governance_status
+```
+
+**Fluxo interno:**
+1. `UPDATE rooms SET governance_status = %s WHERE property_id = %s AND id = %s RETURNING id, governance_status`
+2. Se `fetchone()` retornar `None` → 404.
+3. `INSERT INTO outbox_events` com `event_type = 'room.governance_status_changed'`, `aggregate_type = 'room'`, payload `{room_id, property_id, governance_status, changed_by}` (sem PII).
+
+### 18.5 Role `governance` — acesso e restrições
+
+| Endpoint | Acesso `governance` | Motivo |
+|---|---|---|
+| `GET /rooms` | ✅ Sim | Requer `viewer` (nível 0 ≤ 1) |
+| `PATCH /rooms/{id}/governance` | ✅ Sim | Requer `governance` (nível 1 ≤ 1) |
+| `POST /reservations/.../check-in` | ❌ Não | Requer `staff` (nível 2 > 1) → 403 |
+| `POST /reservations/.../check-out` | ❌ Não | Requer `staff` → 403 |
+| `GET /payments` | ❌ Não | Requer `staff` → 403 |
+| `GET /reservations` (lista) | ⚠️ Sim* | Requer apenas `viewer` — ver nota abaixo |
+
+> **⚠️ Work item aberto (PII):** `GET /reservations` e `GET /reservations/{id}` exigem apenas `viewer` e retornam dados de hóspedes (nomes, contatos). O role `governance` satisfaz `viewer` e, portanto, tecnicamente tem acesso a esses dados. Isolamento total de PII para o role `governance` requer guards por endpoint (`if ctx.role == "governance": raise HTTPException(403)`) nesses endpoints — registrado como work item para sprint seguinte.
+
+### 18.6 Outbox event `room.governance_status_changed`
+
+Emitido pelo `PATCH /rooms/{id}/governance` dentro da mesma transação do UPDATE:
+
+```json
+{
+  "room_id": "room-101",
+  "property_id": "prop-abc",
+  "governance_status": "clean",
+  "changed_by": "<user_uuid>"
+}
+```
+
+Sem PII (nomes/emails/telefones). Segue a política de zero PII nos payloads (§3.2).
+
+### 18.7 Migração `027_governance`
+
+**SQL:** `migrations/sql/027_governance.sql`
+**Alembic:** `migrations/versions/027_governance.py`
+**down_revision:** `026_no_room_overlap_constraint`
+
+Operações (atômicas):
+1. `DROP CONSTRAINT user_property_roles_role_check` + `ADD CONSTRAINT ... CHECK (role IN ('owner', 'manager', 'staff', 'viewer', 'governance'))`.
+2. `ALTER TABLE rooms ADD COLUMN governance_status TEXT NOT NULL DEFAULT 'clean' CHECK (governance_status IN ('dirty', 'cleaning', 'clean'))`.
+
+**Downgrade:** remove a coluna `governance_status` e reverte a constraint ao conjunto original de 4 roles.

@@ -104,6 +104,7 @@ class TestCheckInRBAC:
                     None,            # idempotency check
                     _reservation_row(),  # reservation row
                     _TZ_ROW,         # timezone
+                    ("clean",),      # governance_status (guard 3e)
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 with patch(
@@ -257,6 +258,7 @@ class TestCheckInWrongDate:
                     None,            # idempotency check
                     _reservation_row(checkin=yesterday),
                     _TZ_ROW,         # timezone
+                    ("clean",),      # governance_status (guard 3e)
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 with patch(
@@ -288,6 +290,7 @@ class TestCheckInWrongDate:
                     None,            # idempotency check
                     _reservation_row(checkin=brt_date),
                     _TZ_ROW,         # timezone → America/Sao_Paulo
+                    ("clean",),      # governance_status (guard 3e)
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 with patch(
@@ -350,6 +353,7 @@ class TestCheckInRoomConflict:
                     None,            # idempotency check
                     _reservation_row(),
                     _TZ_ROW,         # timezone
+                    ("clean",),      # governance_status (guard 3e)
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 with patch(
@@ -382,6 +386,7 @@ class TestCheckInHappyPath:
                     None,            # idempotency check
                     _reservation_row(),
                     _TZ_ROW,         # timezone
+                    ("clean",),      # governance_status (guard 3e)
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 with patch(
@@ -447,6 +452,7 @@ class TestCheckInIdempotency:
                     None,            # idempotency check
                     _reservation_row(),
                     _TZ_ROW,         # timezone
+                    ("clean",),      # governance_status (guard 3e)
                 ]
                 mock_txn.return_value.__enter__.return_value = cur
                 with patch(
