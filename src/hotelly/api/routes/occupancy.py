@@ -56,6 +56,7 @@ def _get_occupancy(
                 SELECT id AS room_type_id, name
                 FROM room_types
                 WHERE property_id = %s
+                  AND deleted_at IS NULL
             ),
             grid AS (
                 SELECT rt.room_type_id, rt.name, ds.date
@@ -392,8 +393,9 @@ def _get_occupancy_grid(
                 res.guest_name      AS res_guest_name
             FROM rooms r
             JOIN room_types rt
-                ON  rt.property_id = r.property_id
-                AND rt.id          = r.room_type_id
+                ON  rt.property_id  = r.property_id
+                AND rt.id           = r.room_type_id
+                AND rt.deleted_at IS NULL
             LEFT JOIN reservations res
                 ON  res.room_id     = r.id
                 AND res.property_id = r.property_id

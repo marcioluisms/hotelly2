@@ -5,7 +5,13 @@ Provides CRUD for the room_types catalog of a property.
 GET    /room_types?property_id=...           → list   (viewer+)
 POST   /room_types?property_id=...           → create (manager+)
 PATCH  /room_types/{id}?property_id=...      → update (manager+)
-DELETE /room_types/{id}?property_id=...      → delete (manager+, 204)
+DELETE /room_types/{id}?property_id=...      → soft-delete (manager+, 204)
+
+Lifecycle policy (Layer 1 — Soft Delete):
+  DELETE sets deleted_at = now() rather than removing the row so that
+  financial history (reservations, rate records for past dates) retains its
+  FK target.  The row is excluded from all operational reads via
+  WHERE deleted_at IS NULL.  Physical purge is a separate superadmin action.
 """
 
 from __future__ import annotations
@@ -60,9 +66,10 @@ def _row_to_dict(row: tuple) -> dict:
 def list_room_types(
     ctx: PropertyRoleContext = Depends(require_property_role("viewer")),
 ) -> list[dict]:
-    """List all room types for the property.
+    """List all active (non-soft-deleted) room types for the property.
 
     Returns room types ordered by name.
+    Soft-deleted room types (deleted_at IS NOT NULL) are excluded.
     Requires viewer role or higher.
     """
     with txn() as cur:
@@ -71,6 +78,7 @@ def list_room_types(
             SELECT id, property_id, name, description, max_occupancy, created_at, updated_at
             FROM room_types
             WHERE property_id = %s
+              AND deleted_at IS NULL
             ORDER BY name
             """,
             (ctx.property_id,),
@@ -121,6 +129,7 @@ def update_room_type(
     """Update a room type's name, description or max_occupancy.
 
     Only the provided fields are changed (partial update).
+    Returns 404 for soft-deleted room types.
     Requires manager role or higher.
     """
     if not any([body.name, body.description is not None, body.max_occupancy is not None]):
@@ -147,7 +156,7 @@ def update_room_type(
             f"""
             UPDATE room_types
             SET {", ".join(sets)}
-            WHERE property_id = %s AND id = %s
+            WHERE property_id = %s AND id = %s AND deleted_at IS NULL
             RETURNING id, property_id, name, description, max_occupancy, created_at, updated_at
             """,  # noqa: S608 – no user input in SET clause, only whitelisted column names
             params,
@@ -167,118 +176,113 @@ def delete_room_type(
     room_type_id: str = Path(..., description="Room type ID"),
     ctx: PropertyRoleContext = Depends(require_property_role("manager")),
 ) -> None:
-    """Delete a room type.
+    """Soft-delete a room type (Layer 1 lifecycle — ADR Room Type Lifecycle).
 
-    Behaviour:
-    - Rooms with active reservations (confirmed / in_house) block deletion (409).
-    - Rooms whose reservations are all finalized (cancelled / checked_out) are
-      automatically purged: their room_id is NULLed on the finished reservations
-      and the room row is deleted — removing "ghost" rooms that the UI could not
-      show as blocking.
-    - Rooms with no reservations at all are deleted unconditionally.
+    Sets deleted_at = now() on the room_types row — the row is NOT physically
+    removed. Financial history (past reservations, past rate records) is
+    preserved because the FK target still exists.
+
+    Blocking conditions (→ 409):
+    - Any room in this category still has is_active = true (deactivate first).
+    - Any reservation with status confirmed or in_house on this room_type.
+
+    Side-effects on success:
+    - Future ari_days rows (date >= today) are hard-deleted: they are
+      operational/derivative data that would show phantom inventory.
+    - Future room_type_rates rows (date >= today) are hard-deleted: rates for
+      a decommissioned category would produce incorrect quote responses.
+    - ON DELETE CASCADE covers ari_days and rates as documented in the ADR;
+      the explicit DELETE here is a belt-and-suspenders cleanup within the
+      same transaction as the soft-delete.
 
     Requires manager role or higher.
     """
-    from psycopg2 import errors as pg_errors
-
     with txn() as cur:
-        # 1. Collect all rooms for this room type.
+        # 1. Verify the room type exists and is not already soft-deleted.
         cur.execute(
-            "SELECT id FROM rooms WHERE property_id = %s AND room_type_id = %s",
+            """
+            SELECT 1 FROM room_types
+            WHERE property_id = %s AND id = %s AND deleted_at IS NULL
+            """,
             (ctx.property_id, room_type_id),
         )
-        all_room_ids: list[str] = [row[0] for row in cur.fetchall()]
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Room type not found")
 
-        if all_room_ids:
-            # 2. Find rooms that have at least one ACTIVE reservation
-            #    (confirmed or in_house). These truly block deletion.
-            cur.execute(
-                """
-                SELECT COUNT(DISTINCT room_id) FROM reservations
-                WHERE property_id = %s
-                  AND room_id = ANY(%s)
-                  AND status NOT IN (
-                      'cancelled'::reservation_status,
-                      'checked_out'::reservation_status
-                  )
-                """,
-                (ctx.property_id, all_room_ids),
-            )
-            rooms_with_active_res: int = cur.fetchone()[0]
+        # 2. Block if any room in this category is still active.
+        #    Active rooms must be deactivated via PATCH /rooms/{id} first.
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM rooms
+            WHERE property_id = %s AND room_type_id = %s AND is_active = true
+            """,
+            (ctx.property_id, room_type_id),
+        )
+        active_rooms: int = cur.fetchone()[0]
 
-            if rooms_with_active_res > 0:
-                # Surface active reservation count on the room_type for awareness.
-                cur.execute(
-                    """
-                    SELECT COUNT(*) FROM reservations
-                    WHERE property_id = %s
-                      AND room_type_id = %s
-                      AND status NOT IN (
-                          'cancelled'::reservation_status,
-                          'checked_out'::reservation_status
-                      )
-                    """,
-                    (ctx.property_id, room_type_id),
-                )
-                linked_reservations: int = cur.fetchone()[0]
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "linked_rooms",
-                        "message": (
-                            f"Room type has {rooms_with_active_res} room(s) with active "
-                            "reservations (confirmed or in_house). Cancel or complete "
-                            "those reservations before deleting this category."
-                        ),
-                        "linked_rooms": rooms_with_active_res,
-                        "linked_reservations": linked_reservations,
-                    },
-                )
+        # 3. Block if any reservation is in an open operational state.
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM reservations
+            WHERE property_id = %s
+              AND room_type_id = %s
+              AND status NOT IN (
+                  'cancelled'::reservation_status,
+                  'checked_out'::reservation_status
+              )
+            """,
+            (ctx.property_id, room_type_id),
+        )
+        active_reservations: int = cur.fetchone()[0]
 
-            # 3. All rooms are safe to purge (only finalized or no reservations).
-            #    NULL out room_id on finished reservations so the FK is released.
-            cur.execute(
-                """
-                UPDATE reservations
-                SET room_id = NULL, updated_at = now()
-                WHERE property_id = %s
-                  AND room_id = ANY(%s)
-                  AND status IN (
-                      'cancelled'::reservation_status,
-                      'checked_out'::reservation_status
-                  )
-                """,
-                (ctx.property_id, all_room_ids),
-            )
-
-            # 4. Delete the now-unblocked rooms.
-            cur.execute(
-                "DELETE FROM rooms WHERE property_id = %s AND room_type_id = %s",
-                (ctx.property_id, room_type_id),
-            )
-
-        # 5. Delete the room type itself.
-        try:
-            cur.execute(
-                """
-                DELETE FROM room_types
-                WHERE property_id = %s AND id = %s
-                RETURNING id
-                """,
-                (ctx.property_id, room_type_id),
-            )
-            row = cur.fetchone()
-        except pg_errors.ForeignKeyViolation:
-            # Race condition: a room was inserted between steps 1 and 5.
+        if active_rooms > 0 or active_reservations > 0:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": "linked_rooms",
-                    "message": "Room type has rooms attached and cannot be deleted.",
-                    "linked_rooms": -1,
-                    "linked_reservations": -1,
+                    "code": "active_references",
+                    "message": (
+                        f"Cannot delete: {active_rooms} active room(s) and "
+                        f"{active_reservations} open reservation(s) are linked to "
+                        "this category. Deactivate all rooms and cancel/complete all "
+                        "reservations before removing the category."
+                    ),
+                    "active_rooms": active_rooms,
+                    "active_reservations": active_reservations,
                 },
             )
 
-    if row is None:
-        raise HTTPException(status_code=404, detail="Room type not found")
+        # 4. Cleanup: hard-delete future ari_days (derivative inventory data).
+        #    Past rows are kept for historical occupancy reporting.
+        cur.execute(
+            """
+            DELETE FROM ari_days
+            WHERE property_id = %s
+              AND room_type_id = %s
+              AND date >= CURRENT_DATE
+            """,
+            (ctx.property_id, room_type_id),
+        )
+
+        # 5. Cleanup: hard-delete future room_type_rates.
+        #    Past rows are kept so that historical billing recalculations remain
+        #    possible.  Future rates for a decommissioned category are useless
+        #    and would cause confusing quote responses.
+        cur.execute(
+            """
+            DELETE FROM room_type_rates
+            WHERE property_id = %s
+              AND room_type_id = %s
+              AND date >= CURRENT_DATE
+            """,
+            (ctx.property_id, room_type_id),
+        )
+
+        # 6. Soft-delete: stamp deleted_at instead of removing the row.
+        cur.execute(
+            """
+            UPDATE room_types
+            SET deleted_at = now(), updated_at = now()
+            WHERE property_id = %s AND id = %s AND deleted_at IS NULL
+            """,
+            (ctx.property_id, room_type_id),
+        )

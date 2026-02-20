@@ -3837,3 +3837,74 @@ Quando `room_type_id`, `checkin`, `checkout` e `adult_count` estiverem preenchid
 - Seleção é limpa automaticamente após `putRates` bem-sucedido (`clearSelection()`).
 
 **Retrocompatível:** Shift+Click para seleção de intervalo e a lógica de bulk-edit existente funcionam sem alteração dentro da categoria ativa.
+
+## 21) Ciclo de Vida de Categorias de Quartos — Room Type Lifecycle Policy
+
+### 21.1 Princípio (Regra de Ouro)
+
+> **Soft Delete é o padrão para exclusões via UI.**
+> A linha de `room_types` nunca é removida fisicamente pelo fluxo de dashboard — apenas `deleted_at` é carimbado. Isso garante que o histórico financeiro (reservas, tarifas de datas passadas) mantenha seu alvo de FK.
+
+### 21.2 Abordagem em Camadas
+
+| Camada | Ação | Quem executa | Quando |
+|--------|------|-------------|--------|
+| **Layer 1** (implementado — Sprint 1.16) | `UPDATE room_types SET deleted_at = now()` | Dashboard `DELETE /room_types/{id}` | Operação normal de manager |
+| **Layer 2** (futuro) | `DELETE FROM room_types WHERE id = …` | Endpoint superadmin restrito | Purge explícito, somente após auditoria |
+
+### 21.3 Pré-condições de Bloqueio (409)
+
+A exclusão via dashboard é bloqueada se **qualquer uma** das condições abaixo for verdadeira:
+
+1. **Quartos ativos**: existem `rooms` com `is_active = true` nesta categoria.
+   → Operador deve desativar todos os quartos via `PATCH /rooms/{id}` antes de excluir a categoria.
+
+2. **Reservas abertas**: existem `reservations` com `room_type_id = {id}` e `status NOT IN ('cancelled', 'checked_out')`.
+   → Operador deve cancelar ou concluir (check-out) todas as reservas antes de excluir a categoria.
+
+### 21.4 Efeitos Colaterais na Exclusão Bem-sucedida
+
+Executados **na mesma transação** que o soft-delete:
+
+| Tabela | Ação | Justificativa |
+|--------|------|---------------|
+| `ari_days` | `DELETE WHERE date >= CURRENT_DATE` | Dado operacional/derivado — linha de inventário futura seria fantasma |
+| `room_type_rates` | `DELETE WHERE date >= CURRENT_DATE` | Dado de configuração — tarifas futuras de categoria desativada causariam respostas de quote incorretas |
+| `ari_days` (passado) | **Mantido** | Histórico de ocupação para relatórios |
+| `room_type_rates` (passado) | **Mantido** | Referência para recálculo de billing histórico |
+| `reservations` | **Não tocado** | Histórico financeiro — imutável |
+| `rooms` | **Não tocado** | Permanecem no DB com `is_active = false` até purge Layer 2 |
+
+> **Regra:** `ON DELETE CASCADE` é permitido **apenas** para dados operacionais/derivados como `ari_days`. Dados de histórico financeiro usam `ON DELETE RESTRICT` ou `ON DELETE SET NULL`.
+
+### 21.5 Propagação do Filtro `deleted_at IS NULL`
+
+Todos os endpoints que lêem `room_types` devem incluir `AND deleted_at IS NULL`:
+
+| Endpoint / Query | Status |
+|-----------------|--------|
+| `GET /room_types` (`list_room_types`) | ✅ Implementado |
+| `PATCH /room_types/{id}` (`update_room_type`) | ✅ Implementado |
+| `POST /reservations` — validação de `room_type_id` | ✅ Implementado |
+| `POST /reservations/actions/quote` — validação de `room_type_id` | ✅ Implementado |
+| `GET /occupancy` — CTE `room_types_for_property` | ✅ Implementado |
+| `GET /occupancy/grid` — JOIN `room_types rt` | ✅ Implementado |
+
+### 21.6 Migração `030_room_types_soft_delete`
+
+```sql
+-- migrations/sql/030_room_types_soft_delete.sql
+ALTER TABLE room_types
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_room_types_deleted_at
+    ON room_types (deleted_at);
+```
+
+Alembic revision: `030_room_types_soft_delete` → revises `029_reservations_hold_nullable`.
+
+### 21.7 Endpoint atualizado: `DELETE /room_types/{id}`
+
+- **Antes (hard delete):** `DELETE FROM room_types WHERE …` → destruía a linha e quebrava FKs históricas.
+- **Depois (soft delete):** `UPDATE room_types SET deleted_at = now(), updated_at = now() WHERE … AND deleted_at IS NULL`.
+- Retorna **204** em caso de sucesso; **404** se não encontrado ou já soft-deleted; **409** com `code: "active_references"` se houver quartos ativos ou reservas abertas.

@@ -296,9 +296,12 @@ def create_reservation(
         raise HTTPException(status_code=400, detail="total_cents must be >= 0")
 
     with txn() as cur:
-        # ── 2. Verify room_type_id belongs to this property ───────────────────
+        # ── 2. Verify room_type_id belongs to this property (not soft-deleted) ──
         cur.execute(
-            "SELECT 1 FROM room_types WHERE property_id = %s AND id = %s",
+            """
+            SELECT 1 FROM room_types
+            WHERE property_id = %s AND id = %s AND deleted_at IS NULL
+            """,
             (ctx.property_id, body.room_type_id),
         )
         if cur.fetchone() is None:
@@ -529,7 +532,10 @@ def quote_reservation(
             # Verify the room type belongs to this property before hitting
             # the pricing engine.
             cur.execute(
-                "SELECT 1 FROM room_types WHERE property_id = %s AND id = %s",
+                """
+                SELECT 1 FROM room_types
+                WHERE property_id = %s AND id = %s AND deleted_at IS NULL
+                """,
                 (ctx.property_id, body.room_type_id),
             )
             if cur.fetchone() is None:
