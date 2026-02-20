@@ -484,9 +484,10 @@ Proibidos como label: phone, message_id, hold_id.
 - `POST /rooms` — Cria quarto físico (`name`, `room_type_id`, `is_active`). Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/route.ts`]
 - `PATCH /rooms/{room_id}` — Atualiza nome, categoria e status ativo (partial update). Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/[roomId]/route.ts`]
 - `DELETE /rooms/{room_id}` — Remove quarto. Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/[roomId]/route.ts`]
-- `POST /reservations` — Cria reserva manual (sem hold), `hold_id = NULL`. Requer `staff` ou superior. Campos: `room_type_id`, `checkin`, `checkout`, `total_cents` (obrigatórios); `currency`, `adult_count`, `guest_id`, `room_id` (opcionais). Emite `reservation.created` no outbox. Migration 029 torna `hold_id` nullable. [CONCLUÍDO — proxy em `reservations/route.ts`, UI em `/p/[propertyId]/reservations/page.tsx`]
+- `POST /reservations` — Cria reserva manual (sem hold), `hold_id = NULL`. Requer `staff` ou superior. Campos: `room_type_id`, `checkin`, `checkout`, `total_cents` (obrigatórios); `currency`, `adult_count`, `guest_id`, `room_id` (opcionais). Emite `reservation.created` no outbox. Migration 029 torna `hold_id` nullable. [CONCLUÍDO — proxy em `reservations/route.ts`, UI em `/p/[propertyId]/reservations/page.tsx`] *(Sprint 1.15: UI aprimorada com Autocomplete de hóspede e Pricing Preview — ver §20)*
+- `POST /reservations/actions/quote` — **Pricing Preview** (read-only, sem mutações). Calcula preço e verifica disponibilidade ARI antes da criação. Retorna sempre HTTP 200; inspecionar campo `available`. Requer `staff` ou superior. *(Sprint 1.15 [CONCLUÍDO] — ver §20)*
 - `PATCH /rooms/{room_id}/governance` — atualiza `governance_status` (`dirty`→`cleaning`→`clean`). Requer role `governance` ou superior. Emite `room.governance_status_changed` no outbox. *(Sprint 1.13)*
-- `GET /rates` / `PUT /rates` (contrato na seção 6.3)
+- `GET /rates` / `PUT /rates` (contrato na seção 6.3) *(Sprint 1.15: seleção de datas na UI isolada por `room_type_id` — ver §20)*
 - `GET /outbox` (PII-safe)
 - `GET /payments`
 - `POST /payments/holds/{hold_id}/checkout`
@@ -3734,3 +3735,105 @@ ALTER TABLE room_types
 ```
 
 Retrocompatível: linhas existentes recebem `description = NULL` e `max_occupancy = 2`.
+
+---
+
+## 20) Usability & Financial Intelligence — Sprint 1.15 [CONCLUÍDO]
+
+> **Status: Implementado — 2026-02-20**
+>
+> Objetivo: eliminar o erro 409 `no_ari_record` expondo um preview de preço antes da criação de reserva, e melhorar a UX nas páginas de Reservas e Tarifas.
+
+### 20.1 Novo endpoint: `POST /reservations/actions/quote`
+
+**Arquivo:** `src/hotelly/api/routes/reservations.py`
+
+Endpoint de Pricing Preview para **novas** reservas (sem `reservation_id`). Read-only — nenhuma linha é escrita, nenhum lock `FOR UPDATE` é emitido.
+
+**Request body (`QuoteRequest`):**
+```json
+{
+  "room_type_id": "string",
+  "checkin": "YYYY-MM-DD",
+  "checkout": "YYYY-MM-DD",
+  "adult_count": 2,
+  "children_ages": []
+}
+```
+
+**Resposta — sempre HTTP 200:**
+
+| `available` | Campos adicionais | Significado |
+|---|---|---|
+| `true` | `total_cents`, `currency`, `nights` | Preço calculado com sucesso |
+| `false` | `reason_code`, `meta` | ARI ou tarifa indisponível |
+
+**`reason_code` possíveis:**
+
+| Código | Causa |
+|---|---|
+| `no_ari_record` | Nenhuma linha em `ari_days` para uma das noites da estadia |
+| `no_inventory` | `inv_total - inv_booked - inv_held < 1` para uma das noites |
+| `rate_missing` | Nenhuma linha em `room_type_rates` para uma data |
+| `pax_rate_missing` | Coluna `price_{N}pax_cents` é NULL |
+| `child_rate_missing` | Coluna de bucket de criança é NULL |
+| `child_policy_missing` | Propriedade sem configuração de faixas etárias |
+| `child_policy_incomplete` | Buckets não cobrem 0..17 sem lacunas |
+| `invalid_dates` | `checkin >= checkout` |
+| `invalid_adult_count` | `adult_count` fora do intervalo 1..4 |
+
+**Engine:** chama `quote_minimum()` de `domain/quote.py`, que já era usada internamente por `create_hold`. A lógica de cálculo não foi duplicada.
+
+**Auth:** `staff` ou superior (mesmo nível que `POST /reservations`).
+
+**BFF (hotelly-admin):**
+- Proxy: `src/app/api/p/[propertyId]/reservations/actions/quote/route.ts`
+- Lib: `src/lib/reservations.ts` — `quoteNewReservation()`, tipo `QuoteResponse`
+
+---
+
+### 20.2 CRUD de Reservas — UI aprimorada (`NewReservationDialog`)
+
+**Arquivo:** `src/app/p/[propertyId]/reservations/NewReservationDialog.tsx`
+
+#### 20.2.1 Autocomplete de Hóspede
+
+O campo `ID do hóspede` (input de texto livre esperando UUID) foi substituído por um Autocomplete:
+
+- Digitar ≥ 2 caracteres aciona `GET /guests?search=...` com debounce de 400ms
+- Resultados exibidos como dropdown posicionado com `full_name` + `email`
+- Ao selecionar: chip com botão `✕` para desfazer
+- Ao submeter: envia `guest_id: selectedGuest?.id ?? null`
+- Nenhuma biblioteca externa; padrão idêntico ao `GuestList.tsx`
+
+#### 20.2.2 Pricing Preview
+
+Quando `room_type_id`, `checkin`, `checkout` e `adult_count` estiverem preenchidos, o dialog dispara `POST /reservations/actions/quote` com debounce de 400ms e exibe:
+
+| Estado | Visual |
+|---|---|
+| Calculando | Texto cinza "Calculando preço…" |
+| `available: true` | Bloco verde com preço formatado (R$) e contagem de noites; preenche automaticamente o campo `Valor total` |
+| `available: false` | Bloco âmbar com mensagem legível mapeada do `reason_code`; **botão "Criar" desabilitado** |
+| Erro de rede | Mensagem vermelha inline; botão permanece habilitado (degradação graciosa) |
+
+**Invariante:** o campo `Valor total (centavos)` continua editável para overrides manuais. O auto-preenchimento ocorre a cada nova resposta do quote.
+
+---
+
+### 20.3 Gestão de Tarifas — seleção de datas isolada por categoria (`RatesGrid`)
+
+**Arquivo:** `src/app/p/[propertyId]/rates/RatesGrid.tsx`
+
+**Problema anterior:** `selectedDates` era um `Set<string>` global. Clicar em uma data na categoria A destacava a mesma data em todas as outras categorias, e a "Edição em lote" aplicava valores em todas as categorias simultaneamente.
+
+**Solução:**
+
+- Adicionado estado `selectedRoomTypeId: string | null` que rastreia qual categoria tem seleção ativa.
+- `toggleDate(roomTypeId, date, shiftKey)`: ao clicar em uma categoria diferente da ativa, limpa `selectedDates` e muda `selectedRoomTypeId` antes de selecionar a nova data.
+- Highlight de cabeçalho e células: `selectedRoomTypeId === rt.id && selectedDates.has(d)` — bleed cross-category eliminado.
+- `applyBulk` e `applyPct`: filtram `r.room_type_id !== selectedRoomTypeId` — mutações afetam apenas a categoria ativa.
+- Botão **"Limpar seleção"** aparece na barra de controles quando `selectedCount > 0`.
+- Seleção é limpa automaticamente após `putRates` bem-sucedido (`clearSelection()`).
+
+**Retrocompatível:** Shift+Click para seleção de intervalo e a lógica de bulk-edit existente funcionam sem alteração dentro da categoria ativa.
