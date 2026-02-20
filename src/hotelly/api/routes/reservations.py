@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
 from hotelly.observability.correlation import get_correlation_id
@@ -61,6 +61,22 @@ class ModifyPreviewRequest(BaseModel):
 class ModifyApplyRequest(BaseModel):
     new_checkin: date
     new_checkout: date
+
+
+class CreateReservationRequest(BaseModel):
+    """Request body for manual reservation creation by staff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    room_type_id: str
+    checkin: date
+    checkout: date
+    total_cents: int
+    currency: str = "BRL"
+    adult_count: int = 2
+    children_ages: list[int] = []
+    guest_id: str | None = None
+    room_id: str | None = None
 
 
 router = APIRouter(prefix="/reservations", tags=["reservations"])
@@ -176,7 +192,7 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
         "status": row[3],
         "total_cents": row[4],
         "currency": row[5],
-        "hold_id": str(row[6]),
+        "hold_id": str(row[6]) if row[6] is not None else None,
         "room_id": row[7],
         "room_type_id": row[8],
         "created_at": row[9].isoformat(),
@@ -218,6 +234,227 @@ def _room_exists_and_active(property_id: str, room_id: str) -> bool:
             (property_id, room_id),
         )
         return cur.fetchone() is not None
+
+
+@router.post("", status_code=201)
+def create_reservation(
+    body: CreateReservationRequest,
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> dict:
+    """Create a reservation manually (no hold required).
+
+    Transactional flow:
+    1. Validate dates and total_cents.
+    2. Verify room_type_id belongs to this property.
+    3. If guest_id provided: verify it exists for this property.
+    4. If room_id provided: verify it is active and belongs to the property.
+    5. Lock ARI rows FOR UPDATE and verify availability for every night.
+    6. If room_id provided: room conflict check (ADR-008) with FOR UPDATE lock.
+    7. Increment inv_booked for every night.
+    8. INSERT reservation with hold_id = NULL.
+    9. Emit reservation.created outbox event.
+
+    Requires staff role or higher.
+    """
+    import json
+
+    from hotelly.domain.room_conflict import RoomConflictError, check_room_conflict
+    from hotelly.infra.db import txn
+    from hotelly.infra.repositories.holds_repository import increment_inv_booked
+
+    correlation_id = get_correlation_id()
+
+    # ── 1. Basic validation ───────────────────────────────────────────────────
+    if body.checkin >= body.checkout:
+        raise HTTPException(status_code=400, detail="invalid_dates")
+
+    if body.total_cents < 0:
+        raise HTTPException(status_code=400, detail="total_cents must be >= 0")
+
+    with txn() as cur:
+        # ── 2. Verify room_type_id belongs to this property ───────────────────
+        cur.execute(
+            "SELECT 1 FROM room_types WHERE property_id = %s AND id = %s",
+            (ctx.property_id, body.room_type_id),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=422, detail="room_type_id not found for this property")
+
+        # ── 3. Resolve guest name (if guest_id provided) ──────────────────────
+        guest_name: str | None = None
+        if body.guest_id is not None:
+            cur.execute(
+                "SELECT full_name FROM guests WHERE property_id = %s AND id = %s",
+                (ctx.property_id, body.guest_id),
+            )
+            guest_row = cur.fetchone()
+            if guest_row is None:
+                raise HTTPException(status_code=422, detail="guest_id not found for this property")
+            guest_name = guest_row[0]
+
+        # ── 4. Verify room_id is active and matches the room_type ─────────────
+        if body.room_id is not None:
+            cur.execute(
+                """
+                SELECT room_type_id FROM rooms
+                WHERE property_id = %s AND id = %s AND is_active = true
+                """,
+                (ctx.property_id, body.room_id),
+            )
+            room_row = cur.fetchone()
+            if room_row is None:
+                raise HTTPException(status_code=422, detail="room_id not found or inactive")
+            if room_row[0] != body.room_type_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="room_id does not belong to the specified room_type_id",
+                )
+
+        # ── 5. Lock ARI rows and verify availability for every night ──────────
+        current = body.checkin
+        nights: list[date] = []
+        while current < body.checkout:
+            nights.append(current)
+            current += timedelta(days=1)
+
+        cur.execute(
+            """
+            SELECT date, inv_total, inv_booked, inv_held
+            FROM ari_days
+            WHERE property_id = %s AND room_type_id = %s
+              AND date = ANY(%s)
+            ORDER BY date
+            FOR UPDATE
+            """,
+            (ctx.property_id, body.room_type_id, nights),
+        )
+        ari_rows = cur.fetchall()
+        ari_by_date = {row[0]: row for row in ari_rows}
+
+        for night in nights:
+            ari = ari_by_date.get(night)
+            if ari is None:
+                raise HTTPException(status_code=409, detail="no_ari_record")
+            _, inv_total, inv_booked, inv_held = ari
+            if inv_total - inv_booked - inv_held < 1:
+                raise HTTPException(status_code=409, detail="no_inventory")
+
+        # ── 6. Room conflict check (ADR-008) ──────────────────────────────────
+        if body.room_id is not None:
+            conflict_id = check_room_conflict(
+                cur,
+                room_id=body.room_id,
+                check_in=body.checkin,
+                check_out=body.checkout,
+                property_id=ctx.property_id,
+                lock=True,
+            )
+            if conflict_id is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Room conflict with reservation {conflict_id}",
+                )
+
+        # ── 7. Increment inv_booked for every night ───────────────────────────
+        for night in nights:
+            ok = increment_inv_booked(
+                cur,
+                property_id=ctx.property_id,
+                room_type_id=body.room_type_id,
+                night_date=night,
+            )
+            if not ok:
+                raise HTTPException(status_code=409, detail="no_inventory")
+
+        # ── 8. Insert reservation (hold_id = NULL) ────────────────────────────
+        cur.execute(
+            """
+            INSERT INTO reservations (
+                property_id, checkin, checkout,
+                total_cents, currency,
+                room_type_id, room_id,
+                adult_count, children_ages,
+                guest_id, guest_name,
+                status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
+            RETURNING id, checkin, checkout, status, total_cents, currency,
+                      hold_id, room_id, room_type_id, created_at
+            """,
+            (
+                ctx.property_id,
+                body.checkin,
+                body.checkout,
+                body.total_cents,
+                body.currency,
+                body.room_type_id,
+                body.room_id,
+                body.adult_count,
+                json.dumps(body.children_ages),
+                body.guest_id,
+                guest_name,
+            ),
+        )
+        row = cur.fetchone()
+        reservation_id = str(row[0])
+
+        # ── 9. Emit outbox event ──────────────────────────────────────────────
+        outbox_payload = json.dumps({
+            "reservation_id": reservation_id,
+            "property_id": ctx.property_id,
+            "checkin": body.checkin.isoformat(),
+            "checkout": body.checkout.isoformat(),
+            "total_cents": body.total_cents,
+            "room_type_id": body.room_type_id,
+            "room_id": body.room_id,
+            "guest_id": body.guest_id,
+            "created_by": ctx.user.id,
+        })
+        cur.execute(
+            """
+            INSERT INTO outbox_events
+                (property_id, event_type, aggregate_type, aggregate_id,
+                 correlation_id, message_type, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                ctx.property_id,
+                "reservation.created",
+                "reservation",
+                reservation_id,
+                correlation_id,
+                None,
+                outbox_payload,
+            ),
+        )
+
+    logger.info(
+        "manual reservation created",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                room_type_id=body.room_type_id,
+                room_id=body.room_id,
+                checkin=body.checkin.isoformat(),
+                checkout=body.checkout.isoformat(),
+            )
+        },
+    )
+
+    return {
+        "id": reservation_id,
+        "checkin": row[1].isoformat(),
+        "checkout": row[2].isoformat(),
+        "status": row[3],
+        "total_cents": row[4],
+        "currency": row[5],
+        "hold_id": None,
+        "room_id": row[7],
+        "room_type_id": row[8],
+        "created_at": row[9].isoformat(),
+    }
 
 
 @router.get("")

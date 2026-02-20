@@ -484,6 +484,7 @@ Proibidos como label: phone, message_id, hold_id.
 - `POST /rooms` — Cria quarto físico (`name`, `room_type_id`, `is_active`). Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/route.ts`]
 - `PATCH /rooms/{room_id}` — Atualiza nome, categoria e status ativo (partial update). Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/[roomId]/route.ts`]
 - `DELETE /rooms/{room_id}` — Remove quarto. Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/[roomId]/route.ts`]
+- `POST /reservations` — Cria reserva manual (sem hold), `hold_id = NULL`. Requer `staff` ou superior. Campos: `room_type_id`, `checkin`, `checkout`, `total_cents` (obrigatórios); `currency`, `adult_count`, `guest_id`, `room_id` (opcionais). Emite `reservation.created` no outbox. Migration 029 torna `hold_id` nullable. [CONCLUÍDO — proxy em `reservations/route.ts`, UI em `/p/[propertyId]/reservations/page.tsx`]
 - `PATCH /rooms/{room_id}/governance` — atualiza `governance_status` (`dirty`→`cleaning`→`clean`). Requer role `governance` ou superior. Emite `room.governance_status_changed` no outbox. *(Sprint 1.13)*
 - `GET /rates` / `PUT /rates` (contrato na seção 6.3)
 - `GET /outbox` (PII-safe)
