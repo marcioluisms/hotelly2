@@ -148,7 +148,8 @@ def _list_reservations(
         cur.execute(
             f"""
             SELECT id, checkin, checkout, status, total_cents, currency,
-                   room_id, room_type_id, created_at
+                   room_id, room_type_id, created_at,
+                   guest_id, guest_name
             FROM reservations
             WHERE {where_clause}
             ORDER BY checkin DESC
@@ -169,6 +170,8 @@ def _list_reservations(
             "room_id": row[6],
             "room_type_id": row[7],
             "created_at": row[8].isoformat(),
+            "guest_id": str(row[9]) if row[9] is not None else None,
+            "guest_name": row[10],
         }
         for row in rows
     ]
@@ -190,7 +193,8 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
         cur.execute(
             """
             SELECT id, checkin, checkout, status, total_cents, currency,
-                   hold_id, room_id, room_type_id, created_at
+                   hold_id, room_id, room_type_id, created_at,
+                   guest_id, guest_name
             FROM reservations
             WHERE property_id = %s AND id = %s
             """,
@@ -212,6 +216,8 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
         "room_id": row[7],
         "room_type_id": row[8],
         "created_at": row[9].isoformat(),
+        "guest_id": str(row[10]) if row[10] is not None else None,
+        "guest_name": row[11],
     }
 
 
@@ -395,7 +401,8 @@ def create_reservation(
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
             RETURNING id, checkin, checkout, status, total_cents, currency,
-                      hold_id, room_id, room_type_id, created_at
+                      hold_id, room_id, room_type_id, created_at,
+                      guest_name, guest_id
             """,
             (
                 ctx.property_id,
@@ -470,6 +477,8 @@ def create_reservation(
         "room_id": row[7],
         "room_type_id": row[8],
         "created_at": row[9].isoformat(),
+        "guest_name": row[10],
+        "guest_id": str(row[11]) if row[11] is not None else None,
     }
 
 

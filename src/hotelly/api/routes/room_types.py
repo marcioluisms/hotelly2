@@ -169,12 +169,52 @@ def delete_room_type(
 ) -> None:
     """Delete a room type.
 
-    Fails with 409 if the room type still has rooms attached (FK RESTRICT).
+    Fails with 409 if any rooms still reference this type (FK RESTRICT on
+    the rooms table).  The error body includes:
+      - linked_rooms:        count of rooms that must be deleted first
+      - linked_reservations: count of non-cancelled reservations that
+                             reference this room_type (informational only —
+                             they do NOT block deletion because the FK is
+                             ON DELETE SET NULL, but the operator should be
+                             aware before removing the category).
+
     Requires manager role or higher.
     """
     from psycopg2 import errors as pg_errors
 
     with txn() as cur:
+        # Pre-check: count rooms that block deletion (FK RESTRICT)
+        cur.execute(
+            "SELECT COUNT(*) FROM rooms WHERE property_id = %s AND room_type_id = %s",
+            (ctx.property_id, room_type_id),
+        )
+        linked_rooms: int = cur.fetchone()[0]
+
+        if linked_rooms > 0:
+            # Surface active reservation count for operator awareness.
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM reservations
+                WHERE property_id = %s
+                  AND room_type_id = %s
+                  AND status != 'cancelled'::reservation_status
+                """,
+                (ctx.property_id, room_type_id),
+            )
+            linked_reservations: int = cur.fetchone()[0]
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "linked_rooms",
+                    "message": (
+                        f"Room type has {linked_rooms} room(s) attached and cannot be deleted. "
+                        "Delete all rooms first."
+                    ),
+                    "linked_rooms": linked_rooms,
+                    "linked_reservations": linked_reservations,
+                },
+            )
+
         try:
             cur.execute(
                 """
@@ -186,9 +226,16 @@ def delete_room_type(
             )
             row = cur.fetchone()
         except pg_errors.ForeignKeyViolation:
+            # Race condition: a room was inserted between the precheck and
+            # the DELETE.  Re-raise with a safe generic message.
             raise HTTPException(
                 status_code=409,
-                detail="Room type has rooms attached and cannot be deleted",
+                detail={
+                    "code": "linked_rooms",
+                    "message": "Room type has rooms attached and cannot be deleted.",
+                    "linked_rooms": -1,
+                    "linked_reservations": -1,
+                },
             )
 
     if row is None:

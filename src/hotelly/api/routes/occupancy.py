@@ -77,17 +77,37 @@ def _get_occupancy(
                 GROUP BY hn.room_type_id, hn.date
             ),
             booked_agg AS (
-                SELECT
-                    hn.room_type_id,
-                    hn.date,
-                    COALESCE(SUM(hn.qty), 0) AS booked
-                FROM hold_nights hn
-                JOIN reservations r ON r.hold_id = hn.hold_id
-                WHERE r.property_id = %s
-                  AND r.status = ANY(%s::reservation_status[])
-                  AND hn.date >= %s
-                  AND hn.date < %s
-                GROUP BY hn.room_type_id, hn.date
+                -- Union of hold-based and manual (hold_id IS NULL) reservations.
+                SELECT room_type_id, date, SUM(qty) AS booked
+                FROM (
+                    -- Hold-based: counted via hold_nights for accuracy
+                    SELECT hn.room_type_id, hn.date, hn.qty
+                    FROM hold_nights hn
+                    JOIN reservations r ON r.hold_id = hn.hold_id
+                    WHERE r.property_id = %s
+                      AND r.status = ANY(%s::reservation_status[])
+                      AND hn.date >= %s
+                      AND hn.date < %s
+
+                    UNION ALL
+
+                    -- Manual: expand checkin→checkout into per-night rows
+                    SELECT r.room_type_id,
+                           gs.date::date,
+                           1 AS qty
+                    FROM reservations r
+                    CROSS JOIN LATERAL generate_series(
+                        r.checkin,
+                        r.checkout - interval '1 day',
+                        '1 day'
+                    ) AS gs(date)
+                    WHERE r.property_id = %s
+                      AND r.hold_id IS NULL
+                      AND r.status = ANY(%s::reservation_status[])
+                      AND r.checkin  < %s
+                      AND r.checkout > %s
+                ) nights
+                GROUP BY room_type_id, date
             )
             SELECT
                 g.room_type_id,
@@ -108,15 +128,19 @@ def _get_occupancy(
             """,
             (
                 start_date,  # date_series start
-                end_date,  # date_series end
+                end_date,    # date_series end
                 property_id,  # room_types_for_property
                 property_id,  # held_agg holds.property_id
-                start_date,  # held_agg date start
-                end_date,  # held_agg date end
-                property_id,                 # booked_agg reservations.property_id
-                list(OPERATIONAL_STATUSES),  # booked_agg status filter
-                start_date,                  # booked_agg date start
-                end_date,                    # booked_agg date end
+                start_date,   # held_agg date start
+                end_date,     # held_agg date end
+                property_id,                 # booked_agg hold-based: r.property_id
+                list(OPERATIONAL_STATUSES),  # booked_agg hold-based: status filter
+                start_date,                  # booked_agg hold-based: hn.date >= start
+                end_date,                    # booked_agg hold-based: hn.date < end
+                property_id,                 # booked_agg manual: r.property_id
+                list(OPERATIONAL_STATUSES),  # booked_agg manual: status filter
+                end_date,                    # booked_agg manual: r.checkin < end_date
+                start_date,                  # booked_agg manual: r.checkout > start_date
                 property_id,                 # ari_days join
             ),
         )
