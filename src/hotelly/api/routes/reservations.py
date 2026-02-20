@@ -63,6 +63,15 @@ class ModifyApplyRequest(BaseModel):
     new_checkout: date
 
 
+class UpdateStatusRequest(BaseModel):
+    """Request body for a manual status transition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_status: str
+    notes: str | None = None
+
+
 class CreateReservationRequest(BaseModel):
     """Request body for manual reservation creation by staff."""
 
@@ -404,7 +413,7 @@ def create_reservation(
                 guest_id, guest_name,
                 status
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending_payment')
             RETURNING id, checkin, checkout, status, total_cents, currency,
                       hold_id, room_id, room_type_id, created_at,
                       guest_name, guest_id
@@ -1499,6 +1508,208 @@ def cancel_reservation_action(
                 property_id=ctx.property_id,
                 reservation_id=reservation_id,
                 refund_amount_cents=result.get("refund_amount_cents"),
+            )
+        },
+    )
+
+    return response_body
+
+
+# ---------------------------------------------------------------------------
+# Status transition action (PMS state machine)
+# ---------------------------------------------------------------------------
+
+
+@router.patch("/{reservation_id}/status")
+def update_reservation_status(
+    body: UpdateStatusRequest,
+    reservation_id: str = Path(..., description="Reservation UUID"),
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+) -> dict:
+    """Transition a reservation's status through the PMS state machine.
+
+    Allowed transitions:
+    - pending_payment → confirmed   (manager+ only — reservations:confirm)
+    - pending_payment → cancelled   (staff+; decrements ARI inventory)
+
+    All other (from_status, to_status) combinations are rejected with 409.
+
+    Side-effects on pending_payment → cancelled:
+    - Decrements inv_booked for every night in the stay.
+
+    Every successful transition is recorded in reservation_status_logs.
+
+    Requires Idempotency-Key header.
+    Requires staff role or higher (manager+ enforced for 'confirmed' target).
+    """
+    import json
+    from datetime import timedelta
+
+    from hotelly.infra.db import txn
+    from hotelly.infra.repositories.holds_repository import decrement_inv_booked
+    from hotelly.infra.repositories.outbox_repository import emit_event
+
+    correlation_id = get_correlation_id()
+
+    # ── State machine definition ──────────────────────────────────────────────
+    # Maps from_status → set of allowed target statuses.
+    ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+        "pending_payment": {"confirmed", "cancelled"},
+    }
+
+    to_status = body.to_status
+
+    # ── Basic target validation ───────────────────────────────────────────────
+    if to_status not in {"confirmed", "cancelled"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid target status '{to_status}'",
+        )
+
+    # ── Task 5: reservations:confirm requires manager+ ────────────────────────
+    if to_status == "confirmed" and ctx.role not in ("manager", "owner"):
+        raise HTTPException(
+            status_code=403,
+            detail="Confirming payment requires manager role or higher",
+        )
+
+    with txn() as cur:
+        # ── Idempotency check ─────────────────────────────────────────────────
+        endpoint_key = f"update-status:{reservation_id}:{to_status}"
+        cur.execute(
+            """
+            SELECT response_code, response_body
+            FROM idempotency_keys
+            WHERE idempotency_key = %s AND endpoint = %s
+            """,
+            (idempotency_key, endpoint_key),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            logger.info(
+                "idempotent replay for status update",
+                extra={
+                    "extra_fields": safe_log_context(
+                        correlationId=correlation_id,
+                        property_id=ctx.property_id,
+                        reservation_id=reservation_id,
+                        idempotency_key=idempotency_key,
+                    )
+                },
+            )
+            return json.loads(existing[1])
+
+        # ── Lock reservation ──────────────────────────────────────────────────
+        cur.execute(
+            """
+            SELECT status, checkin, checkout, room_type_id
+            FROM reservations
+            WHERE property_id = %s AND id = %s
+            FOR UPDATE
+            """,
+            (ctx.property_id, reservation_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+
+        from_status, checkin, checkout, room_type_id = row
+
+        # ── Validate transition is legal ──────────────────────────────────────
+        allowed_targets = ALLOWED_TRANSITIONS.get(from_status, set())
+        if to_status not in allowed_targets:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Transition from '{from_status}' to '{to_status}' is not allowed",
+            )
+
+        # ── Inventory: decrement when cancelling ──────────────────────────────
+        if to_status == "cancelled" and room_type_id:
+            current = checkin
+            while current < checkout:
+                decrement_inv_booked(
+                    cur,
+                    property_id=ctx.property_id,
+                    room_type_id=room_type_id,
+                    night_date=current,
+                )
+                current += timedelta(days=1)
+
+        # ── Apply status transition ───────────────────────────────────────────
+        cur.execute(
+            """
+            UPDATE reservations
+            SET status = %s::reservation_status, updated_at = now()
+            WHERE property_id = %s AND id = %s
+              AND status = %s::reservation_status
+            """,
+            (to_status, ctx.property_id, reservation_id, from_status),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Reservation status changed concurrently",
+            )
+
+        # ── Audit log ─────────────────────────────────────────────────────────
+        cur.execute(
+            """
+            INSERT INTO reservation_status_logs
+                (reservation_id, property_id, from_status, to_status, changed_by, notes)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                reservation_id,
+                ctx.property_id,
+                from_status,
+                to_status,
+                ctx.user.id,
+                body.notes,
+            ),
+        )
+
+        # ── Outbox event ──────────────────────────────────────────────────────
+        emit_event(
+            cur,
+            property_id=ctx.property_id,
+            event_type=f"reservation.{to_status}",
+            aggregate_type="reservation",
+            aggregate_id=reservation_id,
+            payload={
+                "reservation_id": reservation_id,
+                "from_status": from_status,
+                "to_status": to_status,
+                "changed_by": ctx.user.id,
+                "notes": body.notes,
+            },
+            correlation_id=correlation_id,
+        )
+
+        # ── Idempotency record ────────────────────────────────────────────────
+        response_body = {
+            "status": to_status,
+            "reservation_id": reservation_id,
+        }
+        cur.execute(
+            """
+            INSERT INTO idempotency_keys
+                (idempotency_key, endpoint, response_code, response_body)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (idempotency_key, endpoint) DO NOTHING
+            """,
+            (idempotency_key, endpoint_key, 200, json.dumps(response_body)),
+        )
+
+    logger.info(
+        "reservation status updated",
+        extra={
+            "extra_fields": safe_log_context(
+                correlationId=correlation_id,
+                property_id=ctx.property_id,
+                reservation_id=reservation_id,
+                from_status=from_status,
+                to_status=to_status,
             )
         },
     )

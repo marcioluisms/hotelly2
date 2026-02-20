@@ -6,7 +6,8 @@ overlapping reservations in a given date range.
 Overlap formula:  (new_checkin < existing_checkout) AND (new_checkout > existing_checkin)
 Strict inequality allows check-out day == check-in day (touching dates are OK).
 
-Only operational statuses generate conflicts: confirmed, in_house, checked_out.
+Only operational statuses generate conflicts: confirmed, in_house, checked_out,
+pending_payment.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from psycopg2.extensions import cursor as PgCursor
 
 logger = logging.getLogger(__name__)
 
-OPERATIONAL_STATUSES = ("confirmed", "in_house", "checked_out")
+OPERATIONAL_STATUSES = ("confirmed", "in_house", "checked_out", "pending_payment")
 
 
 class RoomConflictError(Exception):
