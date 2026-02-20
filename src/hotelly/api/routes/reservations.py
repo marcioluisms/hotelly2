@@ -79,6 +79,22 @@ class CreateReservationRequest(BaseModel):
     room_id: str | None = None
 
 
+class QuoteRequest(BaseModel):
+    """Request body for pricing preview of a new reservation.
+
+    Identical to CreateReservationRequest minus guest_id / room_id, which are
+    not needed to calculate a price.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    room_type_id: str
+    checkin: date
+    checkout: date
+    adult_count: int = 2
+    children_ages: list[int] = []
+
+
 router = APIRouter(prefix="/reservations", tags=["reservations"])
 
 logger = get_logger(__name__)
@@ -454,6 +470,80 @@ def create_reservation(
         "room_id": row[7],
         "room_type_id": row[8],
         "created_at": row[9].isoformat(),
+    }
+
+
+@router.post("/actions/quote")
+def quote_reservation(
+    body: QuoteRequest,
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> dict:
+    """Pricing preview for a new reservation — read-only, no mutations.
+
+    Validates ARI inventory and PAX rates for every night in the requested stay
+    by calling quote_minimum() from the domain layer.  No locks are taken and
+    nothing is written to the database.
+
+    Always returns HTTP 200.  Inspect the `available` field to determine
+    whether a reservation can be created at the quoted price.
+
+    Success response:
+        {"available": true, "total_cents": int, "currency": str, "nights": int}
+
+    Failure response:
+        {"available": false, "reason_code": str, "meta": dict}
+
+    Possible reason_codes:
+        invalid_dates          – checkin >= checkout
+        invalid_adult_count    – adult_count outside 1..4
+        invalid_child_age      – a child age outside 0..17
+        no_ari_record          – no ARI row exists for a night in the stay
+        no_inventory           – ARI row exists but available < 1
+        rate_missing           – no rate row for a night
+        pax_rate_missing       – rate row exists but the PAX column is NULL
+        child_rate_missing     – child-bucket rate column is NULL
+        child_policy_missing   – property has no child-age bucket config
+        child_policy_incomplete – child-age buckets do not cover 0..17
+
+    Requires staff role or higher.
+    """
+    from hotelly.domain.quote import QuoteUnavailable, quote_minimum
+    from hotelly.infra.db import txn
+
+    if body.checkin >= body.checkout:
+        return {"available": False, "reason_code": "invalid_dates", "meta": {}}
+
+    try:
+        with txn() as cur:
+            # Verify the room type belongs to this property before hitting
+            # the pricing engine.
+            cur.execute(
+                "SELECT 1 FROM room_types WHERE property_id = %s AND id = %s",
+                (ctx.property_id, body.room_type_id),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="room_type_id not found for this property",
+                )
+
+            result = quote_minimum(
+                cur,
+                property_id=ctx.property_id,
+                room_type_id=body.room_type_id,
+                checkin=body.checkin,
+                checkout=body.checkout,
+                adult_count=body.adult_count,
+                children_ages=body.children_ages,
+            )
+    except QuoteUnavailable as exc:
+        return {"available": False, "reason_code": exc.reason_code, "meta": exc.meta}
+
+    return {
+        "available": True,
+        "total_cents": result["total_cents"],
+        "currency": result["currency"],
+        "nights": result["nights"],
     }
 
 
