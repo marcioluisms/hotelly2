@@ -127,19 +127,19 @@ def _list_reservations(
     """
     from hotelly.infra.db import txn
 
-    conditions = ["property_id = %s"]
+    conditions = ["r.property_id = %s"]
     params: list = [property_id]
 
     if from_date:
-        conditions.append("checkin >= %s")
+        conditions.append("r.checkin >= %s")
         params.append(from_date)
 
     if to_date:
-        conditions.append("checkin <= %s")
+        conditions.append("r.checkin <= %s")
         params.append(to_date)
 
     if status:
-        conditions.append("status = %s")
+        conditions.append("r.status = %s")
         params.append(status)
 
     where_clause = " AND ".join(conditions)
@@ -147,12 +147,13 @@ def _list_reservations(
     with txn() as cur:
         cur.execute(
             f"""
-            SELECT id, checkin, checkout, status, total_cents, currency,
-                   room_id, room_type_id, created_at,
-                   guest_id, guest_name
-            FROM reservations
+            SELECT r.id, r.checkin, r.checkout, r.status, r.total_cents, r.currency,
+                   r.room_id, r.room_type_id, r.created_at,
+                   r.guest_id, COALESCE(r.guest_name, g.full_name) AS guest_name
+            FROM reservations r
+            LEFT JOIN guests g ON g.id = r.guest_id AND g.property_id = r.property_id
             WHERE {where_clause}
-            ORDER BY checkin DESC
+            ORDER BY r.checkin DESC
             LIMIT 100
             """,
             params,
@@ -192,11 +193,12 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
     with txn() as cur:
         cur.execute(
             """
-            SELECT id, checkin, checkout, status, total_cents, currency,
-                   hold_id, room_id, room_type_id, created_at,
-                   guest_id, guest_name
-            FROM reservations
-            WHERE property_id = %s AND id = %s
+            SELECT r.id, r.checkin, r.checkout, r.status, r.total_cents, r.currency,
+                   r.hold_id, r.room_id, r.room_type_id, r.created_at,
+                   r.guest_id, COALESCE(r.guest_name, g.full_name) AS guest_name
+            FROM reservations r
+            LEFT JOIN guests g ON g.id = r.guest_id AND g.property_id = r.property_id
+            WHERE r.property_id = %s AND r.id = %s
             """,
             (property_id, reservation_id),
         )

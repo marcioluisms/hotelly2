@@ -169,52 +169,95 @@ def delete_room_type(
 ) -> None:
     """Delete a room type.
 
-    Fails with 409 if any rooms still reference this type (FK RESTRICT on
-    the rooms table).  The error body includes:
-      - linked_rooms:        count of rooms that must be deleted first
-      - linked_reservations: count of non-cancelled reservations that
-                             reference this room_type (informational only —
-                             they do NOT block deletion because the FK is
-                             ON DELETE SET NULL, but the operator should be
-                             aware before removing the category).
+    Behaviour:
+    - Rooms with active reservations (confirmed / in_house) block deletion (409).
+    - Rooms whose reservations are all finalized (cancelled / checked_out) are
+      automatically purged: their room_id is NULLed on the finished reservations
+      and the room row is deleted — removing "ghost" rooms that the UI could not
+      show as blocking.
+    - Rooms with no reservations at all are deleted unconditionally.
 
     Requires manager role or higher.
     """
     from psycopg2 import errors as pg_errors
 
     with txn() as cur:
-        # Pre-check: count rooms that block deletion (FK RESTRICT)
+        # 1. Collect all rooms for this room type.
         cur.execute(
-            "SELECT COUNT(*) FROM rooms WHERE property_id = %s AND room_type_id = %s",
+            "SELECT id FROM rooms WHERE property_id = %s AND room_type_id = %s",
             (ctx.property_id, room_type_id),
         )
-        linked_rooms: int = cur.fetchone()[0]
+        all_room_ids: list[str] = [row[0] for row in cur.fetchall()]
 
-        if linked_rooms > 0:
-            # Surface active reservation count for operator awareness.
+        if all_room_ids:
+            # 2. Find rooms that have at least one ACTIVE reservation
+            #    (confirmed or in_house). These truly block deletion.
             cur.execute(
                 """
-                SELECT COUNT(*) FROM reservations
+                SELECT COUNT(DISTINCT room_id) FROM reservations
                 WHERE property_id = %s
-                  AND room_type_id = %s
-                  AND status != 'cancelled'::reservation_status
+                  AND room_id = ANY(%s)
+                  AND status NOT IN (
+                      'cancelled'::reservation_status,
+                      'checked_out'::reservation_status
+                  )
                 """,
-                (ctx.property_id, room_type_id),
+                (ctx.property_id, all_room_ids),
             )
-            linked_reservations: int = cur.fetchone()[0]
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "linked_rooms",
-                    "message": (
-                        f"Room type has {linked_rooms} room(s) attached and cannot be deleted. "
-                        "Delete all rooms first."
-                    ),
-                    "linked_rooms": linked_rooms,
-                    "linked_reservations": linked_reservations,
-                },
+            rooms_with_active_res: int = cur.fetchone()[0]
+
+            if rooms_with_active_res > 0:
+                # Surface active reservation count on the room_type for awareness.
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM reservations
+                    WHERE property_id = %s
+                      AND room_type_id = %s
+                      AND status NOT IN (
+                          'cancelled'::reservation_status,
+                          'checked_out'::reservation_status
+                      )
+                    """,
+                    (ctx.property_id, room_type_id),
+                )
+                linked_reservations: int = cur.fetchone()[0]
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "linked_rooms",
+                        "message": (
+                            f"Room type has {rooms_with_active_res} room(s) with active "
+                            "reservations (confirmed or in_house). Cancel or complete "
+                            "those reservations before deleting this category."
+                        ),
+                        "linked_rooms": rooms_with_active_res,
+                        "linked_reservations": linked_reservations,
+                    },
+                )
+
+            # 3. All rooms are safe to purge (only finalized or no reservations).
+            #    NULL out room_id on finished reservations so the FK is released.
+            cur.execute(
+                """
+                UPDATE reservations
+                SET room_id = NULL, updated_at = now()
+                WHERE property_id = %s
+                  AND room_id = ANY(%s)
+                  AND status IN (
+                      'cancelled'::reservation_status,
+                      'checked_out'::reservation_status
+                  )
+                """,
+                (ctx.property_id, all_room_ids),
             )
 
+            # 4. Delete the now-unblocked rooms.
+            cur.execute(
+                "DELETE FROM rooms WHERE property_id = %s AND room_type_id = %s",
+                (ctx.property_id, room_type_id),
+            )
+
+        # 5. Delete the room type itself.
         try:
             cur.execute(
                 """
@@ -226,8 +269,7 @@ def delete_room_type(
             )
             row = cur.fetchone()
         except pg_errors.ForeignKeyViolation:
-            # Race condition: a room was inserted between the precheck and
-            # the DELETE.  Re-raise with a safe generic message.
+            # Race condition: a room was inserted between steps 1 and 5.
             raise HTTPException(
                 status_code=409,
                 detail={
