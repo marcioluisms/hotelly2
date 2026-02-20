@@ -25,9 +25,21 @@ _SQL_FILE = (
 
 
 def upgrade() -> None:
-    # Add enum value first — must precede the constraint recreation which
-    # casts the value in its WHERE predicate.
+    # ── Step 1: Add the new enum value ────────────────────────────────────────
+    # PostgreSQL 12+: ALTER TYPE ADD VALUE is permitted inside a transaction,
+    # BUT the new value is NOT visible to other statements in the same
+    # transaction.  The SQL file below casts 'pending_payment'::reservation_status
+    # in the exclusion-constraint WHERE predicate — that cast will fail with
+    # "invalid input value for enum" if the value hasn't been committed yet.
+    #
+    # Fix: execute a COMMIT immediately after ADD VALUE so the catalog change
+    # is flushed and the new value is visible to all subsequent DDL.
+    # op.execute(sql) below will auto-start a new implicit transaction.
     op.execute("ALTER TYPE reservation_status ADD VALUE IF NOT EXISTS 'pending_payment'")
+    op.execute("COMMIT")
+
+    # ── Step 2: Constraint recreation + audit table ────────────────────────────
+    # Runs in a fresh implicit transaction started automatically after the COMMIT.
     sql = _SQL_FILE.read_text()
     op.execute(sql)
 
