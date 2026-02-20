@@ -234,7 +234,7 @@ Idempotência ponta a ponta combina:
 - Fonte da verdade do schema são as migrations em `migrations/` (Alembic).
 - Arquivos auxiliares (ex.: `docs/data/*.sql`) são referência humana, não execução.
 
-**`guests`: Entidade global de identidade (CRM). Campos normalizados (`email`, `phone` E.164) e preferências (`profile_data` JSONB). Sprint 1.10 — migration `024_guests_crm`.**
+**`guests`: Entidade global de identidade (CRM). Campos normalizados (`email`, `phone` E.164) e preferências (`profile_data` JSONB). Sprint 1.10 [CONCLUÍDO] — migration `024_guests_crm`.**
 
 | Coluna | Tipo | Constraints |
 |---|---|---|
@@ -309,12 +309,12 @@ Compatibilidade `/rates`:
   - `guest_name` (TEXT, nullable) — **snapshot histórico**: cópia do nome no momento da reserva, mantida para auditoria mesmo que o perfil do hóspede seja atualizado posteriormente.
 - `guest_count` foi removido (DB + código).
 
-**Campos de contato em `holds` (Sprint 1.10 — CRM Bridge, migration 025):**
+**Campos de contato em `holds` (Sprint 1.10 [CONCLUÍDO] — CRM Bridge, migration 025):**
 - `holds.email` (TEXT, nullable) — e-mail capturado pelo fluxo de booking; usado por `upsert_guest()` como chave primária de deduplicação.
 - `holds.phone` (TEXT, nullable) — telefone E.164; usado como chave secundária de deduplicação quando `email` é nulo.
 - Ambos são nullable: holds criados por fluxos que ainda não capturam contato terão `NULL`; nesse caso `upsert_guest()` cria um perfil name-only e a deduplicação passa a funcionar automaticamente assim que o upstream preencher esses campos.
 
-**Identidade do hóspede (Sprint 1.10):**
+**Identidade do hóspede (Sprint 1.10 [CONCLUÍDO]):**
 - `reservations.guest_id` (UUID, nullable, FK → `guests(id)`) — referência ao perfil normalizado. Populado por `upsert_guest()` no momento da conversão do hold.
 - `reservations.guest_name` e `reservations.guest_id` coexistem: `guest_name` é o snapshot imutável; `guest_id` é o vínculo vivo ao CRM.
 - Reservas anteriores ao Sprint 1.10 têm `guest_id = NULL`; isso é esperado e não constitui erro.
@@ -468,7 +468,9 @@ Proibidos como label: phone, message_id, hold_id.
   - `/p/[propertyId]/rates`
   - `/p/[propertyId]/frontdesk/occupancy`
   - `/p/[propertyId]/settings` (crianças + cancelamento)
-  - /p/[propertyId]/settings/team (Gestão de membros da equipe)
+  - `/p/[propertyId]/settings/team` (Gestão de membros da equipe)
+  - `/p/[propertyId]/settings/categories` (CRUD de categorias de quartos — `room_types`) [CONCLUÍDO]
+  - `/p/[propertyId]/settings/rooms` (CRUD de quartos físicos — `rooms`) [CONCLUÍDO]
 
 ### 11.2 Endpoints backend (dashboard)
 - `GET /auth/whoami`, `GET /me`, `GET /properties`, `GET /properties/{id}`
@@ -479,6 +481,9 @@ Proibidos como label: phone, message_id, hold_id.
 - `POST /reservations/{id}/actions/assign-room` → 202 (task)
 - `GET /occupancy` (`start_date`, `end_date` exclusivo; max 90 dias)
 - `GET /rooms` (retorna `governance_status` em cada quarto — Sprint 1.13)
+- `POST /rooms` — Cria quarto físico (`name`, `room_type_id`, `is_active`). Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/route.ts`]
+- `PATCH /rooms/{room_id}` — Atualiza nome, categoria e status ativo (partial update). Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/[roomId]/route.ts`]
+- `DELETE /rooms/{room_id}` — Remove quarto. Requer `manager` ou superior. [CONCLUÍDO — proxy em `rooms/[roomId]/route.ts`]
 - `PATCH /rooms/{room_id}/governance` — atualiza `governance_status` (`dirty`→`cleaning`→`clean`). Requer role `governance` ou superior. Emite `room.governance_status_changed` no outbox. *(Sprint 1.13)*
 - `GET /rates` / `PUT /rates` (contrato na seção 6.3)
 - `GET /outbox` (PII-safe)
@@ -489,6 +494,13 @@ Proibidos como label: phone, message_id, hold_id.
 - GET /rbac/users — Lista membros e papéis da propriedade (Join com e-mails).
 - POST /rbac/users/invite — Vincula usuário existente (via e-mail) a uma role.
 - DELETE /rbac/users/{user_id} — Remove vínculo de acesso.
+- `GET /guests` — Lista hóspedes da propriedade com busca opcional por nome/e-mail. Requer `staff` ou superior. *(Sprint 1.10 [CONCLUÍDO])*
+- `POST /guests` — Cria novo perfil de hóspede. Requer `staff` ou superior. 409 em conflito de e-mail/telefone. *(Sprint 1.10 [CONCLUÍDO])*
+- `PATCH /guests/{id}` — Atualiza campos do perfil (partial update). Requer `staff` ou superior. 404 se não pertencer à propriedade; 409 em conflito de unicidade. *(Sprint 1.10 [CONCLUÍDO])*
+- `GET /room_types` — Lista categorias de quartos. Requer `viewer` ou superior.
+- `POST /room_types` — Cria nova categoria. Requer `manager` ou superior.
+- `PATCH /room_types/{id}` — Atualiza nome/descrição/capacidade (partial update). Requer `manager` ou superior. [UI CONCLUÍDA — `updateRoomType` em `src/lib/roomTypes.ts`]
+- `DELETE /room_types/{id}` — Remove categoria. 409 se houver quartos vinculados (FK RESTRICT). Requer `manager` ou superior.
 
 **RBAC:** tudo é property-scoped via `?property_id=...`.
 
@@ -3604,3 +3616,120 @@ Operações (atômicas):
 2. `ALTER TABLE rooms ADD COLUMN governance_status TEXT NOT NULL DEFAULT 'clean' CHECK (governance_status IN ('dirty', 'cleaning', 'clean'))`.
 
 **Downgrade:** remove a coluna `governance_status` e reverte a constraint ao conjunto original de 4 roles.
+
+---
+
+## 19) CRM de Hóspedes — API de Escrita (Sprint 1.10 [CONCLUÍDO])
+
+> **Status: Implementado e Verificado (Sprint 1.10)**
+>
+> A leitura (`GET /guests`) foi entregue na Sprint 1.10 junto com a migração `024_guests_crm` e a identidade CRM (upsert via `guests_repository`). A escrita direta pelo painel admin (`POST /guests`, `PATCH /guests/{id}`) foi adicionada na continuação da Sprint 1.10, fechando o ciclo CRUD do CRM.
+
+### 19.1 Visão geral
+
+O módulo CRM expõe três endpoints para gestão de perfis de hóspedes a partir do painel admin. Todos são property-scoped (`?property_id=...`) e protegidos pelo role mínimo `staff` — garantindo que o role `governance` (housekeeping) não acesse dados de PII.
+
+**Arquivo:** `src/hotelly/api/routes/guests.py`
+
+### 19.2 RBAC — Restrições de acesso
+
+| Role | Acesso aos endpoints `/guests` |
+|---|---|
+| `owner` | ✅ Leitura e escrita |
+| `manager` | ✅ Leitura e escrita |
+| `staff` (= receptionist no admin) | ✅ Leitura e escrita |
+| `governance` | ❌ 403 — protege PII de housekeeping |
+| `viewer` | ❌ 403 |
+
+O guard é aplicado na camada da API (`require_property_role("staff")`); o frontend admin adiciona uma camada complementar renderizando o componente `AccessDenied` para o role `governance` antes mesmo de chamar a API.
+
+### 19.3 Endpoint `GET /guests`
+
+```
+GET /guests?property_id={id}&search={texto}
+Authorization: Bearer <token>   (min role: staff)
+
+200: [ { "id": "...", "name": "...", "email": "...", "phone": "...",
+         "document": "...", "created_at": "2026-01-15T10:00:00+00:00" }, ... ]
+403: role insuficiente (governance ou viewer)
+```
+
+- `search` é opcional; quando presente, aplica `ILIKE %texto%` em `full_name` e `email` (case-insensitive).
+- Resultado ordenado por `full_name ASC`, limitado a 500 registros.
+- Campos mapeados da tabela: `full_name → name`, `document_id → document`.
+
+### 19.4 Endpoint `POST /guests`
+
+```
+POST /guests?property_id={id}
+Authorization: Bearer <token>   (min role: staff)
+Content-Type: application/json
+
+Body:
+{
+  "name":     "Maria Silva",       // obrigatório
+  "email":    "maria@exemplo.com", // opcional
+  "phone":    "+5511999990000",    // opcional
+  "document": "123.456.789-00"     // opcional
+}
+
+201: { "id": "...", "name": "...", "email": "...", "phone": "...",
+       "document": "...", "created_at": "..." }
+409: e-mail ou telefone já cadastrado nesta propriedade
+     (unique partial indexes `uq_guests_property_email` / `uq_guests_property_phone`)
+```
+
+- `email` é normalizado para minúsculas antes do INSERT.
+- Strings vazias são tratadas como `NULL` (sem phantom records).
+- Usa INSERT direto (não `upsert_guest()` do repositório — este é para resolução de identidade automática no fluxo de reservas).
+
+### 19.5 Endpoint `PATCH /guests/{guest_id}`
+
+```
+PATCH /guests/{guest_id}?property_id={id}
+Authorization: Bearer <token>   (min role: staff)
+Content-Type: application/json
+
+Body (todos os campos são opcionais — partial update):
+{
+  "name":     "Maria Souza",
+  "email":    "novo@exemplo.com",
+  "phone":    "+5511888880000",
+  "document": "novo-doc"
+}
+
+200: { "id": "...", "name": "...", "email": "...", "phone": "...",
+       "document": "...", "created_at": "..." }
+400: nenhum campo fornecido no body
+404: hóspede não encontrado ou não pertence a esta propriedade
+409: novo e-mail ou telefone já pertence a outro hóspede da propriedade
+```
+
+- Apenas os campos presentes no body são alterados (partial UPDATE com cláusula SET dinâmica).
+- O `property_id` é sempre incluído no `WHERE` — impede acesso cross-property.
+- `email` normalizado para minúsculas; strings vazias convertidas para `NULL`.
+
+### 19.6 Frontend (hotelly-admin)
+
+| Artefato | Caminho |
+|---|---|
+| Proxy `GET` + `POST` | `src/app/api/p/[propertyId]/guests/route.ts` |
+| Proxy `PATCH` | `src/app/api/p/[propertyId]/guests/[guestId]/route.ts` |
+| Lib client-side | `src/lib/guests.ts` — `listGuests()`, `createGuest()`, `updateGuest()` |
+| UI | `src/app/p/[propertyId]/guests/GuestList.tsx` |
+| Guard RBAC | `src/app/p/[propertyId]/guests/page.tsx` — renderiza `<AccessDenied />` para role `governance` |
+
+O componente `GuestList` usa um único `Dialog` para criação e edição, controlado pelo estado `editingGuest` (null = modo criação, Guest = modo edição). Após salvar, a lista é atualizada in-place sem reload: novos registros são inseridos em ordem alfabética; edições substituem a linha correspondente.
+
+### 19.7 Migração `028_room_types_meta`
+
+Adicionada para suportar a página de Categorias do admin:
+
+```sql
+-- migrations/sql/028_room_types_meta.sql
+ALTER TABLE room_types
+    ADD COLUMN IF NOT EXISTS description   TEXT,
+    ADD COLUMN IF NOT EXISTS max_occupancy INT NOT NULL DEFAULT 2;
+```
+
+Retrocompatível: linhas existentes recebem `description = NULL` e `max_occupancy = 2`.

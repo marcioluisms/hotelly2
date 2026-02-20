@@ -179,10 +179,10 @@ class TestRoomsSuccess:
         private_key, _ = rsa_keypair
         token = _create_token(private_key)
 
-        # Mock data: 2 rooms
+        # Mock data: 2 rooms (id, room_type_id, name, is_active, governance_status)
         mock_rows = [
-            ("101", "rt_standard", "Quarto 101", True),
-            ("201", "rt_suite", "Suíte 201", True),
+            ("101", "rt_standard", "Quarto 101", True, "clean"),
+            ("201", "rt_suite", "Suíte 201", True, "dirty"),
         ]
 
         class MockCursor:
@@ -219,8 +219,10 @@ class TestRoomsSuccess:
                     assert data[0]["room_type_id"] == "rt_standard"
                     assert data[0]["name"] == "Quarto 101"
                     assert data[0]["is_active"] is True
+                    assert data[0]["governance_status"] == "clean"
 
                     assert data[1]["id"] == "201"
                     assert data[1]["room_type_id"] == "rt_suite"
                     assert data[1]["name"] == "Suíte 201"
                     assert data[1]["is_active"] is True
+                    assert data[1]["governance_status"] == "dirty"
