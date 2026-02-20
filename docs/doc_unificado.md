@@ -265,6 +265,11 @@ Idempotência ponta a ponta combina:
 - `holds.guest_name` (TEXT, nullable) — snapshot imutável do nome do hóspede gravado no momento da criação do hold. O Worker lê este campo para montar a notificação WhatsApp sem precisar consultar `conversations`. Divergência entre `holds.guest_name` e `guests.full_name` é esperada e intencional (hold = snapshot; guests = perfil vivo).
 - Tabela `payments` — registra todos os pagamentos via Stripe (`provider = 'stripe'`, `provider_object_id` = checkout session ID canônico). É a fonte de verdade para reconciliação financeira; o status transita `created → succeeded | needs_manual`. Nenhuma lógica de negócio deve consultar Stripe diretamente para checar status — sempre ler `payments.status`.
 
+**Regras de negócio adicionadas na migração 032:**
+- `properties.confirmation_threshold` (NUMERIC NOT NULL DEFAULT 1.0) — fração mínima do `total_cents` que deve ser coberta por pagamentos folio capturados para que a reserva seja automaticamente confirmada. Valor `1.0` = pagamento integral exigido. Valores entre 0 e 1 permitem confirmação com pagamento parcial (ex: sinal de 30% → `0.3`). Verificado em `folio_service._maybe_auto_confirm` após cada `POST /reservations/{id}/payments`.
+- `reservations.guarantee_justification` (TEXT, nullable) — texto livre obrigatório informado pelo operador ao confirmar uma reserva manualmente via "Garantir Reserva". Persiste na linha da reserva e é replicado no campo `notes` do audit log como `"Manual Guarantee: <texto>"`. Nunca preenchido em confirmações automáticas (sistema).
+- `payments.justification` (TEXT, nullable) — anotação opcional associada a um pagamento Stripe para fins de rastreabilidade.
+
 ### 6.3 Modelo de pricing por ocupação (PAX) — `room_type_rates`
 
 Tabela canônica: `room_type_rates` (PK `(property_id, room_type_id, date)`).
@@ -3908,3 +3913,343 @@ Alembic revision: `030_room_types_soft_delete` → revises `029_reservations_hol
 - **Antes (hard delete):** `DELETE FROM room_types WHERE …` → destruía a linha e quebrava FKs históricas.
 - **Depois (soft delete):** `UPDATE room_types SET deleted_at = now(), updated_at = now() WHERE … AND deleted_at IS NULL`.
 - Retorna **204** em caso de sucesso; **404** se não encontrado ou já soft-deleted; **409** com `code: "active_references"` se houver quartos ativos ou reservas abertas.
+
+---
+
+## 22) Ciclo de Vida Profissional de Reservas — PMS Status Flow
+
+### 22.1 Visão Geral
+
+Reservas manuais criadas pelo dashboard percorrem um ciclo de vida explícito antes de chegarem ao status `confirmed`. Isso garante que nenhuma reserva seja considerada "confirmada" sem que o pagamento tenha sido verificado por um colaborador autorizado.
+
+Reservas originadas por canal de vendas externo (hold-based, via `hold_id IS NOT NULL`) entram diretamente como `confirmed` porque o processamento de pagamento ocorre na plataforma de pagamentos e o evento de confirmação é recebido via webhook antes da reserva ser criada.
+
+### 22.2 Máquina de Estados
+
+```
+                    [canal/webhook]
+                          │
+                          ▼
+             POST /reservations    ──▶  pending_payment ──[pagamento >= threshold]──▶  confirmed (auto)
+             (staff+, manual)                │                                               │
+                                             │──[Garantir Reserva, manager+]────────▶  confirmed (manual)
+                                             │ (staff+)                                      │ (staff+)
+                                             ▼                                               ▼
+                                        cancelled                                         in_house
+                                                                                              │ (staff+)
+                                                                                              ▼
+                                                                                         checked_out
+```
+
+| Transição | Gatilho | Endpoint | Papel mínimo | Efeito colateral |
+|-----------|---------|----------|-------------|-----------------|
+| `pending_payment → confirmed` (auto) | Total de pagamentos folio ≥ `confirmation_threshold × total_cents` | interno (`folio_service`) | — | Audit log `changed_by = 'system'`, notes = "Payment Threshold Reached" |
+| `pending_payment → confirmed` (manual) | Ação "Garantir Reserva" com justificativa obrigatória | `PATCH /reservations/{id}/status` | **manager** | Salva `guarantee_justification` na reserva; audit log `"Manual Guarantee: <texto>"` |
+| `pending_payment → cancelled` | Cancelamento manual | `PATCH /reservations/{id}/status` | staff | Decrementa `inv_booked` para todas as noites da estadia |
+| `confirmed → in_house` | Check-in | `POST /reservations/{id}/actions/check-in` | staff | Valida quarto atribuído e `governance_status = 'clean'` |
+| `in_house → checked_out` | Check-out | `POST /reservations/{id}/actions/check-out` | staff | Valida saldo zero no folio; marca quarto como `dirty` |
+
+Qualquer outra combinação `(from_status, to_status)` é rejeitada com **409 Conflict**.
+
+### 22.3 Confirmação: Automática por Threshold e Manual por Garantia
+
+A transição `pending_payment → confirmed` pode ocorrer de **duas formas**:
+
+#### Automática (Payment Threshold)
+
+Após cada registro de pagamento folio (`POST /reservations/{id}/payments`), o serviço `folio_service._maybe_auto_confirm` verifica:
+
+```
+total_capturedfolio / reservation.total_cents >= property.confirmation_threshold
+```
+
+Se a condição for satisfeita e a reserva ainda estiver em `pending_payment`, o status é atualizado atomicamente na mesma transação, e o audit log recebe `changed_by = 'system'`, `notes = 'Payment Threshold Reached'`. Um evento `reservation.confirmed` é emitido no outbox.
+
+`confirmation_threshold` é um campo `NUMERIC NOT NULL DEFAULT 1.0` na tabela `properties`. O valor padrão de `1.0` exige pagamento integral. Valores menores (ex: `0.3`) permitem confirmação com pagamento parcial.
+
+#### Manual (Garantir Reserva)
+
+Um `manager` ou `owner` pode confirmar manualmente via `PATCH /reservations/{id}/status` com:
+- `to_status: "confirmed"`
+- `guarantee_justification: "<texto obrigatório e não vazio>"`
+
+O endpoint valida que `guarantee_justification` não está vazio (HTTP 422 se omitido) e:
+1. Atualiza `reservations.guarantee_justification` com o texto fornecido.
+2. Registra no audit log com `changed_by = ctx.user.id`, `notes = "Manual Guarantee: <texto>"`.
+
+Na UI, o botão **"Garantir Reserva"** (componente `GuaranteeButton`) abre um modal com textarea obrigatória — o botão de confirmação permanece desabilitado enquanto o campo estiver vazio.
+
+### 22.4 Inventário durante `pending_payment`
+
+No momento da criação via `POST /reservations`, o sistema executa as mesmas verificações de disponibilidade de uma reserva confirmada e chama `increment_inv_booked` para cada noite. Isso significa que **uma reserva `pending_payment` já ocupa inventário** desde o instante de sua criação — o quarto não pode ser vendido duas vezes enquanto o pagamento não for confirmado ou a reserva não for cancelada.
+
+Se a reserva for cancelada (`pending_payment → cancelled`), `decrement_inv_booked` é chamado atomicamente na mesma transação, liberando o inventário.
+
+### 22.5 Migração `031_pending_payment_status`
+
+- Adiciona `'pending_payment'` ao tipo enum `reservation_status` via `ALTER TYPE ... ADD VALUE IF NOT EXISTS`.
+- Recria a constraint `no_physical_room_overlap` incluindo `pending_payment` na cláusula `WHERE` (ver §24.3).
+- Cria a tabela `reservation_status_logs` (ver §23).
+
+> **Nota de migração:** `ALTER TYPE ADD VALUE` não pode ser executado dentro do mesmo bloco de transação que referencia o novo valor. O arquivo de migração Python emite `op.execute("COMMIT")` entre o `ADD VALUE` e a recriação da constraint para garantir que o valor esteja visível no catálogo antes do DDL subsequente.
+
+---
+
+## 23) Trilha de Auditoria e Conformidade — Reservation Status Logs
+
+### 23.1 Propósito
+
+Toda transição de status de uma reserva deve ser rastreável: **quem** realizou a ação, **quando**, **de qual estado** partiu, **para qual estado** foi, e com quais **notas** de justificativa. Essa trilha é exigência de conformidade PMS e insumo essencial para disputas financeiras e auditorias internas.
+
+### 23.2 Estrutura da Tabela `reservation_status_logs`
+
+```sql
+CREATE TABLE reservation_status_logs (
+    id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    reservation_id TEXT        NOT NULL,
+    property_id    TEXT        NOT NULL,
+    from_status    TEXT,                       -- NULL em criação direta (futuro)
+    to_status      TEXT        NOT NULL,
+    changed_by     TEXT        NOT NULL,       -- Clerk user_id do operador
+    changed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    notes          TEXT                        -- Justificativa opcional
+);
+
+CREATE INDEX idx_rsl_reservation ON reservation_status_logs (reservation_id, changed_at DESC);
+CREATE INDEX idx_rsl_property    ON reservation_status_logs (property_id,    changed_at DESC);
+```
+
+| Coluna | Tipo | Descrição |
+|--------|------|-----------|
+| `id` | UUID | PK gerado automaticamente |
+| `reservation_id` | TEXT | FK lógica para `reservations.id` (sem FK física para permitir histórico independente) |
+| `property_id` | TEXT | Escopo de tenant — permite consultas de auditoria por propriedade |
+| `from_status` | TEXT | Status anterior; `NULL` quando não aplicável |
+| `to_status` | TEXT | Novo status após a transição |
+| `changed_by` | TEXT | `ctx.user.id` — ID do usuário Clerk que executou a ação |
+| `changed_at` | TIMESTAMPTZ | Timestamp da transição (UTC, default `now()`) |
+| `notes` | TEXT | Campo livre preenchido pelo operador via UI (opcional) |
+
+### 23.3 Comportamento de Escrita
+
+A inserção em `reservation_status_logs` ocorre **dentro da mesma transação** que o `UPDATE reservations SET status = ...` no endpoint `PATCH /reservations/{id}/status`. A atomicidade garante que nunca haverá uma transição sem log nem um log sem transição correspondente.
+
+```python
+# Trecho de reservations.py — dentro de with txn() as cur:
+cur.execute(
+    """
+    INSERT INTO reservation_status_logs
+        (reservation_id, property_id, from_status, to_status, changed_by, notes)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    """,
+    (reservation_id, ctx.property_id, from_status, to_status, ctx.user.id, body.notes),
+)
+```
+
+### 23.4 Índices e Padrões de Consulta
+
+| Consulta típica | Índice utilizado |
+|-----------------|-----------------|
+| Histórico de uma reserva específica (timeline) | `idx_rsl_reservation` |
+| Auditoria de todas as transições de uma propriedade por período | `idx_rsl_property` |
+
+### 23.5 Idempotência
+
+O endpoint `PATCH /reservations/{id}/status` utiliza o cabeçalho `Idempotency-Key` para evitar dupla-inserção em caso de retry. A chave é registrada na tabela `idempotency_keys` ao final da transação; requisições duplicadas retornam o corpo da resposta original sem executar novamente a transição nem inserir nova linha no log.
+
+---
+
+## 24) Cálculo de Ocupação e Inventário
+
+### 24.1 `OPERATIONAL_STATUSES` — Definição Centralizada
+
+O conjunto de status que "ocupam" inventário é definido em `src/hotelly/domain/room_conflict.py` como:
+
+```python
+OPERATIONAL_STATUSES = ("confirmed", "in_house", "checked_out", "pending_payment")
+```
+
+Essa tupla é importada por todos os componentes que precisam filtrar reservas operacionais: `occupancy.py`, `check_room_conflict()` e a constraint de banco de dados `no_physical_room_overlap`. Alterar `OPERATIONAL_STATUSES` propaga o efeito para todos os pontos de uso automaticamente — **não é necessário atualizar múltiplos arquivos manualmente**.
+
+### 24.2 `booked_agg` — UNION ALL para Dois Tipos de Reserva
+
+O endpoint `GET /occupancy` utiliza uma CTE `booked_agg` que combina via `UNION ALL` dois ramos distintos de contagem de noites reservadas:
+
+```sql
+booked_agg AS (
+    SELECT room_type_id, date, SUM(qty) AS booked
+    FROM (
+        -- Ramo 1: Reservas de canal (hold-based)
+        -- Conta via hold_nights para precisão de datas de hold.
+        SELECT hn.room_type_id, hn.date, hn.qty
+        FROM hold_nights hn
+        JOIN reservations r ON r.hold_id = hn.hold_id
+        WHERE r.property_id = %s
+          AND r.status = ANY(%s::reservation_status[])
+          AND hn.date >= %s AND hn.date < %s
+
+        UNION ALL
+
+        -- Ramo 2: Reservas manuais (hold_id IS NULL)
+        -- Expande o intervalo checkin→checkout em linhas por noite via generate_series.
+        SELECT r.room_type_id,
+               gs.date::date,
+               1 AS qty
+        FROM reservations r
+        CROSS JOIN LATERAL generate_series(
+            r.checkin,
+            r.checkout - interval '1 day',
+            '1 day'
+        ) AS gs(date)
+        WHERE r.property_id = %s
+          AND r.hold_id IS NULL
+          AND r.status = ANY(%s::reservation_status[])
+          AND r.checkin  < %s
+          AND r.checkout > %s
+    ) nights
+    GROUP BY room_type_id, date
+)
+```
+
+**Ramo 1 (hold-based):** reservas originadas de canal externo têm suas noites pré-computadas em `hold_nights`. A contagem é feita via join com essa tabela, preservando a granularidade exata definida no hold.
+
+**Ramo 2 (manual):** reservas manuais (`hold_id IS NULL`) não têm `hold_nights`. O `CROSS JOIN LATERAL generate_series(checkin, checkout - 1 day, '1 day')` expande o intervalo de datas em uma linha por noite dinamicamente. O filtro de sobreposição `r.checkin < end_date AND r.checkout > start_date` garante que apenas reservas que se sobrepõem ao período de consulta sejam expandidas.
+
+### 24.3 `no_physical_room_overlap` — Constraint de Exclusão Atualizada
+
+A constraint de banco de dados que impede dupla-alocação de quartos físicos foi atualizada pela migração `031` para incluir `pending_payment`:
+
+```sql
+ALTER TABLE reservations
+    ADD CONSTRAINT no_physical_room_overlap
+    EXCLUDE USING GIST (
+        room_id WITH =,
+        daterange(checkin, checkout, '[)') WITH &&
+    )
+    WHERE (
+        room_id IS NOT NULL
+        AND status IN (
+            'confirmed'::reservation_status,
+            'in_house'::reservation_status,
+            'checked_out'::reservation_status,
+            'pending_payment'::reservation_status  -- adicionado em 031
+        )
+    );
+```
+
+Isso significa que qualquer tentativa de `INSERT` ou `UPDATE` que coloque dois registros de status operacional no mesmo quarto físico para datas sobrepostas será **rejeitada pelo banco de dados** — independentemente de a aplicação ter validado ou não. A constraint é a segunda camada de defesa (a primeira é `check_room_conflict()` na camada de aplicação).
+
+### 24.4 Cálculo de Disponibilidade
+
+Para cada combinação `(room_type_id, date)`, a disponibilidade é calculada como:
+
+```
+available = max(0, inv_total - booked - held)
+```
+
+- `inv_total` — capacidade total cadastrada em `ari_days`
+- `booked` — soma de `booked_agg` (inclui `pending_payment`)
+- `held` — soma de `held_agg` (holds ativos não expirados)
+
+Se `available_raw < 0`, o endpoint registra um aviso de **overbooking** nos logs (sem PII) e retorna `available = 0` para a UI.
+
+### 24.5 Grid Gantt (`GET /occupancy/grid`)
+
+O endpoint `/occupancy/grid` retorna spans por quarto físico para renderização em estilo Gantt. Diferentemente de `GET /occupancy` (que agrega por `room_type_id`), este endpoint opera em nível de `room_id` individual.
+
+- Cada reserva é retornada como um único span `(checkin, checkout, status, guest_name)` — sem expansão por dia.
+- Quartos sem reservas no período aparecem com `reservations: []`.
+- Filtra por `OPERATIONAL_STATUSES` (incluindo `pending_payment`).
+- JOIN com `room_types` aplica `AND rt.deleted_at IS NULL` para excluir categorias soft-deleted.
+
+---
+
+## 25) Padrões Operacionais da Interface — UI Operational Standards
+
+### 25.1 Campos Obrigatórios em Reservas Manuais
+
+O dialog `NewReservationDialog` impõe dois campos obrigatórios antes de permitir a criação de uma reserva manual:
+
+| Campo | Validação no frontend | Mensagem de erro |
+|-------|-----------------------|-----------------|
+| **Hóspede** | `selectedGuest !== null` | "Selecione um hóspede antes de criar a reserva." |
+| **Quarto** | `roomId !== ""` | "Selecione um quarto antes de criar a reserva." |
+
+**Mecanismo de validação:**
+- O botão "Criar" fica desabilitado enquanto `missingRequired = !selectedGuest || !roomId`.
+- `handleSubmit` possui verificações de retorno antecipado (`early return`) para ambos os campos, evitando qualquer chamada à API com dados incompletos.
+- Labels exibem `*` em vermelho (`<span style={{ color: "#c53030" }}>*</span>`) para sinalizar obrigatoriedade.
+- Bordas dos inputs ficam vermelhas (`border-color: #f87171`) enquanto os campos estão vazios.
+- A opção "Sem quarto específico" foi removida do seletor de quartos — toda reserva manual requer atribuição de quarto no momento da criação.
+
+O backend também valida: `POST /reservations` retorna **422** se `room_type_id` ou `room_id` não pertencerem à propriedade, ou se `guest_id` não for encontrado.
+
+### 25.2 Correção de Desnormalização — `COALESCE(r.guest_name, g.full_name)`
+
+O campo `reservations.guest_name` é uma coluna desnormalizada que é preenchida na criação da reserva com o `full_name` do hóspede no momento do cadastro. Em cenários onde o hóspede foi vinculado por um caminho não-padrão, esse campo pode ser `NULL` mesmo que `guest_id` esteja preenchido.
+
+Ambas as funções `_list_reservations` e `_get_reservation` utilizam `COALESCE` para resolver o nome correto:
+
+```sql
+COALESCE(r.guest_name, g.full_name) AS guest_name
+```
+
+com o JOIN correspondente:
+
+```sql
+LEFT JOIN guests g ON g.id = r.guest_id AND g.property_id = r.property_id
+```
+
+Isso garante que a coluna `guest_name` retornada pela API sempre apresente o nome mais recente do cadastro quando o campo desnormalizado estiver ausente.
+
+### 25.3 Nome Amigável do Quarto — `room_name` via LEFT JOIN
+
+Para evitar exibição de UUIDs brutos na interface, ambas as funções de consulta de reservas incluem um JOIN adicional com a tabela `rooms`:
+
+```sql
+LEFT JOIN rooms ro ON ro.id = r.room_id AND ro.property_id = r.property_id
+```
+
+O campo `ro.name AS room_name` é retornado no JSON da reserva e exibido:
+
+- **Lista de reservas** (`reservations/page.tsx`): coluna "Quarto" entre "Hóspede" e "Check-in"; exibe o nome (ex.: "Ap. 1") ou `–` se não atribuído.
+- **Detalhe da reserva** (`[reservationId]/page.tsx`): campo "Quarto" no painel de informações; fallback para UUID truncado se `room_name` for nulo (reserva antiga sem JOIN), e "Não atribuído" se `room_id` também for nulo.
+
+### 25.4 Botões Operacionais na Lista de Reservas
+
+A coluna "Ações" da lista de reservas exibe botões contextuais baseados no status da reserva e no papel do usuário. A lógica de renderização ocorre **no servidor** (server component), evitando flickers de hidratação:
+
+| Status | Botão | Cor | Condição adicional | Papel mínimo |
+|--------|-------|-----|--------------------|-------------|
+| `pending_payment` | **Confirmar Pgto** | Verde `#1e7e34` | — | manager |
+| `confirmed` | **Check-in** | Verde `#1e7e34` | `checkin === hoje (UTC)` | staff |
+| `in_house` | **Check-out** | Azul `#1d4ed8` | — | staff |
+
+**Implementação:**
+
+```tsx
+// page.tsx (server component)
+const todayISO = new Date().toISOString().split("T")[0]; // UTC
+
+// Na célula de Ações:
+{canConfirmPayment && statusStr === "pending_payment" && idStr && (
+  <GuaranteeButton propertyId={propertyId} reservationId={idStr} />
+)}
+{statusStr === "confirmed" && checkinStr === todayISO && idStr && (
+  <CheckInButton propertyId={propertyId} reservationId={idStr} status={statusStr} />
+)}
+{statusStr === "in_house" && idStr && (
+  <CheckOutButton propertyId={propertyId} reservationId={idStr} status={statusStr} />
+)}
+```
+
+Os componentes `CheckInButton` e `CheckOutButton` (em `[reservationId]/`) são importados e reutilizados diretamente na lista, mantendo a paridade de comportamento entre a visão de lista e a visão de detalhe. Após a ação bem-sucedida, `router.refresh()` recarrega os dados do servidor sem navegação de página.
+
+### 25.5 Limpeza da Coluna JSON
+
+A coluna de depuração JSON foi minimizada para reduzir ruído visual:
+
+- Cabeçalho renomeado de "Detalhes" para `···` (cinza claro, peso normal).
+- O elemento `<details>` exibe `···` como `<summary>`, ocupando apenas 32px de largura.
+- Ao expandir, o `<pre>` é posicionado com `position: absolute; z-index: 10` para flutuar sobre as linhas da tabela, evitando empurrar o layout.
+- Essa coluna destina-se exclusivamente a depuração em desenvolvimento; em produção pode ser ocultada via CSS sem impacto funcional.

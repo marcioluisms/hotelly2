@@ -70,6 +70,7 @@ class UpdateStatusRequest(BaseModel):
 
     to_status: str
     notes: str | None = None
+    guarantee_justification: str | None = None
 
 
 class CreateReservationRequest(BaseModel):
@@ -86,6 +87,7 @@ class CreateReservationRequest(BaseModel):
     children_ages: list[int] = []
     guest_id: str | None = None
     room_id: str | None = None
+    guarantee_justification: str | None = None
 
 
 class QuoteRequest(BaseModel):
@@ -417,9 +419,9 @@ def create_reservation(
                 room_type_id, room_id,
                 adult_count, children_ages,
                 guest_id, guest_name,
-                status
+                status, guarantee_justification
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending_payment')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending_payment', %s)
             RETURNING id, checkin, checkout, status, total_cents, currency,
                       hold_id, room_id, room_type_id, created_at,
                       guest_name, guest_id
@@ -436,6 +438,7 @@ def create_reservation(
                 json.dumps(body.children_ages),
                 body.guest_id,
                 guest_name,
+                body.guarantee_justification,
             ),
         )
         row = cur.fetchone()
@@ -1573,12 +1576,20 @@ def update_reservation_status(
             detail=f"Invalid target status '{to_status}'",
         )
 
-    # ── Task 5: reservations:confirm requires manager+ ────────────────────────
+    # ── reservations:confirm requires manager+ ────────────────────────────────
     if to_status == "confirmed" and ctx.role not in ("manager", "owner"):
         raise HTTPException(
             status_code=403,
             detail="Confirming payment requires manager role or higher",
         )
+
+    # ── Guarantee justification is mandatory for manual confirmation ──────────
+    if to_status == "confirmed":
+        if not body.guarantee_justification or not body.guarantee_justification.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="guarantee_justification is required to guarantee a reservation",
+            )
 
     with txn() as cur:
         # ── Idempotency check ─────────────────────────────────────────────────
@@ -1646,11 +1657,13 @@ def update_reservation_status(
         cur.execute(
             """
             UPDATE reservations
-            SET status = %s::reservation_status, updated_at = now()
+            SET status = %s::reservation_status,
+                updated_at = now(),
+                guarantee_justification = COALESCE(%s, guarantee_justification)
             WHERE property_id = %s AND id = %s
               AND status = %s::reservation_status
             """,
-            (to_status, ctx.property_id, reservation_id, from_status),
+            (to_status, body.guarantee_justification, ctx.property_id, reservation_id, from_status),
         )
         if cur.rowcount == 0:
             raise HTTPException(
@@ -1659,6 +1672,11 @@ def update_reservation_status(
             )
 
         # ── Audit log ─────────────────────────────────────────────────────────
+        audit_notes = (
+            f"Manual Guarantee: {body.guarantee_justification}"
+            if to_status == "confirmed"
+            else body.notes
+        )
         cur.execute(
             """
             INSERT INTO reservation_status_logs
@@ -1671,7 +1689,7 @@ def update_reservation_status(
                 from_status,
                 to_status,
                 ctx.user.id,
-                body.notes,
+                audit_notes,
             ),
         )
 

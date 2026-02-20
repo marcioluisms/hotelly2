@@ -124,7 +124,7 @@ def _get_payment(property_id: str, payment_id: str) -> dict | None:
     with txn() as cur:
         cur.execute(
             """
-            SELECT id, status, amount_cents, currency, hold_id, provider, provider_object_id, created_at
+            SELECT id, status, amount_cents, currency, hold_id, provider, provider_object_id, created_at, justification
             FROM payments
             WHERE property_id = %s AND id = %s
             """,
@@ -144,6 +144,7 @@ def _get_payment(property_id: str, payment_id: str) -> dict | None:
         "provider": row[5],
         "provider_object_id": row[6],
         "created_at": row[7].isoformat(),
+        "justification": row[8],
     }
 
 

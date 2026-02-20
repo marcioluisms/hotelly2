@@ -34,7 +34,9 @@ class ReservationNotPayableError(Exception):
 # ── Allowed statuses ─────────────────────────────────────
 
 # Statuses that allow financial operations (payment recording).
-_PAYABLE_STATUSES = frozenset({"confirmed", "in_house"})
+# pending_payment is included so payments can be registered before guarantee;
+# auto-confirmation fires when total_paid / total_cents >= confirmation_threshold.
+_PAYABLE_STATUSES = frozenset({"pending_payment", "confirmed", "in_house"})
 
 
 # ── Service functions ────────────────────────────────────
@@ -91,7 +93,7 @@ def record_payment(
         raise ReservationNotPayableError(status)
 
     # 2. Insert payment via repository
-    return insert_folio_payment(
+    payment = insert_folio_payment(
         cur,
         reservation_id=reservation_id,
         property_id=property_id,
@@ -99,6 +101,118 @@ def record_payment(
         method=method,
         recorded_by=recorded_by,
     )
+
+    # 3. Auto-confirm if payment threshold is met (pending_payment only)
+    _maybe_auto_confirm(cur, reservation_id=reservation_id, property_id=property_id)
+
+    return payment
+
+
+def _maybe_auto_confirm(
+    cur: PgCursor,
+    *,
+    reservation_id: str,
+    property_id: str,
+) -> bool:
+    """Auto-transition reservation to 'confirmed' if payment threshold is met.
+
+    Checks whether total captured folio payments cover at least
+    property.confirmation_threshold of the reservation's total_cents.
+    Only acts when the reservation is still in 'pending_payment'.
+
+    Returns True if the reservation was auto-confirmed, False otherwise.
+    All writes share the caller's open transaction.
+    """
+    from hotelly.infra.repositories.outbox_repository import emit_event
+
+    # 1. Lock reservation — only proceed if still pending_payment
+    cur.execute(
+        """
+        SELECT total_cents
+        FROM reservations
+        WHERE property_id = %s AND id = %s AND status = 'pending_payment'
+        FOR UPDATE
+        """,
+        (property_id, reservation_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return False  # Already confirmed / cancelled / in-house, or not found
+
+    total_cents: int = row[0]
+    if total_cents <= 0:
+        return False
+
+    # 2. Fetch property confirmation_threshold
+    cur.execute(
+        "SELECT confirmation_threshold FROM properties WHERE id = %s",
+        (property_id,),
+    )
+    prop_row = cur.fetchone()
+    if prop_row is None:
+        return False
+    threshold = float(prop_row[0])
+
+    # 3. Sum captured folio payments for this reservation
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(amount_cents), 0)
+        FROM folio_payments
+        WHERE reservation_id = %s AND status = 'captured'
+        """,
+        (reservation_id,),
+    )
+    total_paid: int = cur.fetchone()[0]
+
+    if total_paid / total_cents < threshold:
+        return False
+
+    # 4. Apply auto-confirmation
+    cur.execute(
+        """
+        UPDATE reservations
+        SET status = 'confirmed'::reservation_status, updated_at = now()
+        WHERE property_id = %s AND id = %s AND status = 'pending_payment'
+        """,
+        (property_id, reservation_id),
+    )
+    if cur.rowcount == 0:
+        return False  # Concurrent update beat us
+
+    # 5. Audit log — changed_by = 'system'
+    cur.execute(
+        """
+        INSERT INTO reservation_status_logs
+            (reservation_id, property_id, from_status, to_status, changed_by, notes)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            reservation_id,
+            property_id,
+            "pending_payment",
+            "confirmed",
+            "system",
+            "Payment Threshold Reached",
+        ),
+    )
+
+    # 6. Outbox event
+    emit_event(
+        cur,
+        property_id=property_id,
+        event_type="reservation.confirmed",
+        aggregate_type="reservation",
+        aggregate_id=reservation_id,
+        payload={
+            "reservation_id": reservation_id,
+            "from_status": "pending_payment",
+            "to_status": "confirmed",
+            "changed_by": "system",
+            "notes": "Payment Threshold Reached",
+        },
+    )
+
+    return True
 
 
 def get_reservation_folio(

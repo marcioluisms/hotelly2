@@ -43,6 +43,7 @@ class PropertyPatchRequest(BaseModel):
     name: str | None = None
     timezone: str | None = None
     outbound_provider: Literal["evolution", "meta"] | None = None
+    confirmation_threshold: float | None = None
 
     @field_validator("timezone")
     @classmethod
