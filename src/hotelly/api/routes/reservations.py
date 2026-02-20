@@ -158,9 +158,11 @@ def _list_reservations(
             f"""
             SELECT r.id, r.checkin, r.checkout, r.status, r.total_cents, r.currency,
                    r.room_id, r.room_type_id, r.created_at,
-                   r.guest_id, COALESCE(r.guest_name, g.full_name) AS guest_name
+                   r.guest_id, COALESCE(r.guest_name, g.full_name) AS guest_name,
+                   ro.name AS room_name
             FROM reservations r
             LEFT JOIN guests g ON g.id = r.guest_id AND g.property_id = r.property_id
+            LEFT JOIN rooms ro ON ro.id = r.room_id AND ro.property_id = r.property_id
             WHERE {where_clause}
             ORDER BY r.checkin DESC
             LIMIT 100
@@ -182,6 +184,7 @@ def _list_reservations(
             "created_at": row[8].isoformat(),
             "guest_id": str(row[9]) if row[9] is not None else None,
             "guest_name": row[10],
+            "room_name": row[11],
         }
         for row in rows
     ]
@@ -204,9 +207,11 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
             """
             SELECT r.id, r.checkin, r.checkout, r.status, r.total_cents, r.currency,
                    r.hold_id, r.room_id, r.room_type_id, r.created_at,
-                   r.guest_id, COALESCE(r.guest_name, g.full_name) AS guest_name
+                   r.guest_id, COALESCE(r.guest_name, g.full_name) AS guest_name,
+                   ro.name AS room_name
             FROM reservations r
             LEFT JOIN guests g ON g.id = r.guest_id AND g.property_id = r.property_id
+            LEFT JOIN rooms ro ON ro.id = r.room_id AND ro.property_id = r.property_id
             WHERE r.property_id = %s AND r.id = %s
             """,
             (property_id, reservation_id),
@@ -229,6 +234,7 @@ def _get_reservation(property_id: str, reservation_id: str) -> dict | None:
         "created_at": row[9].isoformat(),
         "guest_id": str(row[10]) if row[10] is not None else None,
         "guest_name": row[11],
+        "room_name": row[12],
     }
 
 
