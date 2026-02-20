@@ -145,9 +145,19 @@ def put_rates(
 
     All rates are written under ctx.property_id (ignores any property_id in body).
     Uses INSERT ... ON CONFLICT DO UPDATE for idempotent upserts.
+
+    Also seeds missing ari_days rows (ON CONFLICT DO NOTHING) so that new room
+    types become quotable immediately after rates are saved.  inv_total is
+    derived from the count of active rooms for the room_type at the time of the
+    request.  Existing ari_days rows (with tracked inv_booked / inv_held) are
+    never modified by this step.
+
     Requires staff role or higher.
     """
     property_id = ctx.property_id
+
+    # Collect unique (room_type_id → dates) for ari_days seeding below.
+    ari_seed: dict[str, set[date]] = {}
 
     with txn() as cur:
         for rate in body.rates:
@@ -202,5 +212,30 @@ def put_rates(
                     rate.is_blocked,
                 ),
             )
+            ari_seed.setdefault(rate.room_type_id, set()).add(rate.date)
+
+        # Seed ari_days for every (room_type_id, date) that lacks a row.
+        # ON CONFLICT DO NOTHING preserves existing inventory counters.
+        for room_type_id, dates in ari_seed.items():
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM rooms
+                WHERE property_id = %s AND room_type_id = %s AND is_active = TRUE
+                """,
+                (property_id, room_type_id),
+            )
+            inv_total = cur.fetchone()[0]
+
+            for d in sorted(dates):
+                cur.execute(
+                    """
+                    INSERT INTO ari_days
+                        (property_id, room_type_id, date, inv_total, currency)
+                    VALUES (%s, %s, %s, %s, 'BRL')
+                    ON CONFLICT (property_id, room_type_id, date) DO NOTHING
+                    """,
+                    (property_id, room_type_id, d, inv_total),
+                )
 
     return {"upserted": len(body.rates)}

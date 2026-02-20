@@ -141,6 +141,20 @@ def create_room(
                 detail="room_type_id not found for this property",
             )
 
+        # Keep ari_days.inv_total in sync: a new active room increases the
+        # sellable inventory for all future dates that already have an ARI row.
+        if body.is_active:
+            cur.execute(
+                """
+                UPDATE ari_days
+                SET inv_total = inv_total + 1, updated_at = now()
+                WHERE property_id = %s
+                  AND room_type_id = %s
+                  AND date >= CURRENT_DATE
+                """,
+                (ctx.property_id, body.room_type_id),
+            )
+
     return _room_to_dict(row)
 
 
