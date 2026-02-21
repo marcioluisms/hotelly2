@@ -259,7 +259,7 @@ def delete_room(
 
 
 class GovernanceUpdateBody(BaseModel):
-    governance_status: Literal["dirty", "cleaning", "clean"]
+    governance_status: Literal["dirty", "cleaning", "clean", "maintenance"]
 
 
 @router.patch("/{room_id}/governance")

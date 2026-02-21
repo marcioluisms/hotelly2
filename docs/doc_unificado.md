@@ -584,7 +584,7 @@ Causa raiz documentada: incidente de 2026-02-18 13:58 UTC — `WORKER_BASE_URL` 
 **Regras de Ouro Financeiras:**
 1. **Trava de Check-out:** O sistema aplica a política "No Balance, No Exit". O status `checked_out` é bloqueado via código (409 Conflict) se `balance_due > 0`.
 2. **Resiliência de Cálculo:** Em caso de erro na consulta do Folio, o sistema deve adotar o comportamento *Fail-Closed*, impedindo o check-out por segurança.
-3. **Terminologia Única:** O estado operacional pós-entrada é `in_house`. O termo `checked_in` está depreciado e não deve ser utilizado em novas implementações.
+3. **Terminologia Única:** O estado operacional pós-entrada é `in_house`. Este é o único termo válido para hóspedes atualmente na propriedade.
 
 **Infraestrutura:**
 - As migrações de banco (`folio_payments`) devem ser executadas via CI/CD (Cloud Build) para garantir paridade entre Staging e Produção.
@@ -966,7 +966,7 @@ Permissões de Conta de Serviço: A Service Account do Cloud Run (hotelly-public
 Dependências de Inicialização: O serviço Cloud Run não entrará em estado Ready se não houver acesso imediato ao Secret Manager e ao Cloud SQL.
 
 Configuração de Banco de Dados (PostgreSQL)
-Enums Customizados: Ao configurar um novo banco, certifique-se de que o tipo reservation_status contenha o conjunto completo: ['confirmed', 'cancelled', 'in_house', 'checked_in', 'checked_out'].
+Enums Customizados: Ao configurar um novo banco, certifique-se de que o tipo reservation_status contenha o conjunto completo: ['pending_payment', 'confirmed', 'cancelled', 'in_house', 'checked_out'].
 
 Casting em Consultas: Queries que utilizam operadores de comparação (= ANY ou =) com colunas do tipo Enum exigem casting explícito (ex: status::reservation_status = %s) devido às restrições do driver psycopg2.
 
@@ -1117,11 +1117,11 @@ Aliases de Rota: Para manter a compatibilidade entre o legado do frontend e a ev
 Consumo de Reservas: A rota padrão para adição de serviços deve ser POST /reservations/{reservation_id}/extras.
 
 Lógica de Negócio e Estados
-Normalização de Status: Para fins de lançamento de receitas, os status in_house (backend) e checked_in (frontend) são semanticamente equivalentes.
+Normalização de Status: Para fins de lançamento de receitas, o status válido para hóspedes na propriedade é in_house.
 
 Matriz de Permissão de Consumo:
 
-Permitidos: confirmed, in_house, checked_in.
+Permitidos: confirmed, in_house.
 
 Bloqueados: pending, cancelled, checked_out.
 
@@ -1249,8 +1249,11 @@ Registro interno do estado de pagamento associado a um hold.
 Reserva confirmada (resultado final da conversão).
 
 ##### Estados (MVP)
+- `pending_payment`
 - `confirmed`
-- `cancelled` (opcional no MVP)
+- `cancelled`
+- `in_house`
+- `checked_out`
 
 ##### Invariantes (MVP)
 - `UNIQUE(property_id, hold_id)` garante "no máximo 1 reserva por hold"

@@ -7,7 +7,8 @@ POST: create a new extra
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from psycopg2 import errors as pg_errors
 from pydantic import BaseModel, ConfigDict
 
 from hotelly.api.rbac import PropertyRoleContext, require_property_role
@@ -109,3 +110,38 @@ def create_extra(
         "created_at": r[5].isoformat() if hasattr(r[5], "isoformat") else str(r[5]),
         "updated_at": r[6].isoformat() if hasattr(r[6], "isoformat") else str(r[6]),
     }
+
+
+# ── DELETE /extras/{extra_id} ─────────────────────────────
+
+
+@router.delete("/{extra_id}", status_code=204)
+def delete_extra(
+    extra_id: str,
+    ctx: PropertyRoleContext = Depends(require_property_role("staff")),
+) -> None:
+    """Hard-delete an extra from the property catalog.
+
+    Returns 404 if the extra does not exist or belongs to a different property.
+    Returns 409 if the extra is referenced by existing reservation_extras rows
+    (FK ON DELETE RESTRICT prevents physical deletion in that case).
+    """
+    with txn() as cur:
+        # Verify ownership before attempting deletion.
+        cur.execute(
+            "SELECT id FROM extras WHERE id = %s AND property_id = %s",
+            (extra_id, ctx.property_id),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Extra not found")
+
+        try:
+            cur.execute(
+                "DELETE FROM extras WHERE id = %s AND property_id = %s",
+                (extra_id, ctx.property_id),
+            )
+        except pg_errors.ForeignKeyViolation:
+            raise HTTPException(
+                status_code=409,
+                detail="Extra is linked to existing reservations and cannot be deleted",
+            )
